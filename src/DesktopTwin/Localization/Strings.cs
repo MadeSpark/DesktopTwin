@@ -119,7 +119,6 @@ internal static class Strings
         Pair("Menu.Diagnostics.DisableChildSessions", "关闭 Child Sessions（恢复系统原状）"),
 
         // ---- 全屏顶栏 ----
-        Pair("Fullscreen.Title", "桌面分身"),
         Pair("Fullscreen.Minimize", "最小化"),
         Pair("Fullscreen.Restore", "还原"),
         Pair("Fullscreen.Restore.ToolTip", "退出全屏，回到窗口模式"),
@@ -433,10 +432,10 @@ internal static class Strings
         Pair("Startup.ElevatedConfirm.Title", "确认自动以管理员权限启动"),
         Pair("Startup.NeedTarget.Title", "还需要选择目标程序"),
         Pair("Startup.NeedTarget.Message", "「自动启动 + 管理员权限」需要一个明确的目标程序。选好之后会再确认一次。"),
-        Pair("Main.WatchMode.Enter.ToolTip", "分身画面仅可观看，本机键鼠不会生效"),
-        Pair("Main.WatchMode.Exit.ToolTip", "退出观看模式"),
         Pair("Main.WatchMode.Watch", "观看模式"),
         Pair("Main.WatchMode.Control", "控制模式"),
+        Pair("Main.WatchMode.Button.Watch.ToolTip", "当前处于观看模式：本机键鼠不会进入桌面分身。点击切换为控制模式。"),
+        Pair("Main.WatchMode.Button.Control.ToolTip", "当前处于控制模式：本机键鼠可以操作桌面分身。点击切换为观看模式。"),
         Pair("Main.SmallWindow.Enable.ToolTip", "把窗口缩到 750 宽，并按 16:9 同步缩小高度"),
         Pair("Main.SmallWindow.Restore.ToolTip", "将窗口还原至默认大小"),
         Pair("Main.SmallWindow.Enable", "小窗模式"),

@@ -19,7 +19,7 @@ namespace DesktopTwin.View;
 /// </summary>
 public partial class MainWindow : FluentWindow
 {
-    private const double FullscreenBarAutoHideSeconds = 10;
+    private const double FullscreenBarAutoHideSeconds = 6;
 
     /// <summary>
     /// 鼠标进入窗口顶部这个高度（DIP）内就唤出工具栏。
@@ -48,6 +48,13 @@ public partial class MainWindow : FluentWindow
     private Rect _boundsBeforeFullscreen;
     private WindowStyle _styleBeforeFullscreen = WindowStyle.SingleBorderWindow;
     private ResizeMode _resizeBeforeFullscreen = ResizeMode.CanResize;
+    private WindowCornerPreference _cornerPreferenceBeforeFullscreen;
+    private WindowBackdropType _backdropTypeBeforeFullscreen;
+    private Brush _backgroundBeforeFullscreen = Brushes.Black;
+    private double _minWidthBeforeFullscreen;
+    private double _maxWidthBeforeFullscreen;
+    private double _minHeightBeforeFullscreen;
+    private double _maxHeightBeforeFullscreen;
     private bool _smartSizingBeforeFullscreen;
     private DispatcherTimer? _barAutoHideTimer;
     private DispatcherTimer? _cursorWatchTimer;
@@ -321,6 +328,13 @@ public partial class MainWindow : FluentWindow
         _boundsBeforeFullscreen = new Rect(Left, Top, ActualWidth, ActualHeight);
         _styleBeforeFullscreen = WindowStyle;
         _resizeBeforeFullscreen = ResizeMode;
+        _cornerPreferenceBeforeFullscreen = WindowCornerPreference;
+        _backdropTypeBeforeFullscreen = WindowBackdropType;
+        _backgroundBeforeFullscreen = Background;
+        _minWidthBeforeFullscreen = MinWidth;
+        _maxWidthBeforeFullscreen = MaxWidth;
+        _minHeightBeforeFullscreen = MinHeight;
+        _maxHeightBeforeFullscreen = MaxHeight;
         _smartSizingBeforeFullscreen = _settings.Current.Session.SmartSizing;
 
         _isFullscreen = true;
@@ -339,6 +353,19 @@ public partial class MainWindow : FluentWindow
         finally
         {
             _suppressStateChange = false;
+        }
+
+        // 全屏必须是一整块不透明黑。FluentWindow 默认挂着会在全屏露馅的东西：
+        // ① DWM 圆角（WindowCornerPreference=Round）→ 四个角是圆的；
+        // ② 背景材质会让窗口背景变透明 → 边缘 1px 能看到背后的窗口；
+        // ③ 窗口背景在浅色主题下是白的 → 缩放取整留 1px 缝时会露白边。
+        // 三者都压掉，退出时再逐项还原。
+        WindowCornerPreference = WindowCornerPreference.DoNotRound;
+        WindowBackdropType = WindowBackdropType.None;
+        Background = Brushes.Black;
+        if (PresentationSource.FromVisual(this) is HwndSource { CompositionTarget: HwndTarget target })
+        {
+            target.BackgroundColor = Colors.Black;
         }
 
         // 标题栏让位给画面。
@@ -386,6 +413,12 @@ public partial class MainWindow : FluentWindow
         {
             WindowStyle = _styleBeforeFullscreen;
             ResizeMode = _resizeBeforeFullscreen;
+
+            // 还原 DWM 圆角与背景材质，并恢复窗口自己的背景。
+            WindowCornerPreference = _cornerPreferenceBeforeFullscreen;
+            WindowBackdropType = _backdropTypeBeforeFullscreen;
+            Background = _backgroundBeforeFullscreen;
+
             WindowTitleBar.Visibility = Visibility.Visible;
             TitleRow.Height = GridLength.Auto;
 
@@ -393,6 +426,12 @@ public partial class MainWindow : FluentWindow
             RdpFormsHost.ClearValue(FrameworkElement.MarginProperty);
 
             SetCurrentValue(TopmostProperty, _settings.Current.Session.Topmost);
+
+            // 先还掉尺寸锁，再恢复边界：否则下面的 Width/Height 会被全屏锁掉的 min/max 夹住。
+            MinWidth = _minWidthBeforeFullscreen;
+            MaxWidth = _maxWidthBeforeFullscreen;
+            MinHeight = _minHeightBeforeFullscreen;
+            MaxHeight = _maxHeightBeforeFullscreen;
 
             WindowState = WindowState.Normal;
             Left = _boundsBeforeFullscreen.Left;
@@ -420,6 +459,13 @@ public partial class MainWindow : FluentWindow
     /// </summary>
     private void ApplyFullscreenBounds()
     {
+        // 这里也会被排队的回调调用（OnDesktopSizeChanged 用 Background 优先级排队），
+        // 排队期间用户可能已经退出全屏：那时再摆尺寸、锁 min==max 会把窗口模式也锁死。
+        if (!_isFullscreen)
+        {
+            return;
+        }
+
         if (!WindowNativeMethods.TryGetMonitorRect(new WindowInteropHelper(this).Handle, out var monitor))
         {
             return;
@@ -435,8 +481,23 @@ public partial class MainWindow : FluentWindow
 
         Left = monitor.Left / dpi.DpiScaleX;
         Top = monitor.Top / dpi.DpiScaleY;
+
+        // 显示器分辨率/DPI 变化时这里会被再次调用（WM_DISPLAYCHANGE）。进全屏时锁死的
+        // min==max 会先于 Width/Height 生效，把新尺寸夹在旧值上，窗口就贴不上新显示器。
+        // 所以每次都要先释放再改尺寸，改完再按新尺寸锁死。
+        MinWidth = _minWidthBeforeFullscreen;
+        MaxWidth = _maxWidthBeforeFullscreen;
+        MinHeight = _minHeightBeforeFullscreen;
+        MaxHeight = _maxHeightBeforeFullscreen;
+
         Width = monitorWidth / dpi.DpiScaleX;
         Height = monitorHeight / dpi.DpiScaleY;
+
+        // 尺寸锁死是兜底：WindowBackdropType=None 会让 WindowChrome 按 NoResize 重算
+        // （缩放命中区归零），这里 min==max 再确保任何路径都缩不动，
+        // 避免把「全屏」拖成别的尺寸却还停在 IsFullscreen 状态。
+        MinWidth = MaxWidth = Width;
+        MinHeight = MaxHeight = Height;
     }
 
     /// <summary>
@@ -560,7 +621,7 @@ public partial class MainWindow : FluentWindow
         }
         else
         {
-            // 取消固定后按普通规则处理：再显示 10 秒，然后自动收起。
+            // 取消固定后按普通规则处理：再显示几秒，然后自动收起。
             ShowFullscreenBar();
         }
     }

@@ -98,8 +98,8 @@ public partial class MainWindowViewModel : ObservableObject
     private bool _sendSystemShortcutsToRemote = true;
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(WatchModeMenuHeader))]
-    [NotifyPropertyChangedFor(nameof(WatchModeMenuToolTip))]
+    [NotifyPropertyChangedFor(nameof(WatchModeButtonText))]
+    [NotifyPropertyChangedFor(nameof(WatchModeButtonToolTip))]
     private bool _isWatchModeEnabled;
 
     [ObservableProperty]
@@ -221,16 +221,18 @@ public partial class MainWindowViewModel : ObservableObject
         : Locale.Get("Main.SmallWindow.Enable.ToolTip");
 
     /// <summary>
-    /// 观看模式菜单文本。
+    /// 标题栏上观看/控制切换按钮显示的文字：显示**当前**所处的模式。
     /// </summary>
-    public string WatchModeMenuHeader => IsWatchModeEnabled ? Locale.Get("Main.WatchMode.Control") : Locale.Get("Main.WatchMode.Watch");
+    public string WatchModeButtonText => IsWatchModeEnabled
+        ? Locale.Get("Main.WatchMode.Watch")
+        : Locale.Get("Main.WatchMode.Control");
 
     /// <summary>
-    /// 观看模式菜单提示。
+    /// 观看/控制切换按钮的提示：说明当前模式，并告知点击后的去向。
     /// </summary>
-    public string WatchModeMenuToolTip => IsWatchModeEnabled
-        ? Locale.Get("Main.WatchMode.Exit.ToolTip")
-        : Locale.Get("Main.WatchMode.Enter.ToolTip");
+    public string WatchModeButtonToolTip => IsWatchModeEnabled
+        ? Locale.Get("Main.WatchMode.Button.Watch.ToolTip")
+        : Locale.Get("Main.WatchMode.Button.Control.ToolTip");
 
     /// <summary>
     /// 尺寸切换目标宽度。

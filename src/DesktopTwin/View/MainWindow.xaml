@@ -95,6 +95,35 @@
                                CornerRadius="0"
                                Icon="{ui:SymbolIcon ArrowSwap24}"
                                ToolTip="{loc:Loc Main.SwitchWindow.ToolTip}" />
+                    <ui:Button x:Name="WatchModeButton"
+                               Width="100"
+                               Height="32"
+                               Background="Transparent"
+                               BorderBrush="Transparent"
+                               behaviors:ResponsiveTitleBarBehavior.CollapseOrder="4"
+                               Command="{Binding ToggleWatchModeCommand}"
+                               Content="{Binding WatchModeButtonText}"
+                               CornerRadius="0"
+                               ToolTip="{Binding WatchModeButtonToolTip}">
+                        <ui:Button.Icon>
+                            <!-- 两态循环：控制模式（光标）→ 观看模式（眼睛） -->
+                            <ui:SymbolIcon>
+                                <ui:SymbolIcon.Style>
+                                    <Style TargetType="{x:Type ui:SymbolIcon}">
+                                        <Setter Property="Symbol"
+                                                Value="Cursor24" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsWatchModeEnabled}"
+                                                         Value="True">
+                                                <Setter Property="Symbol"
+                                                        Value="Eye24" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </ui:SymbolIcon.Style>
+                            </ui:SymbolIcon>
+                        </ui:Button.Icon>
+                    </ui:Button>
 
                     <!-- 窗口变窄时，被折叠的按钮在这里仍然可用 -->
                     <ui:DropDownButton Width="40"
@@ -120,6 +149,11 @@
                                              Header="{loc:Loc Menu.SwitchWindow}"
                                              Icon="{ui:SymbolIcon ArrowSwap24}"
                                              Visibility="{Binding Source={x:Reference SwitchWindowButton}, Path=IsVisible, Converter={StaticResource BooleanToVisibilityRevertConverter}}" />
+                                <ui:MenuItem Command="{Binding ToggleWatchModeCommand}"
+                                             Header="{Binding WatchModeButtonText}"
+                                             Icon="{ui:SymbolIcon Eye24}"
+                                             ToolTip="{Binding WatchModeButtonToolTip}"
+                                             Visibility="{Binding Source={x:Reference WatchModeButton}, Path=IsVisible, Converter={StaticResource BooleanToVisibilityRevertConverter}}" />
                             </ContextMenu>
                         </ui:DropDownButton.Flyout>
                     </ui:DropDownButton>
@@ -154,9 +188,6 @@
                                 <ui:MenuItem Command="{Binding ToggleSmallWindowModeCommand}"
                                              Header="{Binding WindowSizeModeMenuHeader}"
                                              ToolTip="{Binding WindowSizeModeMenuToolTip}" />
-                                <ui:MenuItem Command="{Binding ToggleWatchModeCommand}"
-                                             Header="{Binding WatchModeMenuHeader}"
-                                             ToolTip="{Binding WatchModeMenuToolTip}" />
                                 <Separator />
                                 <ui:MenuItem Header="{loc:Loc Menu.Resolution}">
                                     <ui:MenuItem Command="{Binding SelectResolutionCommand}"
@@ -530,11 +561,14 @@
                                 <ui:SymbolIcon FontSize="14" Symbol="ArrowSwap24" />
                             </ui:Button.Icon>
                         </ui:Button>
-                        <TextBlock Margin="0,0,14,0"
-                                   VerticalAlignment="Center"
-                                   FontWeight="SemiBold"
-                                   Foreground="White"
-                                   Text="{loc:Loc Fullscreen.Title}" />
+                        <!-- 标题位置换成观看/控制切换按钮：与标题栏那个同一个命令、同一份文案。 -->
+                        <ui:Button MinWidth="88"
+                                   Height="30"
+                                   Margin="6,0,14,0"
+                                   Command="{Binding ToggleWatchModeCommand}"
+                                   Content="{Binding WatchModeButtonText}"
+                                   IsEnabled="{Binding IsSessionInteractionEnabled}"
+                                   ToolTip="{Binding WatchModeButtonToolTip}" />
                         <ui:Button Width="36"
                                    Height="30"
                                    Click="OnFullscreenMinimizeClicked"
