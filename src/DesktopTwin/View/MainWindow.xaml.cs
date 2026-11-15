@@ -115,6 +115,9 @@ public partial class MainWindow : FluentWindow
         // 固定状态下不动，那是用户明确要求常驻的。
         Deactivated += OnWindowDeactivated;
 
+        // 焦点回到窗口时恢复全屏置顶（见 OnWindowActivated 的说明）。
+        Activated += OnWindowActivated;
+
         // 窗口从「隐藏」恢复显示（托盘唤回）时，Popup 的定位同样会失效。
         IsVisibleChanged += OnWindowVisibilityChanged;
 
@@ -263,10 +266,35 @@ public partial class MainWindow : FluentWindow
 
     private void OnWindowDeactivated(object? sender, EventArgs e)
     {
-        if (_isFullscreen && !_barPinned)
+        if (!_isFullscreen)
+        {
+            return;
+        }
+
+        // 全屏期间窗口失焦（切到别的程序、弹出凭据框等）时临时放下置顶：
+        // 置顶窗口会盖住「Windows 安全中心」凭据框这类非置顶窗口，
+        // 即使它抢到了前台焦点也露不出来。放下置顶后，非置顶的前台窗口就能显示。
+        // 用 SetCurrentValue 而不是直接赋值，避免清掉 XAML 里的 OneWay 绑定。
+        SetCurrentValue(TopmostProperty, false);
+
+        if (!_barPinned)
         {
             HideFullscreenBar();
         }
+    }
+
+    /// <summary>
+    /// 焦点回到全屏窗口时恢复置顶，重新盖住任务栏。
+    /// 只在全屏期间生效：窗口模式下的置顶完全由 ViewModel 的 IsTopmost 绑定驱动。
+    /// </summary>
+    private void OnWindowActivated(object? sender, EventArgs e)
+    {
+        if (!_isFullscreen)
+        {
+            return;
+        }
+
+        SetCurrentValue(TopmostProperty, true);
     }
 
     /// <summary>
