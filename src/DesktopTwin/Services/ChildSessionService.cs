@@ -993,7 +993,9 @@ public sealed class ChildSessionService : IDisposable
         ThrowIfDisposed();
         _settings.Current.Session.WatchMode = enabled;
         _settings.SaveSoon();
-        _desktopWindow?.RdpHost.SetInputBlocked(enabled);
+        // 用户主动切回控制模式时要把焦点还给输入窗口，否则观看模式期间被系统
+        // 移走的焦点不会自动回来，画面看着像还在观看模式。
+        _desktopWindow?.RdpHost.SetInputBlocked(enabled, restoreFocus: !enabled);
         RefreshState(enabled
             ? Locale.Get("Svc.Status.WatchModeOn")
             : Locale.Get("Svc.Status.WatchModeOff"));
