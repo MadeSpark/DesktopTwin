@@ -987,8 +987,9 @@ public partial class MainWindow : FluentWindow
     /// </summary>
     private void RevealCredentialDialog(IntPtr handle, IntPtr dialog)
     {
-        // 从轮询回调到真正执行之间可能已经被退全屏/停轮询取代：再确认一次，
-        // 避免「已退出全屏」之后还用过期判断把原生置顶放下去、再也收不回来。
+        // 先把「为凭据框放下置顶」的标记记下，再放下原生置顶：万一这期间退全屏/停轮询，
+        // StopCredentialDialogWatch 的 RestoreTopmostAfterCredentialDialog 能看到标记、
+        // 把原生置顶收回来，不会留成「标记还没记、置顶已经放下」的死态。
         lock (_credentialDialogWatchGate)
         {
             if (!_credentialDialogWatchEnabled)
@@ -996,22 +997,20 @@ public partial class MainWindow : FluentWindow
                 _revealedCredentialDialog = IntPtr.Zero;
                 return;
             }
+
+            _topmostSuppressedForCredential = true;
         }
 
         if (!WindowNativeMethods.SetWindowTopmost(handle, false))
         {
-            // 放下失败（窗口可能正在销毁）就不去抢前台，下一轮再试。
+            // 放下失败（窗口可能正在销毁）：回滚刚记的标记，下一轮再试。
             lock (_credentialDialogWatchGate)
             {
+                _topmostSuppressedForCredential = false;
                 _revealedCredentialDialog = IntPtr.Zero;
             }
 
             return;
-        }
-
-        lock (_credentialDialogWatchGate)
-        {
-            _topmostSuppressedForCredential = true;
         }
 
         // 顺序：先还原（防最小化）→ 提到本带顶部 → 抢前台焦点。
