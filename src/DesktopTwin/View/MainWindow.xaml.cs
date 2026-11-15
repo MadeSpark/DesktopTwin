@@ -987,6 +987,17 @@ public partial class MainWindow : FluentWindow
     /// </summary>
     private void RevealCredentialDialog(IntPtr handle, IntPtr dialog)
     {
+        // 从轮询回调到真正执行之间可能已经被退全屏/停轮询取代：再确认一次，
+        // 避免「已退出全屏」之后还用过期判断把原生置顶放下去、再也收不回来。
+        lock (_credentialDialogWatchGate)
+        {
+            if (!_credentialDialogWatchEnabled)
+            {
+                _revealedCredentialDialog = IntPtr.Zero;
+                return;
+            }
+        }
+
         if (!WindowNativeMethods.SetWindowTopmost(handle, false))
         {
             // 放下失败（窗口可能正在销毁）就不去抢前台，下一轮再试。
