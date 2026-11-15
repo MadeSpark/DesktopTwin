@@ -207,8 +207,10 @@ public sealed class WindowSettings
 /// <summary>
 /// 与外部工具联动、以及自动登录相关的可选设置。
 ///
-/// 这里的每一项都默认关闭：它们要么会结束本机别的进程（UU 视角切换），
+/// 除「自动登录」外，这里的每一项都默认关闭：它们要么会结束本机别的进程（UU 视角切换），
 /// 要么会保存登录凭据（自动登录），必须由用户主动打开。
+/// 自动登录默认开启：它只是「尽量自动填」，没存密码时退回 RDP 的缓存凭据/手动输入，
+/// 本身不保存任何密码，不需要用户先做一次选择。
 /// </summary>
 public sealed class AutomationSettings
 {
@@ -223,9 +225,10 @@ public sealed class AutomationSettings
     public string UuViewSwitchHotkey { get; set; } = "Ctrl+Alt+U";
 
     /// <summary>
-    /// 是否启用分身自动登录。
+    /// 是否启用分身自动登录。默认开启：没存密码时只尝试 RDP 记住的上一次凭据，
+    /// 失败或没有就退回手动输入，不会静默改变任何东西。
     /// </summary>
-    public bool AutoLoginEnabled { get; set; }
+    public bool AutoLoginEnabled { get; set; } = true;
 
     /// <summary>
     /// 自动登录使用的用户名。留空表示使用当前 Windows 账户。
