@@ -872,7 +872,7 @@ internal sealed class AutoLoginService : IDisposable
     /// 但 <c>CredUIPromptForWindowsCredentials</c> 在部分配置下走的是经典 Win32 对话框
     /// （<c>#32770</c>）。两种都要认，否则「保存并验证」在某些机器上会填不进去。
     /// </summary>
-    private static IntPtr FindCredentialDialog()
+    internal static IntPtr FindCredentialDialog()
     {
         var handle = WindowNativeMethods.FindWindowByClassName(CredentialDialogClassName);
         if (handle != IntPtr.Zero)

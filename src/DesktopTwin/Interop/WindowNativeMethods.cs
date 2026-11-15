@@ -15,6 +15,19 @@ internal static class WindowNativeMethods
     internal const uint SwpNoSize = 0x0001;
 
     /// <summary>
+    /// 设置窗口位置时不改变水平/垂直坐标。
+    /// </summary>
+    internal const uint SwpNoMove = 0x0002;
+
+    /// <summary>
+    /// <c>ShowWindow</c> 的 SW_RESTORE：把最小化的窗口还原并显示。
+    /// </summary>
+    internal const int SwRestore = 9;
+
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private static readonly IntPtr HwndNotopmost = new(-2);
+
+    /// <summary>
     /// 设置窗口位置时不改变 Z 序。
     /// </summary>
     internal const uint SwpNoZOrder = 0x0004;
@@ -57,6 +70,45 @@ internal static class WindowNativeMethods
             0,
             SwpNoSize | SwpNoZOrder | SwpNoActivate | SwpNoOwnerZOrder);
     }
+
+    /// <summary>
+    /// 把窗口移入/移出置顶带（WS_EX_TOPMOST）。
+    ///
+    /// 用 Win32 直接改而不是走 WPF 的 <c>Topmost</c> 依赖属性：
+    /// 凭据框是模态的，UI 线程会卡在它的消息循环里，WPF 的 Dispatcher 派发不了
+    /// 属性赋值；SetWindowPos 不经过 Dispatcher，任何时候都能立刻生效。
+    /// </summary>
+    internal static bool SetWindowTopmost(IntPtr window, bool topmost)
+    {
+        return SetWindowPos(
+            window,
+            topmost ? HwndTopmost : HwndNotopmost,
+            0,
+            0,
+            0,
+            0,
+            SwpNoMove | SwpNoSize | SwpNoActivate);
+    }
+
+    /// <summary>
+    /// 请求把窗口设为前台窗口。
+    /// </summary>
+    internal static bool SetForegroundWindow(IntPtr window) => SetForegroundWindowCore(window);
+
+    /// <summary>
+    /// 按 <paramref name="command"/> 显示窗口（例如 <see cref="SwRestore"/>）。
+    /// </summary>
+    internal static bool ShowWindow(IntPtr window, int command) => ShowWindowCore(window, command);
+
+    /// <summary>
+    /// 把窗口提到所在 Z 序带的顶部（不会越过置顶窗口）。
+    /// </summary>
+    internal static bool BringWindowToTop(IntPtr window) => BringWindowToTopCore(window);
+
+    /// <summary>
+    /// 窗口句柄是否仍然有效。
+    /// </summary>
+    internal static bool IsWindow(IntPtr window) => window != IntPtr.Zero && IsWindowCore(window);
 
     /// <summary>
     /// 按窗口类名查找顶层窗口，找不到返回 <see cref="IntPtr.Zero"/>。
@@ -211,6 +263,22 @@ internal static class WindowNativeMethods
         int width,
         int height,
         uint flags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindowCore(IntPtr window);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindowCore(IntPtr window, int command);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool BringWindowToTopCore(IntPtr window);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowCore(IntPtr window);
 
     /// <summary>
     /// 屏幕坐标矩形。
