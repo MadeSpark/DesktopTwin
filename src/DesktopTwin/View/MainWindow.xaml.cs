@@ -1025,7 +1025,12 @@ public partial class MainWindow : FluentWindow
         IntPtr handle;
         lock (_credentialDialogWatchGate)
         {
-            shouldRestore = _topmostSuppressedForCredential && _isFullscreen && _windowIsActive;
+            // 仍在全屏时，只有窗口是前台才恢复（否则会把本窗顶上去盖住别的程序）；
+            // 退出全屏时（_isFullscreen 已置 false）必须恢复原生置顶——凭据框场景里
+            // 降的是原生 WS_EX_TOPMOST，WPF 的 Topmost 还是 true，不恢复的话后面
+            // SetCurrentValue(Topmost, settings) 是 no-op，窗口就停在非置顶状态。
+            shouldRestore = _topmostSuppressedForCredential
+                            && (_windowIsActive || !_isFullscreen);
             if (shouldRestore)
             {
                 _topmostSuppressedForCredential = false;
