@@ -264,19 +264,21 @@ internal static class WindowNativeMethods
         int height,
         uint flags);
 
-    [DllImport("user32.dll")]
+    // 注意 EntryPoint：C# 方法名带了 Core 后缀避免与上面的包装方法重名，
+    // 但原生入口没有这个后缀，必须显式指回 user32.dll 里的真实名字。
+    [DllImport("user32.dll", EntryPoint = "SetForegroundWindow")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetForegroundWindowCore(IntPtr window);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", EntryPoint = "ShowWindow")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool ShowWindowCore(IntPtr window, int command);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", EntryPoint = "BringWindowToTop")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool BringWindowToTopCore(IntPtr window);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", EntryPoint = "IsWindow")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsWindowCore(IntPtr window);
 

@@ -74,6 +74,12 @@ public partial class MainWindow : FluentWindow
     private bool _credentialDialogWatchEnabled;
 
     /// <summary>
+    /// 窗口当前是否前台。UI 线程在 Activate/Deactivate 里更新，轮询线程读取——
+    /// 读写都走 <see cref="_credentialDialogWatchGate"/>，保证线程间可见。
+    /// </summary>
+    private bool _windowIsActive;
+
+    /// <summary>
     /// 有一条通知因为窗口隐藏没能重新打开，等可见时补上。
     /// 排队回调里窗口若正好被隐藏，这个状态不能丢，否则通知就没了。
     /// </summary>
@@ -285,6 +291,12 @@ public partial class MainWindow : FluentWindow
 
     private void OnWindowDeactivated(object? sender, EventArgs e)
     {
+        // 轮询线程恢复置顶前会看这个标记：窗口失焦后绝不能再被顶上去盖住别的程序。
+        lock (_credentialDialogWatchGate)
+        {
+            _windowIsActive = false;
+        }
+
         if (!_isFullscreen)
         {
             return;
@@ -308,6 +320,11 @@ public partial class MainWindow : FluentWindow
     /// </summary>
     private void OnWindowActivated(object? sender, EventArgs e)
     {
+        lock (_credentialDialogWatchGate)
+        {
+            _windowIsActive = true;
+        }
+
         if (!_isFullscreen)
         {
             return;
@@ -862,6 +879,7 @@ public partial class MainWindow : FluentWindow
             _revealedCredentialDialog = IntPtr.Zero;
             _topmostSuppressedForCredential = false;
             _credentialDialogWatchEnabled = true;
+            _windowIsActive = IsActive;
         }
 
         if (_credentialDialogWatchTimer is null)
@@ -936,20 +954,23 @@ public partial class MainWindow : FluentWindow
                 return;
             }
 
-            // 凭据框已经消失（用户提交/取消了），恢复置顶，让全屏重新盖住任务栏。
-            bool restoreTopmost;
+            // 凭据框已经消失（用户提交/取消了），尝试恢复置顶。
+            bool marshalRestore;
             lock (_credentialDialogWatchGate)
             {
-                restoreTopmost = _topmostSuppressedForCredential;
-                _topmostSuppressedForCredential = false;
+                // 窗口不在前台时不动、也不清标记：等 OnWindowActivated 时由
+                // RestoreTopmostAfterCredentialDialog 在 UI 线程重新检查后再恢复。
+                marshalRestore = _topmostSuppressedForCredential
+                                 && _credentialDialogWatchEnabled
+                                 && _windowIsActive;
                 _revealedCredentialDialog = IntPtr.Zero;
             }
 
-            // SetWindowPos 跨线程是 SendMessage，会等 UI 线程处理，不能放在锁里
-            // （否则 UI 线程若正好在等这把锁，两边就互相等死了）。
-            if (restoreTopmost)
+            if (marshalRestore)
             {
-                WindowNativeMethods.SetWindowTopmost(handle, true);
+                // 恢复置顶必须回到 UI 线程做：在线程池里直接 SetWindowPos，用的是
+                // 「查完状态就过期」的判断，UI 线程这期间可能又失焦/退全屏了。
+                _ = Dispatcher.BeginInvoke(new Action(RestoreTopmostAfterCredentialDialog));
             }
         }
         catch (Exception exception)
@@ -993,22 +1014,28 @@ public partial class MainWindow : FluentWindow
     }
 
     /// <summary>
-    /// 把「为凭据框放下置顶」的状态还原。UI 线程调用：焦点回到全屏窗、
-    /// 或退出全屏时都会走到这里，确保不会把窗口永久留在非置顶状态。
+    /// 把「为凭据框放下置顶」的状态还原。只会在 UI 线程被调用：焦点回到全屏窗
+    /// （<see cref="OnWindowActivated"/>）、退全屏收尾（<see cref="StopCredentialDialogWatch"/>）、
+    /// 或凭据框消失后由轮询线程 <c>Dispatcher.BeginInvoke</c> 回来。
+    /// 在这里统一重新检查「仍全屏 + 窗口是前台」，避免用过期判断改 Z 序。
     /// </summary>
     private void RestoreTopmostAfterCredentialDialog()
     {
-        bool restoreTopmost;
+        bool shouldRestore;
         IntPtr handle;
         lock (_credentialDialogWatchGate)
         {
-            restoreTopmost = _topmostSuppressedForCredential;
-            _topmostSuppressedForCredential = false;
-            _revealedCredentialDialog = IntPtr.Zero;
+            shouldRestore = _topmostSuppressedForCredential && _isFullscreen && _windowIsActive;
+            if (shouldRestore)
+            {
+                _topmostSuppressedForCredential = false;
+                _revealedCredentialDialog = IntPtr.Zero;
+            }
+
             handle = _windowHandle;
         }
 
-        if (restoreTopmost && _isFullscreen && handle != IntPtr.Zero)
+        if (shouldRestore && handle != IntPtr.Zero)
         {
             WindowNativeMethods.SetWindowTopmost(handle, true);
         }
