@@ -23,6 +23,17 @@ public partial class MainWindow : FluentWindow
     private const double FullscreenBarAutoHideSeconds = 6;
 
     /// <summary>
+    /// 全屏浮层工具栏距屏幕顶端的位置。
+    /// </summary>
+    private const double FullscreenBarTopOffset = 10;
+
+    /// <summary>
+    /// 全屏浮层工具栏自身高度：Border 上下内边距 6×2 + 按钮 30 + 边框 1×2。
+    /// 改工具栏样式时要一起调，通知条的位置依赖它。
+    /// </summary>
+    private const double FullscreenBarHeight = 44;
+
+    /// <summary>
     /// 鼠标进入窗口顶部这个高度（DIP）内就唤出工具栏。
     /// </summary>
     private const double FullscreenBarHotZone = 6;
@@ -33,9 +44,12 @@ public partial class MainWindow : FluentWindow
     private const double NormalNotificationOffset = 32;
 
     /// <summary>
-    /// 通知条在全屏模式下距屏幕顶端的位置（没有标题栏，贴近一点）。
+    /// 通知条在全屏模式下距屏幕顶端的位置。
+    ///
+    /// 必须让开全屏浮层工具栏（VerticalOffset 10 + 自身高约 44），否则两者重叠：
+    /// 切观看/控制模式的提示正好会在工具栏唤出时弹出来，会被工具栏压住。
     /// </summary>
-    private const double FullscreenNotificationOffset = 8;
+    private const double FullscreenNotificationOffset = FullscreenBarTopOffset + FullscreenBarHeight + 10;
 
     private readonly ChildSessionService _childSessionService;
     private readonly SettingsService _settings;
@@ -801,7 +815,7 @@ public partial class MainWindow : FluentWindow
                 }
 
                 FullscreenBarPopup.HorizontalOffset = Math.Max(0, (ActualWidth - barWidth) / 2);
-                FullscreenBarPopup.VerticalOffset = 10;
+                FullscreenBarPopup.VerticalOffset = FullscreenBarTopOffset;
             }
         }), DispatcherPriority.Loaded);
 
