@@ -42,11 +42,12 @@ public static partial class ChildSessionEnvironmentCheck
     private static readonly object TermsrvGate = new();
 
     /// <summary>
-    /// sfc /verifyfile 同一时刻只跑一个。
+    /// sfc 同一时刻只跑一个进程（校验 /verifyfile 与修复 /scanfile 共用）。
     ///
-    /// 修复完成后的同步复核很容易和后台校验撞上：两个进程读同一个文件只是白烧 CPU 和磁盘。
+    /// 修复完成后的同步复核很容易和后台校验撞上：两个进程读同一个文件只是白烧 CPU 和磁盘；
+    /// 两个 sfc 同时改同一个文件更糟——CBS 会互相打架。
     /// </summary>
-    private static readonly SemaphoreSlim SfcGate = new(1, 1);
+    internal static readonly SemaphoreSlim SfcGate = new(1, 1);
     private static TermsrvFileState _termsrvState = new(false, false, false, Array.Empty<string>());
     private static DateTime _termsrvStateAt = DateTime.MinValue;
 
@@ -295,11 +296,49 @@ public static partial class ChildSessionEnvironmentCheck
 
         try
         {
+            // 闸只管本进程。用户的 /scannow、或兜底扫描超时放闸后仍在跑的那种，
+            // 都只能靠查进程发现——撞上去会让校验结论不可信（两个 sfc 争 CBS）。
+            if (IsSfcProcessRunning())
+            {
+                AppLog.Info("已有 sfc 进程在运行，本次跳过校验。");
+                return -1;
+            }
+
             return RunSfcVerifyFileCore(path);
         }
         finally
         {
             SfcGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 是否已经有 sfc 进程在跑（不区分是谁启动的）。
+    /// </summary>
+    internal static bool IsSfcProcessRunning()
+    {
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName("sfc");
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+                                              or System.ComponentModel.Win32Exception)
+        {
+            AppLog.Warn("无法枚举 sfc 进程，按「没有在运行」处理。", exception);
+            return false;
+        }
+
+        try
+        {
+            return processes.Length > 0;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
         }
     }
 

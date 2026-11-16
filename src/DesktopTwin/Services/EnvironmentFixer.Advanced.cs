@@ -5,6 +5,7 @@ using System.IO;
 using System.Security;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using DesktopTwin.Interop;
 using DesktopTwin.Localization;
 using Microsoft.Win32;
@@ -252,7 +253,9 @@ public static partial class EnvironmentFixer
     /// 所以修复也用同一把尺子验收：**复制完必须复核通过才算成功**，
     /// 否则回滚原文件再交给 sfc —— 不能因为「看起来复制成功了」就宣布修好。
     ///
-    /// 顺序：先试工具自己留下的原版备份（秒级），没有可用备份才跑 sfc /scannow（5~15 分钟）。
+    /// 顺序：工具备份还原 → sfc /scanfile 就地修复 → sfc /scannow（独立窗口兜底）。
+    /// 前两步都在 TermService 停止的窗口里跑并当场复验：文件没被映射，sfc 能就地替换，
+    /// 修好了当场生效，不用重启。只有单文件都修不好时才退到完整扫描。
     /// </summary>
     private static Result FixTermsrvDll(CancellationToken cancellationToken)
     {
@@ -335,29 +338,51 @@ public static partial class EnvironmentFixer
             }
         }
 
-        // 2) 交给 sfc
+        // 2) 用 sfc /scanfile 就地修：只校验这一个文件，几秒到几十秒。
+        //    关键是它跑在服务停止的窗口里——文件没被映射，修复能当场落地，
+        //    不像 /scannow 那样被占用、只能登记到重启后。
         cancellationToken.ThrowIfCancellationRequested();
 
-        var sfcResult = RunSfcScannow(cancellationToken);
-        var after = ChildSessionEnvironmentCheck.VerifyTermsrvNow();
-
-        if (after.Exists && after.Verified && after.Intact)
+        var scanfileRepair = TryRepairTermsrvWithSfcScanfile(
+            termsrvPath, cancellationToken, out var scanfileStopError);
+        if (scanfileRepair is not null)
         {
-            // 不再追一句「此前可能未能重新启动」：停服务失败时 TryStart 往往本来就是成功的
-            //（服务还在跑），那句话会误报。真正的恢复结果由 FixTermsrvDll 收尾时判定，
-            // 那里失败会直接把结论改成失败并说明原因。
-            return new Result(true, Locale.Format("Fix.Termsrv.RepairedBySfc", sfcResult));
+            return scanfileRepair;
         }
 
-        var failureMessage = Locale.Format("Fix.Termsrv.SfcNotFixed", sfcResult);
-        if (stopFailure is not null)
+        // 3) 兜底：交回完整扫描，但不在本进程里等。
+        //    进度和结论还给 sfc 自己的控制台，我们既不用解析它的输出，
+        //    也不会因为超时去杀它——被杀会把替换登记成「重启后执行」，
+        //    用户下次开机被塞进「更新并重启」，比多等几分钟糟得多。
+        // 用户已经取消（或面板已关闭）就别再起一个几分钟的修复阶段。
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var launch = LaunchSfcScannowInConsole(cancellationToken);
+
+        var launchResult = launch switch
         {
-            // 根因要跟着结论一起给用户看：只留在日志里，用户只会看到「sfc 跑过了还是不一致」，
-            // 不知道是服务停不下来导致备份还原根本没做成。
-            failureMessage = Locale.Format("Fix.Termsrv.StopFailed", stopFailure) + failureMessage;
+            SfcLaunch.Launched => new Result(false, Locale.Get("Fix.Termsrv.ScannowLaunched")),
+            SfcLaunch.AlreadyRunning => new Result(false, Locale.Get("Fix.Termsrv.ScannowAlreadyRunning")),
+            _ => new Result(false, Locale.Get("Fix.Termsrv.ScannowLaunchFailed"))
+        };
+
+        if (stopFailure is not null || scanfileStopError is not null)
+        {
+            // 根因要跟着结论一起给用户看：只留在日志里，用户只会看到「sfc 跑过了还是不一致」。
+            // 两步分开说——备份停不下服务、就地修复却停下来了，这种情况不能混成一句「都没进行」。
+            launchResult = launchResult with
+            {
+                Message = (stopFailure is not null
+                              ? Locale.Format("Fix.Termsrv.StopFailed", stopFailure)
+                              : string.Empty)
+                          + (scanfileStopError is not null
+                              ? Locale.Format("Fix.Termsrv.ScanfileStopFailed", scanfileStopError)
+                              : string.Empty)
+                          + launchResult.Message
+            };
         }
 
-        return new Result(false, failureMessage);
+        return launchResult;
     }
 
     /// <summary>
@@ -515,75 +540,400 @@ public static partial class EnvironmentFixer
     }
 
     /// <summary>
-    /// 运行 <c>sfc /scannow</c>，返回给用户看的简短结果。
+    /// 在 TermService 停止的状态下用 <c>sfc /scanfile=</c> 就地修复 termsrv.dll。
+    ///
+    /// 相比 /scannow 的两点好处：
+    /// 1. 只校验一个文件，几秒到几十秒，用户不必等一次完整扫描；
+    /// 2. 服务停着，文件没被映射，sfc 可以当场替换，不必等到重启才生效。
     /// </summary>
-    private static string RunSfcScannow(CancellationToken cancellationToken)
+    /// <returns>修好返回结果；没修好返回 null，由调用方交给兜底。</returns>
+    private static Result? TryRepairTermsrvWithSfcScanfile(
+        string termsrvPath,
+        CancellationToken cancellationToken,
+        out string? stopFailure)
     {
+        stopFailure = null;
+
+        if (HasActiveNonConsoleSession())
+        {
+            return new Result(false, Locale.Get("Fix.SessionsRunning"));
+        }
+
+        var termServiceStopped = false;
+
         try
         {
+            // 标志位提前置位：TryStop 是在等状态收敛，等待超时会返回 false，
+            // 但服务此刻可能已经停了。跳过 TryStart 就等于把远程桌面关掉不还。
+            termServiceStopped = true;
+            if (!ServiceNativeMethods.TryStop("TermService", out var stopError)
+                && !WaitForServiceStopped("TermService", TimeSpan.FromSeconds(15)))
+            {
+                AppLog.Warn($"停止 TermService 失败，跳过 sfc /scanfile 修复：{stopError}");
+                stopFailure = stopError;
+                return null;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var outcome = RunSfcScanfile(termsrvPath, cancellationToken);
+            AppLog.Info($"sfc /scanfile 结果：{outcome.Description}");
+
+            if (outcome.Deferred)
+            {
+                // 已有 sfc 在跑，或者它超时了还在跑。这时候既不能杀，也不能再起一个
+                // /scannow 兜底——两个 sfc 同时改同一个文件，CBS 会互相打架。
+                return new Result(
+                    false,
+                    Locale.Format("Fix.Termsrv.ScanfileDeferred", outcome.Description));
+            }
+
+            // 只认文件本身，不猜退出码：sfc 返回 0 既可能是「本来就一致」，
+            // 也可能是「修好了」，还可能是「登记了重启后修复」，三者分不开。
+            var after = ChildSessionEnvironmentCheck.VerifyTermsrvNow();
+            if (after.Exists && after.Verified && after.Intact)
+            {
+                return new Result(
+                    true,
+                    Locale.Format("Fix.Termsrv.ScanfileRepaired", outcome.Description));
+            }
+
+            AppLog.Warn($"sfc /scanfile 未能修复 termsrv.dll（{outcome.Description}），转入完整扫描。");
+            return null;
+        }
+        finally
+        {
+            // 修复没成功也要把服务拉回来：不能因为一次失败的修复让用户失去远程桌面。
+            // sfc 用事务性替换，不会留下写到一半的文件，所以这里不需要像回滚备份那样
+            // 担心重启服务会加载坏 DLL。
+            if (termServiceStopped
+                && !ServiceNativeMethods.TryStart("TermService", out var startError))
+            {
+                AppLog.Warn($"sfc /scanfile 结束后重启 TermService 失败：{startError}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 单文件扫描的结果。
+    /// </summary>
+    /// <param name="ExitCode">sfc 退出码；没跑起来是 -1。</param>
+    /// <param name="Description">给用户看的一句话。</param>
+    /// <param name="Deferred">本次没有拿到结论：要么已有 sfc 在跑，要么它超时了还在跑。</param>
+    private readonly record struct SfcOutcome(int ExitCode, string Description, bool Deferred = false);
+
+    /// <summary>
+    /// 运行 <c>sfc /scanfile=</c> 并等它结束。
+    ///
+    /// 两个「绝不」：
+    /// 1. <b>绝不杀进程</b> —— sfc 的修复被中断只会变成 pending，下次开机强制跑一遍；
+    /// 2. <b>绝不起第二个 sfc</b> —— 两个 sfc 同时改同一个文件，CBS 会互相打架。
+    ///    所以已有 sfc 在跑、或本次超时仍未结束时，返回 Deferred 让调用方收手。
+    /// </summary>
+    private static SfcOutcome RunSfcScanfile(string path, CancellationToken cancellationToken)
+    {
+        var gate = ChildSessionEnvironmentCheck.SfcGate;
+
+        // 和后台校验共用一把闸：后台 verifyfile 只要几秒，等一会儿比撞车划算。
+        // 用带 token 的重载：用户取消时立刻退出，不必等闸、也不必白停一遍服务。
+        if (!gate.Wait(TimeSpan.FromSeconds(30), cancellationToken))
+        {
+            return new SfcOutcome(-1, Locale.Get("Fix.Termsrv.ScanfileBusy"), Deferred: true);
+        }
+
+        var gateHandedOver = false;
+        Process? process = null;
+        try
+        {
+            // 闸只管本进程。用户自己开的 /scannow（或上一次留下的窗口）看不到闸，
+            // 这时候再起一个 /scanfile 就是两个 sfc 抢同一个文件——先查进程。
+            if (IsSfcRunning())
+            {
+                return new SfcOutcome(-1, Locale.Get("Fix.Termsrv.ScanfileBusy"), Deferred: true);
+            }
+
             var sfc = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.System),
                 "sfc.exe");
 
             if (!File.Exists(sfc))
             {
-                return Locale.Get("Fix.Termsrv.SfcMissing");
+                return new SfcOutcome(-1, Locale.Get("Fix.Termsrv.SfcMissing"));
             }
 
-            using var process = Process.Start(new ProcessStartInfo
+            // 不用 using：超时要把进程的所有权连同闸一起交给后台，
+            // 这里提前 Dispose 会让后台的 WaitForExit 失去句柄。
+            process = Process.Start(new ProcessStartInfo
             {
                 FileName = sfc,
-                Arguments = "/scannow",
+                Arguments = $"/scanfile={path}",
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+
+                // sfc 输出是 UTF-16LE。不设这一行读到的是夹了一堆 \0 的乱码。
+                StandardOutputEncoding = Encoding.Unicode
             });
 
             if (process is null)
             {
-                return Locale.Get("Fix.Termsrv.SfcFailed");
+                return new SfcOutcome(-1, Locale.Get("Fix.Termsrv.SfcFailed"));
             }
 
-            // sfc 通常 5~15 分钟；给足时间，期间允许取消。
-            var timeout = TimeSpan.FromMinutes(30);
-            var deadline = DateTime.UtcNow + timeout;
-            while (!process.WaitForExit(2000))
+            // 必须先挂上读再等退出：输出超过管道缓冲区时子进程会卡在写，双方一起等死。
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var started = process;
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
+            while (!started.WaitForExit(500))
             {
-                if (cancellationToken.IsCancellationRequested)
-                {
-                    try
-                    {
-                        process.Kill(entireProcessTree: true);
-                    }
-                    catch (Exception exception) when (exception is InvalidOperationException
-                                                          or System.ComponentModel.Win32Exception)
-                    {
-                        // 进程刚好退出。
-                    }
-
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-
                 if (DateTime.UtcNow > deadline)
                 {
-                    return Locale.Get("Fix.Termsrv.SfcTimeout");
+                    // 进程还活着，就让它跑完：这里既不能杀，也不能再起一个。
+                    // 闸也不能就地放——放了等于允许下一个 sfc 进来跟还活着的这个抢同一个文件。
+                    // 所有权交给后台，等它真正退出再放。
+                    HandOverGateUntilExit(started, gate);
+                    gateHandedOver = true;
+                    process = null;
+                    return new SfcOutcome(-1, Locale.Get("Fix.Termsrv.ScanfileTimeout"), Deferred: true);
                 }
             }
 
-            return process.ExitCode switch
-            {
-                0 => Locale.Get("Fix.Termsrv.SfcClean"),
-                1 => Locale.Get("Fix.Termsrv.SfcRepaired"),
-                _ => Locale.Get("Fix.Termsrv.SfcCouldNotRepair")
-            };
+            var text = outputTask.GetAwaiter().GetResult();
+            return new SfcOutcome(started.ExitCode, DescribeSfcOutput(text, started.ExitCode));
         }
         catch (Exception exception) when (exception is InvalidOperationException
                                               or System.ComponentModel.Win32Exception
                                               or IOException)
         {
-            AppLog.Warn("运行 sfc 失败。", exception);
-            return Locale.Get("Fix.Termsrv.SfcFailed");
+            AppLog.Warn("运行 sfc /scanfile 失败。", exception);
+            return new SfcOutcome(-1, Locale.Get("Fix.Termsrv.SfcFailed"));
+        }
+        finally
+        {
+            process?.Dispose();
+            if (!gateHandedOver)
+            {
+                gate.Release();
+            }
         }
     }
+
+    /// <summary>
+    /// 把闸的所有权交给 sfc 进程：等它真正退出后才释放。
+    ///
+    /// 超时时进程还活着，就地释放等于允许第二个 sfc 进来改同一个文件 —— CBS 会互相打架，
+    /// 而我们要么拿不到结论、要么把文件改坏。挂在后台等待进程退出是唯一诚实的做法。
+    /// </summary>
+    private static void HandOverGateUntilExit(Process process, SemaphoreSlim gate)
+    {
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                process.WaitForExit();
+            }
+            catch (Exception exception) when (exception is InvalidOperationException
+                                                  or System.ComponentModel.Win32Exception)
+            {
+                AppLog.Warn("等待超时的 sfc /scanfile 退出失败。", exception);
+            }
+            finally
+            {
+                process.Dispose();
+                gate.Release();
+            }
+        });
+    }
+
+    /// <summary>
+    /// 把 sfc 的中文输出压成一句能放进 UI 的话。
+    /// 匹配不到就退回退出码——文案随系统语言变，不能拿它当判定依据，
+    /// 判定一律看 <see cref="ChildSessionEnvironmentCheck.VerifyTermsrvNow"/> 的复验结果。
+    /// </summary>
+    private static string DescribeSfcOutput(string output, int exitCode)
+    {
+        if (output.Contains("未找到任何完整性违规", StringComparison.Ordinal))
+        {
+            return Locale.Get("Fix.Termsrv.ScanfileClean");
+        }
+
+        if (output.Contains("无法修复", StringComparison.Ordinal))
+        {
+            return Locale.Get("Fix.Termsrv.ScanfileCannotRepair");
+        }
+
+        if (output.Contains("成功修复", StringComparison.Ordinal))
+        {
+            return Locale.Get("Fix.Termsrv.SfcRepaired");
+        }
+
+        if (output.Contains("重新启动", StringComparison.Ordinal)
+            || output.Contains("重启", StringComparison.Ordinal))
+        {
+            return Locale.Get("Fix.Termsrv.ScanfileNeedRestart");
+        }
+
+        return Locale.Format("Fix.Termsrv.ScanfileExitCode", exitCode);
+    }
+
+    /// <summary>
+    /// 兜底扫描的启动结果。
+    /// </summary>
+    private enum SfcLaunch
+    {
+        Launched,
+        AlreadyRunning,
+        Failed
+    }
+
+    /// <summary>
+    /// 弹出独立命令行窗口运行 <c>sfc /scannow</c>，把进度和结论交回给 sfc 自己。
+    ///
+    /// 刻意不等待、不重定向、不杀进程：
+    /// 1. 它是保底手段，跑几分钟很正常，把主程序卡在那儿没有意义；
+    /// 2. sfc 的修复无法真正中断——被杀掉只会把替换动作登记到下次开机，
+    ///    用户会被塞进「更新并关机/重启」，再运行 sfc 还会被要求先重启。
+    ///    与其冒险终止，不如让它自己跑完。
+    ///
+    /// 走到这里时 TermService 已经恢复运行，termsrv.dll 又处在被映射状态，
+    /// 所以这次扫描多半也是登记 pending、重启后才替换——这是预期行为，
+    /// 调用方会把「可能需要重启」写进给用户的话里。
+    /// </summary>
+    private static SfcLaunch LaunchSfcScannowInConsole(CancellationToken cancellationToken)
+    {
+        // 先确认本进程没有 sfc 在跑（后台 /verifyfile 可能正巧在复核）：
+        // 直接查进程会把「自己的校验」误判成「别人在扫」，从而白白跳过兜底修复。
+        var gate = ChildSessionEnvironmentCheck.SfcGate;
+
+        bool gateHeld;
+        try
+        {
+            // 用带 token 的重载：用户取消时不必在这里干等 30 秒再起一个几分钟的扫描。
+            gateHeld = gate.Wait(TimeSpan.FromSeconds(30), cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return SfcLaunch.Failed;
+        }
+
+        var handedOver = false;
+        try
+        {
+            if (!gateHeld)
+            {
+                AppLog.Info("本进程的 sfc 校验仍在进行，跳过兜底扫描。");
+                return SfcLaunch.AlreadyRunning;
+            }
+
+            // 持着闸还能看到 sfc 进程，那就是外部的（用户自己开的 /scannow 或上一次的窗口）。
+            if (IsSfcRunning())
+            {
+                AppLog.Info("已有 sfc 进程在运行，跳过兜底扫描。");
+                return SfcLaunch.AlreadyRunning;
+            }
+
+            var sfc = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System),
+                "sfc.exe");
+
+            if (!File.Exists(sfc))
+            {
+                AppLog.Warn("找不到 sfc.exe，无法启动兜底扫描。");
+                return SfcLaunch.Failed;
+            }
+
+            // 外层 cmd 用 start 显式开一个新控制台，内层 /k 让窗口留着不关，
+            // 用户能看到 sfc 的输出和最后结论。
+            // 不用 CreateNoWindow=false 直接起 cmd：父进程要是本来就有控制台
+            //（比如从终端启动的本程序），子进程会附到同一个窗口里，看起来像卡住了。
+            //
+            // 内层必须用绝对路径：cmd 对不带路径的命令是先查当前目录再查 PATH 的，
+            // 而这个进程从可写目录启动时，那里放一个同名 sfc.exe 就会被以管理员权限执行
+            //（CWE-426）。WorkingDirectory 一起钉到 System32 兜底。
+            //
+            // 两个 cmd 都加 /d：否则它们会执行 HKCU 下 Command Processor\AutoRun 里的命令，
+            // 而同用户权限的进程可以写那个键——提权执行的正是别人的命令（CWE-78）。
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+                Arguments = $"/d /c start \"\" cmd.exe /d /k \"{sfc}\" /scannow",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Environment.SystemDirectory
+            });
+
+            if (process is null)
+            {
+                return SfcLaunch.Failed;
+            }
+
+            // 闸要跟着这次完整扫描走到结束再放：外层 cmd 立刻退出，真正的 /scannow
+            // 在另一个窗口里跑几分钟，中途放开会让后台 /verifyfile 撞进来。
+            HandOverGateUntilScanCompletes(gate);
+            handedOver = true;
+
+            AppLog.Info("已在独立命令行窗口启动 sfc /scannow。");
+            return SfcLaunch.Launched;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+                                              or System.ComponentModel.Win32Exception
+                                              or IOException)
+        {
+            AppLog.Warn("启动 sfc /scannow 窗口失败。", exception);
+            return SfcLaunch.Failed;
+        }
+        finally
+        {
+            if (gateHeld && !handedOver)
+            {
+                gate.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 把闸交给后台，等这次完整扫描真正结束再释放。
+    ///
+    /// 外层 <c>cmd /c start</c> 启动后立刻退出，扫描本体在另一个进程里跑几分钟，
+    /// 而且从「cmd 起来」到「sfc.exe 出现在进程表」之间还有一小段间隔。
+    /// 期间放开闸，后台 <c>/verifyfile</c> 就会闯进来和扫描抢同一个文件：
+    /// 两个 sfc 争 CBS 的资源，校验结论也不可信。
+    /// </summary>
+    private static void HandOverGateUntilScanCompletes(SemaphoreSlim gate)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // 先等扫描进程真正出现，最多 10 秒（sfc 秒退或没起来就没什么可等的）。
+                var appearDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+                while (DateTime.UtcNow < appearDeadline && !IsSfcRunning())
+                {
+                    await Task.Delay(200).ConfigureAwait(false);
+                }
+
+                // 再等它退出。给个上限，避免异常情况下把闸永久占住。
+                var exitDeadline = DateTime.UtcNow + TimeSpan.FromMinutes(30);
+                while (DateTime.UtcNow < exitDeadline && IsSfcRunning())
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+    }
+
+    /// <summary>
+    /// 是否已经有 sfc 在跑（含用户自己开的、上次窗口留下的）。
+    ///
+    /// 按进程名查而不是查我们的闸：闸只管本进程。实现放在检查侧，
+    /// 校验路径也要用它，避免两处各写一份判断。
+    /// </summary>
+    private static bool IsSfcRunning() => ChildSessionEnvironmentCheck.IsSfcProcessRunning();
 
     // ---------------- 辅助 ----------------
 
