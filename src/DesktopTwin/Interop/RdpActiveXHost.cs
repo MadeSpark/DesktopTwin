@@ -247,12 +247,7 @@ internal sealed class RdpActiveXHost : AxHost
     /// 屏蔽或恢复本机进入桌面分身的鼠标键盘输入。期望状态会被记住，
     /// 每次连接登录后由 ChildSessionService 重新施加。
     /// </summary>
-    /// <param name="blocked">是否屏蔽本机输入。</param>
-    /// <param name="restoreFocus">
-    /// 解除阻止后是否把焦点还给输入窗口。只有用户主动切换模式时才该传 true；
-    /// 登录后自动重新施加的状态不能抢焦点，否则会从本机正在输入的控件里把键盘抢走。
-    /// </param>
-    internal void SetInputBlocked(bool blocked, bool restoreFocus = false)
+    internal void SetInputBlocked(bool blocked)
     {
         _inputBlocked = blocked;
         if (!IsHandleCreated)
@@ -266,7 +261,7 @@ internal sealed class RdpActiveXHost : AxHost
         // 解除阻止后把焦点交还给输入窗口：被禁用期间 Windows 已把焦点移走，
         // 仅重新启用输入窗口不会让 RDP 自动恢复输入转发，必须让它重新持有焦点，
         // 否则表现为「按钮已切回控制模式，画面却始终像观看模式一样没反应」。
-        if (!blocked && restoreFocus && ConnectedState == 1)
+        if (!blocked && ConnectedState == 1)
         {
             var focused = ChildSessionNativeMethods.TryFocusRdpInputWindow(Handle);
             AppLog.Info(

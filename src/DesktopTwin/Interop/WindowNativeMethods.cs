@@ -115,7 +115,7 @@ internal static class WindowNativeMethods
     /// </summary>
     /// <param name="className">窗口类名。</param>
     /// <param name="titleContains">可选的标题关键字，用于区分同类的不同窗口。</param>
-    internal static IntPtr FindWindowByClassName(string className, string? titleContains = null)
+    internal static IntPtr FindWindowByClassName(string className, string? titleContains = null, int? processId = null)
     {
         if (string.IsNullOrEmpty(className))
         {
@@ -136,6 +136,17 @@ internal static class WindowNativeMethods
                 if (!string.Equals(buffer.ToString(), className, StringComparison.Ordinal))
                 {
                     return true;
+                }
+
+                // 只认指定进程的窗口：`#32770` 这类通用类名同时属于别的程序
+                // （mstsc、OneDrive、VPN 客户端……），不过滤会把本程序的凭据填到别人框里。
+                if (processId is not null)
+                {
+                    GetWindowThreadProcessId(window, out var windowProcessId);
+                    if (windowProcessId != processId.Value)
+                    {
+                        return true;
+                    }
                 }
 
                 if (titleContains is not null)
@@ -246,6 +257,9 @@ internal static class WindowNativeMethods
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr window, StringBuilder text, int maximumLength);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out int processId);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

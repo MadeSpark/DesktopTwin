@@ -874,15 +874,25 @@ internal sealed class AutoLoginService : IDisposable
     /// </summary>
     internal static IntPtr FindCredentialDialog()
     {
+        // 现代凭据框（XAML 版）在 Windows 10/11 上由 CredentialUIBroker.exe 宿主，
+        // 不是本进程创建的 —— 按本进程过滤会把真正的 RDP 凭据框排除掉，自动填充
+        // 和全屏拉前台都会失效。这个类名本身也只被 CredUI 使用，保留原样。
         var handle = WindowNativeMethods.FindWindowByClassName(CredentialDialogClassName);
         if (handle != IntPtr.Zero)
         {
             return handle;
         }
 
+        // 经典 Win32 凭据框走的是 #32770 —— 这是所有对话框的通用类名（UAC、别的
+        // RDP 客户端、各种登录框），必须限定本进程，否则会把密码填进别人的框里。
+        // 经典样式的凭据框是本进程内的 RDP ActiveX 弹的，过滤不会误伤。
+        var ownProcessId = Environment.ProcessId;
         foreach (var keyword in LegacyDialogTitleKeywords)
         {
-            handle = WindowNativeMethods.FindWindowByClassName(LegacyDialogClassName, keyword);
+            handle = WindowNativeMethods.FindWindowByClassName(
+                LegacyDialogClassName,
+                keyword,
+                processId: ownProcessId);
             if (handle != IntPtr.Zero)
             {
                 return handle;
