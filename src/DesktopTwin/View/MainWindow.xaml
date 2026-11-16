@@ -38,7 +38,11 @@
                      VerticalContentAlignment="Top">
             <ui:TitleBar.Header>
                 <!-- 左侧留出与窗口边框的距离：ExtendsContentIntoTitleBar 下标题栏内容从 x=0 开始，
-                     不留边距时状态灯会贴着窗口左边缘。12 与系统标题栏图标的缩进量一致。 -->
+                     不留边距时状态灯会贴着窗口左边缘。12 与系统标题栏图标的缩进量一致。
+
+                     标题限宽：TitleBar 模板里 Header 是 Auto 列，会按内容宽度占位、
+                     不会自己让位给右侧按钮。不限宽的话，窄窗口下标题把按钮和
+                     系统按钮（最小化/全屏/关闭）一起顶出可视区。 -->
                 <StackPanel Margin="12,0,0,0"
                             VerticalAlignment="Center"
                             Orientation="Horizontal">
@@ -50,8 +54,10 @@
                              Margin="0,0,8,0"
                              Fill="{Binding ConnectionStatusBrush}"
                              ToolTip="{Binding ConnectionStatusToolTip}" />
-                    <TextBlock VerticalAlignment="Center"
-                               Text="{loc:Loc Main.Title}" />
+                    <TextBlock MaxWidth="160"
+                               VerticalAlignment="Center"
+                               Text="{loc:Loc Main.Title}"
+                               TextTrimming="CharacterEllipsis" />
                 </StackPanel>
             </ui:TitleBar.Header>
             <ui:TitleBar.TrailingContent>
