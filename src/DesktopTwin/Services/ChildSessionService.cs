@@ -625,6 +625,10 @@ public sealed class ChildSessionService : IDisposable
         _settingsReconnectGeneration++;
         window?.RdpHost.CancelPendingReconnect();
 
+        // 在途的自动重连已经作废，这次连接不会再继续：凭据框监听也一并停掉，
+        // 否则它会一直盯到 60 秒上限，期间本机任何一个凭据框都可能被误填。
+        _autoLogin?.StopWatching();
+
         if (window is null || window.RdpHost.ConnectedState == 0)
         {
             return false;
@@ -993,6 +997,8 @@ public sealed class ChildSessionService : IDisposable
         ThrowIfDisposed();
         _settings.Current.Session.WatchMode = enabled;
         _settings.SaveSoon();
+        // 切回控制模式时 SetInputBlocked 会把焦点还给输入窗口：观看模式期间
+        // 被系统移走的焦点不会自动回来，画面看着像还在观看模式。
         _desktopWindow?.RdpHost.SetInputBlocked(enabled);
         RefreshState(enabled
             ? Locale.Get("Svc.Status.WatchModeOn")
@@ -1464,6 +1470,20 @@ public sealed class ChildSessionService : IDisposable
         window.Activate();
     }
 
+    /// <summary>
+    /// 是否正处在连接流程里（RDP 正在连接，或有一次连接尝试在途）。
+    ///
+    /// 不能只看 <see cref="ConnectedState"/>：Connect 是异步发起的，刚调用完的那一小段
+    /// 时间里状态还没变成 2，只看它会误判成「不在连接中」而把刚启动的凭据框监听停掉。
+    /// 设置变更后的自动重连也要算进来——那段时间状态同样是 0，但它确实还会再连一次。
+    /// </summary>
+    private bool IsConnectionAttemptInProgress()
+    {
+        return ConnectedState == 2
+               || _connectionAttemptCompletionSource is { Task.IsCompleted: false }
+               || _pendingRdpSettingChanges != RdpSettingChange.None;
+    }
+
     private void OnStatusTimerTick(object? sender, EventArgs e)
     {
         if (_statusTickInProgress || _disposed)
@@ -1485,6 +1505,12 @@ public sealed class ChildSessionService : IDisposable
                 && !_suppressCredentialDialogFill)
             {
                 _autoLogin.StartWatching();
+            }
+            else if (!IsConnectionAttemptInProgress())
+            {
+                // 连接已经不在进行中（既没在连、也没有在途的连接尝试）就别再盯着凭据框：
+                // 监听会自己跑到 60 秒上限，这段时间里本机任何一个凭据框都有可能被误填。
+                _autoLogin?.StopWatching();
             }
         }
         catch (Exception exception) when (IsExpectedChildSessionException(exception))

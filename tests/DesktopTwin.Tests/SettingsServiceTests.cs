@@ -37,9 +37,10 @@ public sealed class SettingsServiceTests : IDisposable
         // 首次运行提示默认未确认
         Assert.False(settings.ChildSessionNoticeAccepted);
 
-        // 自动化相关能力默认全关：它们会结束别的进程或保存凭据，必须由用户主动开启
+        // UU 视角切换默认关（会结束别的进程），自动登录默认开（没存密码时只尝试
+        // RDP 记住的上一次凭据、失败退回手动输入，本身不保存密码，无需用户先做选择）
         Assert.False(settings.Automation.UuViewSwitchEnabled);
-        Assert.False(settings.Automation.AutoLoginEnabled);
+        Assert.True(settings.Automation.AutoLoginEnabled);
         Assert.Equal("Ctrl+Alt+U", settings.Automation.UuViewSwitchHotkey);
 
         // 密码表默认是空的，且按键不区分大小写（多账户各存一份）

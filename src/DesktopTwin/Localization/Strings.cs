@@ -119,7 +119,6 @@ internal static class Strings
         Pair("Menu.Diagnostics.DisableChildSessions", "关闭 Child Sessions（恢复系统原状）"),
 
         // ---- 全屏顶栏 ----
-        Pair("Fullscreen.Title", "桌面分身"),
         Pair("Fullscreen.Minimize", "最小化"),
         Pair("Fullscreen.Restore", "还原"),
         Pair("Fullscreen.Restore.ToolTip", "退出全屏，回到窗口模式"),
@@ -433,10 +432,10 @@ internal static class Strings
         Pair("Startup.ElevatedConfirm.Title", "确认自动以管理员权限启动"),
         Pair("Startup.NeedTarget.Title", "还需要选择目标程序"),
         Pair("Startup.NeedTarget.Message", "「自动启动 + 管理员权限」需要一个明确的目标程序。选好之后会再确认一次。"),
-        Pair("Main.WatchMode.Enter.ToolTip", "分身画面仅可观看，本机键鼠不会生效"),
-        Pair("Main.WatchMode.Exit.ToolTip", "退出观看模式"),
         Pair("Main.WatchMode.Watch", "观看模式"),
         Pair("Main.WatchMode.Control", "控制模式"),
+        Pair("Main.WatchMode.Button.Watch.ToolTip", "当前处于观看模式：本机键鼠不会进入桌面分身。点击切换为控制模式。"),
+        Pair("Main.WatchMode.Button.Control.ToolTip", "当前处于控制模式：本机键鼠可以操作桌面分身。点击切换为观看模式。"),
         Pair("Main.SmallWindow.Enable.ToolTip", "把窗口缩到 750 宽，并按 16:9 同步缩小高度"),
         Pair("Main.SmallWindow.Restore.ToolTip", "将窗口还原至默认大小"),
         Pair("Main.SmallWindow.Enable", "小窗模式"),
@@ -620,8 +619,8 @@ internal static class Strings
         Pair("Check.Termsrv.Title", "termsrv.dll 与系统组件库不一致"),
         Pair("Check.Termsrv.Summary.Dirty", "sfc 校验发现完整性冲突，文件被直接改过"),
         Pair("Check.Termsrv.Summary.Missing", "termsrv.dll 不存在"),
-        Pair("Check.Termsrv.Detail.Dirty", "少数改版不走「替换 ServiceDll」那条路，而是直接给 %SystemRoot%\\System32\\termsrv.dll 打二进制补丁。这种情况下 ServiceDll 指向原生 DLL 也没用，因为原生 DLL 本身已经被改过。\n\n疑似备份文件：{0}\n（备份文件存在本身就是「有人直接改过」的证据）\n\n判定方式：用 sfc 与该文件的系统组件库副本比对（termsrv.dll 只有目录签名，数字签名校验在这里不可靠）。修复顺序：先用工具留下的备份还原（复制后会用 sfc 复核）；不行再运行 sfc /scannow（通常 5~15 分钟）。注意：文件被远程桌面服务占用时，sfc 往往要到重启后才真正替换，所以跑完会重新校验，没通过就提示你重启。"),
-        Pair("Check.Termsrv.Detail.Missing", "系统目录里找不到 termsrv.dll —— 远程桌面服务没有实现体，任何连接都会失败。\n疑似备份文件：{0}\n\n修复会先试备份，不行再运行 sfc /scannow。"),
+        Pair("Check.Termsrv.Detail.Dirty", "少数改版不走「替换 ServiceDll」那条路，而是直接给 %SystemRoot%\\System32\\termsrv.dll 打二进制补丁。这种情况下 ServiceDll 指向原生 DLL 也没用，因为原生 DLL 本身已经被改过。\n\n疑似备份文件：{0}\n（备份文件存在本身就是「有人直接改过」的证据）\n\n判定方式：用 sfc 与该文件的系统组件库副本比对（termsrv.dll 只有目录签名，数字签名校验在这里不可靠）。修复顺序：先用工具留下的备份还原（复制后会用 sfc 复核）；不行就在停掉远程桌面服务后用 sfc /scanfile 就地修这一个文件（几秒到几十秒，修好当场生效）；只有单文件都修不好时，才会在新窗口里启动一次完整的 sfc /scannow（通常 5~15 分钟）。"),
+        Pair("Check.Termsrv.Detail.Missing", "系统目录里找不到 termsrv.dll —— 远程桌面服务没有实现体，任何连接都会失败。\n疑似备份文件：{0}\n\n修复会先试备份，不行再用 sfc /scanfile 就地修复，最后才退到完整扫描。"),
         Pair("Check.Termsrv.Backups", "{0}"),
         Pair("Check.Termsrv.NoBackup", "无"),
         Pair("Check.Termsrv.State.Intact", "与系统组件库一致"),
@@ -665,12 +664,26 @@ internal static class Strings
         Pair("Fix.Termsrv.SfcRepaired", "已修复受损文件"),
         Pair("Fix.Termsrv.SfcCouldNotRepair", "存在无法修复的项"),
 
+        // ---- 第二组修复：termsrv.dll 就地修复（sfc /scanfile）与兜底扫描 ----
+        Pair("Fix.Termsrv.ScanfileRepaired", "已就地修复 termsrv.dll（{0}），无需重启。"),
+        Pair("Fix.Termsrv.ScanfileDeferred", "{0}，请稍后重新检测（修复可能仍在后台进行）。"),
+        Pair("Fix.Termsrv.ScanfileStopFailed", "就地修复时无法停止远程桌面服务（{0}）。"),
+        Pair("Fix.Termsrv.ScanfileBusy", "已有 sfc 在运行，本次修复没有启动"),
+        Pair("Fix.Termsrv.ScanfileTimeout", "sfc /scanfile 超过 2 分钟仍在运行"),
+        Pair("Fix.Termsrv.ScanfileClean", "校验通过，未发现损坏"),
+        Pair("Fix.Termsrv.ScanfileCannotRepair", "发现损坏但 sfc 无法修复"),
+        Pair("Fix.Termsrv.ScanfileNeedRestart", "sfc 要求重启后才能完成"),
+        Pair("Fix.Termsrv.ScanfileExitCode", "sfc 返回 {0}"),
+        Pair("Fix.Termsrv.ScannowLaunched", "已在新窗口启动完整的 sfc /scannow（通常 5~15 分钟）。请不要关闭该窗口——sfc 的修复被中断会转成「重启后执行」，下次开机会被强制修复。窗口里出现结论后重新检测；若提示需要重启，请重启后再检测一次。"),
+        Pair("Fix.Termsrv.ScannowAlreadyRunning", "已经有一个 sfc 正在运行，本次没有再启动。等它结束后重新检测即可。"),
+        Pair("Fix.Termsrv.ScannowLaunchFailed", "无法自动启动 sfc /scannow，请以管理员身份打开命令行，手动执行 sfc /scannow。"),
+
         // ---- 第二组修复的确认提示 ----
         Pair("Diag.FixHint.DllType", "这会把 ServiceDll 按 REG_EXPAND_SZ 写回原生 termsrv.dll，并重启远程桌面服务。重启会断开当前的远程桌面连接（包括正在用的桌面分身）。"),
         Pair("Diag.FixHint.ServiceKey", "这会把 TermService 的 ImagePath、ObjectName 恢复为系统默认，并把缺失的依赖（RPCSS、StateRepository）追加进去，然后重启服务。重启会断开当前的远程桌面连接。"),
         Pair("Diag.FixHint.Persistence", "这会把命中的计划任务导出成 XML、自启项导出成文本存到备份目录，然后删除它们。删除后这些工具不会再在开机时把配置改回破解状态。"),
         Pair("Diag.FixHint.RdpSecurity", "这只会把低于系统默认的安全参数补回默认值，已经加固成更高值的保持不动。改动在远程桌面服务下次启动时生效，不重启服务。"),
-        Pair("Diag.FixHint.Termsrv", "这会先用工具留下的备份还原 termsrv.dll（复制后立刻用 sfc 复核，不通过就回滚）；没有可用备份时运行 sfc /scannow。sfc 通常需要 5~15 分钟，期间面板会一直显示「正在修复」，请不要关闭。若文件被占用，可能要到重启后才真正替换。"),
+        Pair("Diag.FixHint.Termsrv", "这会先用工具留下的备份还原 termsrv.dll（复制后立刻用 sfc 复核，不通过就回滚）；没有可用备份时，停掉远程桌面服务后用 sfc /scanfile 就地修复这一个文件（几秒到几十秒，修好当场生效、无需重启）；单文件修不好才在新窗口里启动完整的 sfc /scannow（通常 5~15 分钟，跑完窗口会留着结论）。"),
 
     ];
 

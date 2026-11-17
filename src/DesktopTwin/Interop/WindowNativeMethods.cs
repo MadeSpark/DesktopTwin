@@ -15,6 +15,19 @@ internal static class WindowNativeMethods
     internal const uint SwpNoSize = 0x0001;
 
     /// <summary>
+    /// 设置窗口位置时不改变水平/垂直坐标。
+    /// </summary>
+    internal const uint SwpNoMove = 0x0002;
+
+    /// <summary>
+    /// <c>ShowWindow</c> 的 SW_RESTORE：把最小化的窗口还原并显示。
+    /// </summary>
+    internal const int SwRestore = 9;
+
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private static readonly IntPtr HwndNotopmost = new(-2);
+
+    /// <summary>
     /// 设置窗口位置时不改变 Z 序。
     /// </summary>
     internal const uint SwpNoZOrder = 0x0004;
@@ -59,11 +72,50 @@ internal static class WindowNativeMethods
     }
 
     /// <summary>
+    /// 把窗口移入/移出置顶带（WS_EX_TOPMOST）。
+    ///
+    /// 用 Win32 直接改而不是走 WPF 的 <c>Topmost</c> 依赖属性：
+    /// 凭据框是模态的，UI 线程会卡在它的消息循环里，WPF 的 Dispatcher 派发不了
+    /// 属性赋值；SetWindowPos 不经过 Dispatcher，任何时候都能立刻生效。
+    /// </summary>
+    internal static bool SetWindowTopmost(IntPtr window, bool topmost)
+    {
+        return SetWindowPos(
+            window,
+            topmost ? HwndTopmost : HwndNotopmost,
+            0,
+            0,
+            0,
+            0,
+            SwpNoMove | SwpNoSize | SwpNoActivate);
+    }
+
+    /// <summary>
+    /// 请求把窗口设为前台窗口。
+    /// </summary>
+    internal static bool SetForegroundWindow(IntPtr window) => SetForegroundWindowCore(window);
+
+    /// <summary>
+    /// 按 <paramref name="command"/> 显示窗口（例如 <see cref="SwRestore"/>）。
+    /// </summary>
+    internal static bool ShowWindow(IntPtr window, int command) => ShowWindowCore(window, command);
+
+    /// <summary>
+    /// 把窗口提到所在 Z 序带的顶部（不会越过置顶窗口）。
+    /// </summary>
+    internal static bool BringWindowToTop(IntPtr window) => BringWindowToTopCore(window);
+
+    /// <summary>
+    /// 窗口句柄是否仍然有效。
+    /// </summary>
+    internal static bool IsWindow(IntPtr window) => window != IntPtr.Zero && IsWindowCore(window);
+
+    /// <summary>
     /// 按窗口类名查找顶层窗口，找不到返回 <see cref="IntPtr.Zero"/>。
     /// </summary>
     /// <param name="className">窗口类名。</param>
     /// <param name="titleContains">可选的标题关键字，用于区分同类的不同窗口。</param>
-    internal static IntPtr FindWindowByClassName(string className, string? titleContains = null)
+    internal static IntPtr FindWindowByClassName(string className, string? titleContains = null, int? processId = null)
     {
         if (string.IsNullOrEmpty(className))
         {
@@ -84,6 +136,17 @@ internal static class WindowNativeMethods
                 if (!string.Equals(buffer.ToString(), className, StringComparison.Ordinal))
                 {
                     return true;
+                }
+
+                // 只认指定进程的窗口：`#32770` 这类通用类名同时属于别的程序
+                // （mstsc、OneDrive、VPN 客户端……），不过滤会把本程序的凭据填到别人框里。
+                if (processId is not null)
+                {
+                    GetWindowThreadProcessId(window, out var windowProcessId);
+                    if (windowProcessId != processId.Value)
+                    {
+                        return true;
+                    }
                 }
 
                 if (titleContains is not null)
@@ -196,6 +259,9 @@ internal static class WindowNativeMethods
     private static extern int GetWindowText(IntPtr window, StringBuilder text, int maximumLength);
 
     [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out int processId);
+
+    [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
 
@@ -211,6 +277,24 @@ internal static class WindowNativeMethods
         int width,
         int height,
         uint flags);
+
+    // 注意 EntryPoint：C# 方法名带了 Core 后缀避免与上面的包装方法重名，
+    // 但原生入口没有这个后缀，必须显式指回 user32.dll 里的真实名字。
+    [DllImport("user32.dll", EntryPoint = "SetForegroundWindow")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindowCore(IntPtr window);
+
+    [DllImport("user32.dll", EntryPoint = "ShowWindow")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindowCore(IntPtr window, int command);
+
+    [DllImport("user32.dll", EntryPoint = "BringWindowToTop")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool BringWindowToTopCore(IntPtr window);
+
+    [DllImport("user32.dll", EntryPoint = "IsWindow")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowCore(IntPtr window);
 
     /// <summary>
     /// 屏幕坐标矩形。

@@ -6,6 +6,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Text;
+using DesktopTwin.Services;
 using Microsoft.Win32;
 
 namespace DesktopTwin.Interop;
@@ -104,6 +105,15 @@ internal static class ChildSessionNativeMethods
     private static extern bool EnableWindow(
         IntPtr window,
         [MarshalAs(UnmanagedType.Bool)] bool enabled);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowEnabled(IntPtr window);
+
+    [DllImport("user32.dll", EntryPoint = "GetForegroundWindow")]
+    private static extern IntPtr GetForegroundWindowNative();
+
+    internal static IntPtr GetForegroundWindow() => GetForegroundWindowNative();
 
     internal static void EnableChildSessions()
     {
@@ -384,7 +394,7 @@ internal static class ChildSessionNativeMethods
 
     internal static bool TryFocusRdpInputWindow(IntPtr rdpHostWindow)
     {
-        var inputWindow = FindRdpInputWindow(rdpHostWindow);
+        var inputWindow = FindRdpInputWindow(rdpHostWindow, out _);
         if (inputWindow == IntPtr.Zero)
         {
             return false;
@@ -396,7 +406,7 @@ internal static class ChildSessionNativeMethods
 
     internal static bool IsRdpInputWindowFocused(IntPtr rdpHostWindow)
     {
-        var inputWindow = FindRdpInputWindow(rdpHostWindow);
+        var inputWindow = FindRdpInputWindow(rdpHostWindow, out _);
         return inputWindow != IntPtr.Zero && GetFocus() == inputWindow;
     }
 
@@ -406,11 +416,20 @@ internal static class ChildSessionNativeMethods
     /// </summary>
     internal static void SetRdpInputWindowEnabled(IntPtr rdpHostWindow, bool enabled)
     {
-        var inputWindow = FindRdpInputWindow(rdpHostWindow);
-        if (inputWindow != IntPtr.Zero)
+        var inputWindow = FindRdpInputWindow(rdpHostWindow, out var fromCache);
+        if (inputWindow == IntPtr.Zero)
         {
-            _ = EnableWindow(inputWindow, enabled);
+            AppLog.Warn(
+                $"SetRdpInputWindowEnabled: enabled={enabled}，未找到 Input Capture Window（host=0x{rdpHostWindow:X}）。");
+            return;
         }
+
+        var beforeEnabled = IsWindowEnabled(inputWindow);
+        _ = EnableWindow(inputWindow, enabled);
+        var afterEnabled = IsWindowEnabled(inputWindow);
+        AppLog.Info(
+            $"SetRdpInputWindowEnabled: enabled={enabled}，inputWindow=0x{inputWindow:X}，"
+            + $"来源={(fromCache ? "缓存" : "枚举")}，实际状态 before={beforeEnabled} after={afterEnabled}。");
     }
 
     internal static void ClearRdpInputWindowCache(IntPtr rdpHostWindow)
@@ -418,8 +437,9 @@ internal static class ChildSessionNativeMethods
         RdpInputWindows.TryRemove(rdpHostWindow, out _);
     }
 
-    private static IntPtr FindRdpInputWindow(IntPtr rdpHostWindow)
+    private static IntPtr FindRdpInputWindow(IntPtr rdpHostWindow, out bool fromCache)
     {
+        fromCache = false;
         if (rdpHostWindow == IntPtr.Zero)
         {
             return IntPtr.Zero;
@@ -429,6 +449,7 @@ internal static class ChildSessionNativeMethods
         {
             if (IsWindow(cachedInputWindow) && IsChild(rdpHostWindow, cachedInputWindow))
             {
+                fromCache = true;
                 return cachedInputWindow;
             }
 

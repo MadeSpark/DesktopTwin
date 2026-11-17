@@ -252,10 +252,26 @@ internal sealed class RdpActiveXHost : AxHost
         _inputBlocked = blocked;
         if (!IsHandleCreated)
         {
+            AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄未创建，仅记录期望状态。");
             return;
         }
 
         ChildSessionNativeMethods.SetRdpInputWindowEnabled(Handle, !blocked);
+
+        // 解除阻止后把焦点交还给输入窗口：被禁用期间 Windows 已把焦点移走，
+        // 仅重新启用输入窗口不会让 RDP 自动恢复输入转发，必须让它重新持有焦点，
+        // 否则表现为「按钮已切回控制模式，画面却始终像观看模式一样没反应」。
+        if (!blocked && ConnectedState == 1)
+        {
+            var focused = ChildSessionNativeMethods.TryFocusRdpInputWindow(Handle);
+            AppLog.Info(
+                $"SetInputBlocked: blocked={blocked}，解除后焦点归还输入窗口 {(focused ? "成功" : "失败")}，"
+                + $"前台窗口 0x{ChildSessionNativeMethods.GetForegroundWindow():X}。");
+        }
+        else
+        {
+            AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄 0x{Handle:X}。");
+        }
     }
 
     /// <summary>

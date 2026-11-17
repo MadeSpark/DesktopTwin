@@ -1,5 +1,6 @@
 ﻿using System;
 using System.ComponentModel;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
@@ -19,7 +20,18 @@ namespace DesktopTwin.View;
 /// </summary>
 public partial class MainWindow : FluentWindow
 {
-    private const double FullscreenBarAutoHideSeconds = 10;
+    private const double FullscreenBarAutoHideSeconds = 6;
+
+    /// <summary>
+    /// 全屏浮层工具栏距屏幕顶端的位置。
+    /// </summary>
+    private const double FullscreenBarTopOffset = 10;
+
+    /// <summary>
+    /// 全屏浮层工具栏自身高度：Border 上下内边距 6×2 + 按钮 30 + 边框 1×2。
+    /// 改工具栏样式时要一起调，通知条的位置依赖它。
+    /// </summary>
+    private const double FullscreenBarHeight = 44;
 
     /// <summary>
     /// 鼠标进入窗口顶部这个高度（DIP）内就唤出工具栏。
@@ -32,9 +44,12 @@ public partial class MainWindow : FluentWindow
     private const double NormalNotificationOffset = 32;
 
     /// <summary>
-    /// 通知条在全屏模式下距屏幕顶端的位置（没有标题栏，贴近一点）。
+    /// 通知条在全屏模式下距屏幕顶端的位置。
+    ///
+    /// 必须让开全屏浮层工具栏（VerticalOffset 10 + 自身高约 44），否则两者重叠：
+    /// 切观看/控制模式的提示正好会在工具栏唤出时弹出来，会被工具栏压住。
     /// </summary>
-    private const double FullscreenNotificationOffset = 8;
+    private const double FullscreenNotificationOffset = FullscreenBarTopOffset + FullscreenBarHeight + 10;
 
     private readonly ChildSessionService _childSessionService;
     private readonly SettingsService _settings;
@@ -48,9 +63,35 @@ public partial class MainWindow : FluentWindow
     private Rect _boundsBeforeFullscreen;
     private WindowStyle _styleBeforeFullscreen = WindowStyle.SingleBorderWindow;
     private ResizeMode _resizeBeforeFullscreen = ResizeMode.CanResize;
+    private WindowCornerPreference _cornerPreferenceBeforeFullscreen;
+    private WindowBackdropType _backdropTypeBeforeFullscreen;
+    private Brush _backgroundBeforeFullscreen = Brushes.Black;
+    private double _minWidthBeforeFullscreen;
+    private double _maxWidthBeforeFullscreen;
+    private double _minHeightBeforeFullscreen;
+    private double _maxHeightBeforeFullscreen;
     private bool _smartSizingBeforeFullscreen;
     private DispatcherTimer? _barAutoHideTimer;
     private DispatcherTimer? _cursorWatchTimer;
+
+    /// <summary>
+    /// 凭据框轮询间隔。取 400ms：比 AutoLoginService 的 600ms 略快，
+    /// 但足够避免无谓的 CPU 占用；凭据框出现到被拉到前台最多差这一拍。
+    /// </summary>
+    private const int CredentialDialogPollMilliseconds = 400;
+
+    private readonly object _credentialDialogWatchGate = new();
+    private System.Threading.Timer? _credentialDialogWatchTimer;
+    private IntPtr _windowHandle;
+    private IntPtr _revealedCredentialDialog;
+    private bool _topmostSuppressedForCredential;
+    private bool _credentialDialogWatchEnabled;
+
+    /// <summary>
+    /// 窗口当前是否前台。UI 线程在 Activate/Deactivate 里更新，轮询线程读取——
+    /// 读写都走 <see cref="_credentialDialogWatchGate"/>，保证线程间可见。
+    /// </summary>
+    private bool _windowIsActive;
 
     /// <summary>
     /// 有一条通知因为窗口隐藏没能重新打开，等可见时补上。
@@ -108,6 +149,9 @@ public partial class MainWindow : FluentWindow
         // 固定状态下不动，那是用户明确要求常驻的。
         Deactivated += OnWindowDeactivated;
 
+        // 焦点回到窗口时恢复全屏置顶（见 OnWindowActivated 的说明）。
+        Activated += OnWindowActivated;
+
         // 窗口从「隐藏」恢复显示（托盘唤回）时，Popup 的定位同样会失效。
         IsVisibleChanged += OnWindowVisibilityChanged;
 
@@ -157,6 +201,10 @@ public partial class MainWindow : FluentWindow
             _windowSource = null;
         }
 
+        StopCredentialDialogWatch();
+        _credentialDialogWatchTimer?.Dispose();
+        _credentialDialogWatchTimer = null;
+
         _childSessionService.DesktopSizeChanged -= OnDesktopSizeChanged;
 
         RdpFormsHost.Child = null;
@@ -194,7 +242,8 @@ public partial class MainWindow : FluentWindow
         // 窗口要重新贴合新尺寸，缩放模式也要重新判定。
         if (_windowSource is null)
         {
-            _windowSource = HwndSource.FromHwnd(new WindowInteropHelper(this).Handle);
+            _windowHandle = new WindowInteropHelper(this).Handle;
+            _windowSource = HwndSource.FromHwnd(_windowHandle);
             _windowSource?.AddHook(OnWindowMessage);
         }
     }
@@ -256,10 +305,51 @@ public partial class MainWindow : FluentWindow
 
     private void OnWindowDeactivated(object? sender, EventArgs e)
     {
-        if (_isFullscreen && !_barPinned)
+        // 轮询线程恢复置顶前会看这个标记：窗口失焦后绝不能再被顶上去盖住别的程序。
+        lock (_credentialDialogWatchGate)
+        {
+            _windowIsActive = false;
+        }
+
+        if (!_isFullscreen)
+        {
+            return;
+        }
+
+        // 全屏期间窗口失焦（切到别的程序、弹出凭据框等）时临时放下置顶：
+        // 置顶窗口会盖住「Windows 安全中心」凭据框这类非置顶窗口，
+        // 即使它抢到了前台焦点也露不出来。放下置顶后，非置顶的前台窗口就能显示。
+        // 用 SetCurrentValue 而不是直接赋值，避免清掉 XAML 里的 OneWay 绑定。
+        SetCurrentValue(TopmostProperty, false);
+
+        if (!_barPinned)
         {
             HideFullscreenBar();
         }
+    }
+
+    /// <summary>
+    /// 焦点回到全屏窗口时恢复置顶，重新盖住任务栏。
+    /// 只在全屏期间生效：窗口模式下的置顶完全由 ViewModel 的 IsTopmost 绑定驱动。
+    /// </summary>
+    private void OnWindowActivated(object? sender, EventArgs e)
+    {
+        lock (_credentialDialogWatchGate)
+        {
+            _windowIsActive = true;
+        }
+
+        if (!_isFullscreen)
+        {
+            return;
+        }
+
+        SetCurrentValue(TopmostProperty, true);
+
+        // 凭据框场景里，置顶是用 Win32 直接放下的（当时 UI 线程被模态弹窗卡住，
+        // WPF 的 Topmost 属性没变过，SetCurrentValue(true) 是 no-op）。
+        // 焦点回到全屏窗时再显式把 WS_EX_TOPMOST 加回去，确保一定盖住任务栏。
+        RestoreTopmostAfterCredentialDialog();
     }
 
     /// <summary>
@@ -321,6 +411,13 @@ public partial class MainWindow : FluentWindow
         _boundsBeforeFullscreen = new Rect(Left, Top, ActualWidth, ActualHeight);
         _styleBeforeFullscreen = WindowStyle;
         _resizeBeforeFullscreen = ResizeMode;
+        _cornerPreferenceBeforeFullscreen = WindowCornerPreference;
+        _backdropTypeBeforeFullscreen = WindowBackdropType;
+        _backgroundBeforeFullscreen = Background;
+        _minWidthBeforeFullscreen = MinWidth;
+        _maxWidthBeforeFullscreen = MaxWidth;
+        _minHeightBeforeFullscreen = MinHeight;
+        _maxHeightBeforeFullscreen = MaxHeight;
         _smartSizingBeforeFullscreen = _settings.Current.Session.SmartSizing;
 
         _isFullscreen = true;
@@ -339,6 +436,19 @@ public partial class MainWindow : FluentWindow
         finally
         {
             _suppressStateChange = false;
+        }
+
+        // 全屏必须是一整块不透明黑。FluentWindow 默认挂着会在全屏露馅的东西：
+        // ① DWM 圆角（WindowCornerPreference=Round）→ 四个角是圆的；
+        // ② 背景材质会让窗口背景变透明 → 边缘 1px 能看到背后的窗口；
+        // ③ 窗口背景在浅色主题下是白的 → 缩放取整留 1px 缝时会露白边。
+        // 三者都压掉，退出时再逐项还原。
+        WindowCornerPreference = WindowCornerPreference.DoNotRound;
+        WindowBackdropType = WindowBackdropType.None;
+        Background = Brushes.Black;
+        if (PresentationSource.FromVisual(this) is HwndSource { CompositionTarget: HwndTarget target })
+        {
+            target.BackgroundColor = Colors.Black;
         }
 
         // 标题栏让位给画面。
@@ -363,6 +473,7 @@ public partial class MainWindow : FluentWindow
         UpdatePinButtons();
         ShowFullscreenBar();
         StartCursorWatch();
+        StartCredentialDialogWatch();
     }
 
     /// <summary>
@@ -377,6 +488,7 @@ public partial class MainWindow : FluentWindow
 
         _isFullscreen = false;
         StopCursorWatch();
+        StopCredentialDialogWatch();
         HideFullscreenBar();
 
         NotificationPopup.VerticalOffset = NormalNotificationOffset;
@@ -386,6 +498,12 @@ public partial class MainWindow : FluentWindow
         {
             WindowStyle = _styleBeforeFullscreen;
             ResizeMode = _resizeBeforeFullscreen;
+
+            // 还原 DWM 圆角与背景材质，并恢复窗口自己的背景。
+            WindowCornerPreference = _cornerPreferenceBeforeFullscreen;
+            WindowBackdropType = _backdropTypeBeforeFullscreen;
+            Background = _backgroundBeforeFullscreen;
+
             WindowTitleBar.Visibility = Visibility.Visible;
             TitleRow.Height = GridLength.Auto;
 
@@ -393,6 +511,12 @@ public partial class MainWindow : FluentWindow
             RdpFormsHost.ClearValue(FrameworkElement.MarginProperty);
 
             SetCurrentValue(TopmostProperty, _settings.Current.Session.Topmost);
+
+            // 先还掉尺寸锁，再恢复边界：否则下面的 Width/Height 会被全屏锁掉的 min/max 夹住。
+            MinWidth = _minWidthBeforeFullscreen;
+            MaxWidth = _maxWidthBeforeFullscreen;
+            MinHeight = _minHeightBeforeFullscreen;
+            MaxHeight = _maxHeightBeforeFullscreen;
 
             WindowState = WindowState.Normal;
             Left = _boundsBeforeFullscreen.Left;
@@ -420,6 +544,13 @@ public partial class MainWindow : FluentWindow
     /// </summary>
     private void ApplyFullscreenBounds()
     {
+        // 这里也会被排队的回调调用（OnDesktopSizeChanged 用 Background 优先级排队），
+        // 排队期间用户可能已经退出全屏：那时再摆尺寸、锁 min==max 会把窗口模式也锁死。
+        if (!_isFullscreen)
+        {
+            return;
+        }
+
         if (!WindowNativeMethods.TryGetMonitorRect(new WindowInteropHelper(this).Handle, out var monitor))
         {
             return;
@@ -435,8 +566,23 @@ public partial class MainWindow : FluentWindow
 
         Left = monitor.Left / dpi.DpiScaleX;
         Top = monitor.Top / dpi.DpiScaleY;
+
+        // 显示器分辨率/DPI 变化时这里会被再次调用（WM_DISPLAYCHANGE）。进全屏时锁死的
+        // min==max 会先于 Width/Height 生效，把新尺寸夹在旧值上，窗口就贴不上新显示器。
+        // 所以每次都要先释放再改尺寸，改完再按新尺寸锁死。
+        MinWidth = _minWidthBeforeFullscreen;
+        MaxWidth = _maxWidthBeforeFullscreen;
+        MinHeight = _minHeightBeforeFullscreen;
+        MaxHeight = _maxHeightBeforeFullscreen;
+
         Width = monitorWidth / dpi.DpiScaleX;
         Height = monitorHeight / dpi.DpiScaleY;
+
+        // 尺寸锁死是兜底：WindowBackdropType=None 会让 WindowChrome 按 NoResize 重算
+        // （缩放命中区归零），这里 min==max 再确保任何路径都缩不动，
+        // 避免把「全屏」拖成别的尺寸却还停在 IsFullscreen 状态。
+        MinWidth = MaxWidth = Width;
+        MinHeight = MaxHeight = Height;
     }
 
     /// <summary>
@@ -560,7 +706,7 @@ public partial class MainWindow : FluentWindow
         }
         else
         {
-            // 取消固定后按普通规则处理：再显示 10 秒，然后自动收起。
+            // 取消固定后按普通规则处理：再显示几秒，然后自动收起。
             ShowFullscreenBar();
         }
     }
@@ -669,7 +815,7 @@ public partial class MainWindow : FluentWindow
                 }
 
                 FullscreenBarPopup.HorizontalOffset = Math.Max(0, (ActualWidth - barWidth) / 2);
-                FullscreenBarPopup.VerticalOffset = 10;
+                FullscreenBarPopup.VerticalOffset = FullscreenBarTopOffset;
             }
         }), DispatcherPriority.Loaded);
 
@@ -729,6 +875,199 @@ public partial class MainWindow : FluentWindow
     private void StopCursorWatch()
     {
         _cursorWatchTimer?.Stop();
+    }
+
+    /// <summary>
+    /// 全屏期间启动后台轮询，主动发现「Windows 安全中心」凭据框。
+    ///
+    /// 不能用 DispatcherTimer：凭据框是模态的，UI 线程会卡在它的消息循环里，
+    /// DispatcherTimer 跟着停摆（这正是「启动过程中工具栏唤不出」的原因）。
+    /// System.Threading.Timer 跑在线程池上，不依赖 UI 线程泵消息。
+    /// </summary>
+    private void StartCredentialDialogWatch()
+    {
+        _windowHandle = new WindowInteropHelper(this).Handle;
+
+        lock (_credentialDialogWatchGate)
+        {
+            _revealedCredentialDialog = IntPtr.Zero;
+            _topmostSuppressedForCredential = false;
+            _credentialDialogWatchEnabled = true;
+            _windowIsActive = IsActive;
+        }
+
+        if (_credentialDialogWatchTimer is null)
+        {
+            _credentialDialogWatchTimer = new System.Threading.Timer(
+                OnCredentialDialogWatchTick,
+                null,
+                CredentialDialogPollMilliseconds,
+                CredentialDialogPollMilliseconds);
+        }
+        else
+        {
+            _credentialDialogWatchTimer.Change(
+                CredentialDialogPollMilliseconds,
+                CredentialDialogPollMilliseconds);
+        }
+    }
+
+    /// <summary>
+    /// 停止凭据框轮询，并把可能还挂着「放下置顶」的状态收干净。
+    /// </summary>
+    private void StopCredentialDialogWatch()
+    {
+        _credentialDialogWatchTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+
+        lock (_credentialDialogWatchGate)
+        {
+            _credentialDialogWatchEnabled = false;
+        }
+
+        RestoreTopmostAfterCredentialDialog();
+    }
+
+    /// <summary>
+    /// 凭据框轮询回调（线程池线程）。只做 Win32 调用与字段读写，
+    /// 不碰任何 WPF 对象——WPF 对象只认创建它的 UI 线程。
+    /// </summary>
+    private void OnCredentialDialogWatchTick(object? state)
+    {
+        try
+        {
+            IntPtr handle;
+            lock (_credentialDialogWatchGate)
+            {
+                if (!_credentialDialogWatchEnabled)
+                {
+                    return;
+                }
+
+                handle = _windowHandle;
+            }
+
+            if (handle == IntPtr.Zero || !WindowNativeMethods.IsWindow(handle))
+            {
+                return;
+            }
+
+            var dialog = AutoLoginService.FindCredentialDialog();
+            if (dialog != IntPtr.Zero)
+            {
+                lock (_credentialDialogWatchGate)
+                {
+                    if (!_credentialDialogWatchEnabled || dialog == _revealedCredentialDialog)
+                    {
+                        return;
+                    }
+
+                    _revealedCredentialDialog = dialog;
+                }
+
+                RevealCredentialDialog(handle, dialog);
+                return;
+            }
+
+            // 凭据框已经消失（用户提交/取消了），尝试恢复置顶。
+            bool marshalRestore;
+            lock (_credentialDialogWatchGate)
+            {
+                // 窗口不在前台时不动、也不清标记：等 OnWindowActivated 时由
+                // RestoreTopmostAfterCredentialDialog 在 UI 线程重新检查后再恢复。
+                marshalRestore = _topmostSuppressedForCredential
+                                 && _credentialDialogWatchEnabled
+                                 && _windowIsActive;
+                _revealedCredentialDialog = IntPtr.Zero;
+            }
+
+            if (marshalRestore)
+            {
+                // 恢复置顶必须回到 UI 线程做：在线程池里直接 SetWindowPos，用的是
+                // 「查完状态就过期」的判断，UI 线程这期间可能又失焦/退全屏了。
+                _ = Dispatcher.BeginInvoke(new Action(RestoreTopmostAfterCredentialDialog));
+            }
+        }
+        catch (Exception exception)
+        {
+            // 轮询跑在后台线程上，任何异常都不能把进程带崩。这一轮没拉到，
+            // 下一轮还会再试。
+            AppLog.Warn("全屏凭据框轮询失败，跳过本轮。", exception);
+        }
+    }
+
+    /// <summary>
+    /// 把刚出现的凭据框拉到前台。必须先在 Win32 层放下自己的置顶，
+    /// 否则凭据框作为非置顶窗口会一直被压在全屏窗下面。
+    /// </summary>
+    private void RevealCredentialDialog(IntPtr handle, IntPtr dialog)
+    {
+        // 先把「为凭据框放下置顶」的标记记下，再放下原生置顶：万一这期间退全屏/停轮询，
+        // StopCredentialDialogWatch 的 RestoreTopmostAfterCredentialDialog 能看到标记、
+        // 把原生置顶收回来，不会留成「标记还没记、置顶已经放下」的死态。
+        lock (_credentialDialogWatchGate)
+        {
+            if (!_credentialDialogWatchEnabled)
+            {
+                _revealedCredentialDialog = IntPtr.Zero;
+                return;
+            }
+
+            _topmostSuppressedForCredential = true;
+        }
+
+        if (!WindowNativeMethods.SetWindowTopmost(handle, false))
+        {
+            // 放下失败（窗口可能正在销毁）：回滚刚记的标记，下一轮再试。
+            lock (_credentialDialogWatchGate)
+            {
+                _topmostSuppressedForCredential = false;
+                _revealedCredentialDialog = IntPtr.Zero;
+            }
+
+            return;
+        }
+
+        // 顺序：先还原（防最小化）→ 提到本带顶部 → 抢前台焦点。
+        // 我们进程此刻就是前台进程，SetForegroundWindow 通常能成功；
+        // 即便被前台锁挡住，前两步已经让弹窗可见了。
+        _ = WindowNativeMethods.ShowWindow(dialog, WindowNativeMethods.SwRestore);
+        _ = WindowNativeMethods.BringWindowToTop(dialog);
+        _ = WindowNativeMethods.SetForegroundWindow(dialog);
+
+        AppLog.Info($"全屏：检测到凭据框（句柄 0x{dialog.ToInt64():X}），已放下置顶并把它拉到前台。");
+    }
+
+    /// <summary>
+    /// 把「为凭据框放下置顶」的状态还原。只会在 UI 线程被调用：焦点回到全屏窗
+    /// （<see cref="OnWindowActivated"/>）、退全屏收尾（<see cref="StopCredentialDialogWatch"/>）、
+    /// 或凭据框消失后由轮询线程 <c>Dispatcher.BeginInvoke</c> 回来。
+    /// 在这里统一重新检查「仍全屏 + 窗口是前台」，避免用过期判断改 Z 序。
+    /// </summary>
+    private void RestoreTopmostAfterCredentialDialog()
+    {
+        bool shouldRestore;
+        IntPtr handle;
+        lock (_credentialDialogWatchGate)
+        {
+            // 仍在全屏时，只有窗口是前台才恢复（否则会把本窗顶上去盖住别的程序）；
+            // 退出全屏时（_isFullscreen 已置 false）必须恢复原生置顶——凭据框场景里
+            // 降的是原生 WS_EX_TOPMOST，WPF 的 Topmost 还是 true，不恢复的话后面
+            // SetCurrentValue(Topmost, settings) 是 no-op，窗口就停在非置顶状态。
+            shouldRestore = _topmostSuppressedForCredential
+                            && (_windowIsActive || !_isFullscreen);
+            if (shouldRestore)
+            {
+                _topmostSuppressedForCredential = false;
+                _revealedCredentialDialog = IntPtr.Zero;
+            }
+
+            handle = _windowHandle;
+        }
+
+        if (shouldRestore && handle != IntPtr.Zero)
+        {
+            WindowNativeMethods.SetWindowTopmost(handle, true);
+        }
     }
 
     private void OnCursorWatchTick(object? sender, EventArgs e)
