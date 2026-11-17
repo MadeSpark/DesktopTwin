@@ -1,6 +1,6 @@
 ﻿# Desktop Twin · UI language file (English)
 #
-# 584 entries · for Desktop Twin 0.2.8 · see Localization/README.md
+# 595 entries · for Desktop Twin 0.2.9 · see Localization/README.md
 #
 # How to use: rename this file to DesktopTwin.lng and put it next to
 # DesktopTwin.exe (same base name as the executable). There is no language
@@ -555,8 +555,8 @@ Check.RdpSecurity.InactiveDetail=Check: whether RDP-Tcp lowered UserAuthenticati
 Check.Termsrv.Title=termsrv.dll differs from the system component store
 Check.Termsrv.Summary.Dirty=sfc reports an integrity violation; the file was modified
 Check.Termsrv.Summary.Missing=termsrv.dll is missing
-Check.Termsrv.Detail.Dirty=A few repackaged tools skip the "replace ServiceDll" route and patch %SystemRoot%\\System32\\termsrv.dll directly.\nWhen that happens, pointing ServiceDll at the native DLL does not help, because the native DLL itself has been modified.\n\nSuspected backup files: {0}\n(the mere presence of these files is evidence that someone edited termsrv.dll)\n\nHow it is verified: sfc compares the file against its copy in the system component store (termsrv.dll only carries a catalog signature, so Authenticode is not a reliable check here).\nRepair order: restore from a backup the tool left behind (the copy is re-verified with sfc), otherwise run sfc /scannow (usually 5-15 minutes).\nNote: while the file is in use by the Remote Desktop service, sfc usually only replaces it after a reboot, so the result is verified again afterwards and you are told to reboot if it is still wrong.
-Check.Termsrv.Detail.Missing=termsrv.dll is missing from the system directory, so the Remote Desktop service has no implementation and every connection fails.\nSuspected backup files: {0}\n\nThe fix tries the backups first and falls back to sfc /scannow.
+Check.Termsrv.Detail.Dirty=A few repackaged tools skip the "replace ServiceDll" route and patch %SystemRoot%\\System32\\termsrv.dll directly.\nWhen that happens, pointing ServiceDll at the native DLL does not help, because the native DLL itself has been modified.\n\nSuspected backup files: {0}\n(the mere presence of these files is evidence that someone edited termsrv.dll)\n\nHow it is verified: sfc compares the file against its copy in the system component store (termsrv.dll only carries a catalog signature, so Authenticode is not a reliable check here).\nRepair order: first restore from a backup the tool left behind (the copy is re-verified with sfc); if that does not help, stop the Remote Desktop service and repair this single file in place with sfc /scanfile (seconds to a minute, effective immediately, no reboot needed); only if that also fails does it start a full sfc /scannow in a new window (usually 5-15 minutes).
+Check.Termsrv.Detail.Missing=termsrv.dll is missing from the system directory, so the Remote Desktop service has no implementation and every connection fails.\nSuspected backup files: {0}\n\nThe fix tries the backups first, then repairs the file in place with sfc /scanfile, and only falls back to a full scan as a last resort.
 Check.Termsrv.Backups={0}
 Check.Termsrv.NoBackup=none
 Check.Termsrv.State.Intact=matches the system component store
