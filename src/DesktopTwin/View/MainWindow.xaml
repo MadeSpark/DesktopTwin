@@ -102,7 +102,7 @@
                                Icon="{ui:SymbolIcon ArrowSwap24}"
                                ToolTip="{loc:Loc Main.SwitchWindow.ToolTip}" />
                     <ui:Button x:Name="WatchModeButton"
-                               Width="100"
+                               Width="110"
                                Height="32"
                                Background="Transparent"
                                BorderBrush="Transparent"
