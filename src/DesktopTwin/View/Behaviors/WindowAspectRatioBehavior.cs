@@ -19,6 +19,8 @@ namespace DesktopTwin.View.Behaviors;
 /// </summary>
 public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
 {
+    private const int WmEnterSizeMove = 0x0231;
+    private const int WmExitSizeMove = 0x0232;
     private const int WmSizing = 0x0214;
     private const int WmszLeft = 1;
     private const int WmszRight = 2;
@@ -28,10 +30,6 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     private const int WmszBottom = 6;
     private const int WmszBottomLeft = 7;
     private const int WmszBottomRight = 8;
-
-    /// <summary>进入 / 退出「拖动或调整窗口尺寸」模态循环。期间只由 WM_SIZING 约束。</summary>
-    private const int WmEnterSizeMove = 0x0231;
-    private const int WmExitSizeMove = 0x0232;
 
     /// <summary>
     /// 是否启用宽高比约束。
@@ -55,12 +53,12 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
 
     private Window? _window;
     private HwndSource? _source;
+    private DispatcherOperation? _sizeCorrectionOperation;
+    private bool _isInteractiveSizing;
+    private Size? _lastInteractiveSize;
 
     /// <summary>程序自己改尺寸时置位，避免 SizeChanged 再次触发校正形成回环。</summary>
     private bool _correctingSize;
-
-    /// <summary>用户正拖着窗口边缘。这段时间的尺寸变化已由 WM_SIZING 约束，不必再补。</summary>
-    private bool _isUserSizing;
 
     /// <summary>
     /// 是否启用宽高比约束。
@@ -88,7 +86,8 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     {
         if (d is WindowAspectRatioBehavior behavior)
         {
-            behavior.ConstrainHeightToRatio();
+            behavior._lastInteractiveSize = null;
+            behavior.ScheduleSizeCorrection();
         }
     }
 
@@ -148,16 +147,14 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
         _window.Closed += OnWindowClosed;
         _window.SizeChanged += OnWindowSizeChanged;
         _source.AddHook(WindowProc);
-
-        // 比例可能在窗口 Loaded 之前就已经绑定好（甚至分辨率已经改了），那次校正因为
-        // _window 还是 null 被跳过。挂载完成后补一次，否则要等用户手动拖一下才生效。
-        AssociatedObject.Dispatcher.BeginInvoke(
-            ConstrainHeightToRatio,
-            DispatcherPriority.Loaded);
+        ScheduleSizeCorrection();
     }
 
     private void DetachWindowHook()
     {
+        CancelSizeCorrection();
+        _isInteractiveSizing = false;
+        _lastInteractiveSize = null;
         _source?.RemoveHook(WindowProc);
         _source = null;
 
@@ -171,34 +168,57 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
 
     private void OnWindowSizeChanged(object sender, SizeChangedEventArgs e)
     {
-        // 用户拖拽由 WM_SIZING 直接约束，这里只管「非拖拽」的尺寸变化：
-        // 改分辨率、Win+方向键贴边、任务栏的并排/层叠，这些都不经过 WM_SIZING。
-        // 拖拽过程中 SizeChanged 也会连续触发，此时再补一次会和 WM_SIZING 抢着改尺寸。
-        if (!IsEnabled || _window is null || _correctingSize || _isUserSizing)
+        // 最后一次布局可能晚于 WM_EXITSIZEMOVE；仍保留 WM_SIZING 已接受的尺寸。
+        if (MatchesInteractiveSize())
+        {
+            CancelSizeCorrection();
+            return;
+        }
+
+        ScheduleSizeCorrection();
+    }
+
+    private bool CanCorrectSize() =>
+        IsEnabled && _window is not null && !_correctingSize && !_isInteractiveSizing
+        && _window.WindowState == WindowState.Normal
+        && _window.ResizeMode != ResizeMode.NoResize
+        && !(_window.MinHeight == _window.MaxHeight && _window.MinHeight > 0)
+        && double.IsFinite(AspectRatio) && AspectRatio > 0;
+
+    private bool MatchesInteractiveSize()
+    {
+        if (_lastInteractiveSize is not { } size || _window is null
+            || _source?.CompositionTarget is not { } target)
+        {
+            return false;
+        }
+
+        var transform = target.TransformToDevice;
+        return Math.Abs(_window.ActualWidth * transform.M11 - size.Width) <= 1
+            && Math.Abs(_window.ActualHeight * transform.M22 - size.Height) <= 1;
+    }
+
+    private void ScheduleSizeCorrection()
+    {
+        if (!CanCorrectSize() || _sizeCorrectionOperation is not null)
         {
             return;
         }
 
-        // 最大化、全屏时尺寸由系统或全屏逻辑接管；全屏还会把 min==max 锁死，不能碰。
-        if (_window.WindowState != WindowState.Normal || _window.ResizeMode == ResizeMode.NoResize)
-        {
-            return;
-        }
+        // 同一轮布局只保留一次校正，执行时读最新尺寸；交互拖拽只走 WM_SIZING。
+        _sizeCorrectionOperation = AssociatedObject.Dispatcher.BeginInvoke(
+            DispatcherPriority.Loaded,
+            new Action(() =>
+            {
+                _sizeCorrectionOperation = null;
+                ConstrainHeightToRatio();
+            }));
+    }
 
-        if (_window.MinHeight == _window.MaxHeight && _window.MinHeight > 0)
-        {
-            return;
-        }
-
-        if (!double.IsFinite(AspectRatio) || AspectRatio <= 0)
-        {
-            return;
-        }
-
-        // 用宽度反推高度。放到布局之后再改：SizeChanged 里直接改尺寸会被同一次布局覆盖。
-        AssociatedObject.Dispatcher.BeginInvoke(
-            ConstrainHeightToRatio,
-            DispatcherPriority.Loaded);
+    private void CancelSizeCorrection()
+    {
+        _sizeCorrectionOperation?.Abort();
+        _sizeCorrectionOperation = null;
     }
 
     /// <summary>
@@ -209,21 +229,13 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     /// </summary>
     private void ConstrainHeightToRatio()
     {
-        if (!IsEnabled || _window is null || _correctingSize)
+        // 排队期间可能已进入拖拽、全屏或禁止调整大小，执行时必须重新检查。
+        if (!CanCorrectSize() || _window is null || MatchesInteractiveSize())
         {
             return;
         }
 
-        if (_window.WindowState != WindowState.Normal)
-        {
-            return;
-        }
-
-        if (!double.IsFinite(AspectRatio) || AspectRatio <= 0)
-        {
-            return;
-        }
-
+        _lastInteractiveSize = null;
         var handle = new WindowInteropHelper(_window).Handle;
         if (handle == IntPtr.Zero || !TryGetSizingMetrics(handle, out var metrics))
         {
@@ -299,14 +311,23 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     {
         if (message == WmEnterSizeMove)
         {
-            _isUserSizing = true;
+            _isInteractiveSizing = false;
+            _lastInteractiveSize = null;
             return 0;
         }
 
         if (message == WmExitSizeMove)
         {
-            _isUserSizing = false;
+            _isInteractiveSizing = false;
             return 0;
+        }
+
+        // 移动窗口也会进入 size/move 循环；只有 WM_SIZING 才接管尺寸校正，
+        // 避免把拖动贴边或跨显示器移动产生的非拖拽尺寸变化一起跳过。
+        if (message == WmSizing)
+        {
+            _isInteractiveSizing = true;
+            CancelSizeCorrection();
         }
 
         if (message != WmSizing ||
@@ -328,6 +349,7 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
         }
 
         Marshal.StructureToPtr(rect, lParam, false);
+        _lastInteractiveSize = new Size(rect.Right - rect.Left, rect.Bottom - rect.Top);
         handled = true;
         return 1;
     }
