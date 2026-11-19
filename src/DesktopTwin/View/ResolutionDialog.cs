@@ -76,7 +76,13 @@ internal static class ResolutionDialog
         });
         sizePanel.Children.Add(heightBox);
 
-        var dpiBox = new System.Windows.Controls.ComboBox { Width = 100, VerticalContentAlignment = VerticalAlignment.Center };
+        var dpiBox = new System.Windows.Controls.ComboBox
+        {
+            Width = 100,
+            IsEditable = true,
+            Text = $"{scaleFactor}%",
+            VerticalContentAlignment = VerticalAlignment.Center
+        };
         foreach (var factor in new[] { 100, 125, 150, 175, 200 })
         {
             dpiBox.Items.Add(new System.Windows.Controls.ComboBoxItem
@@ -165,9 +171,9 @@ internal static class ResolutionDialog
                 return;
             }
 
-            var dpiText = (dpiBox.SelectedItem as System.Windows.Controls.ComboBoxItem)
-                ?.Content as string;
-            if (!int.TryParse(dpiText?.TrimEnd('%'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var newScale)
+            // IsEditable 下用户可以手输任意值：选预设和手输都从 Text 取。
+            var dpiText = dpiBox.Text;
+            if (!int.TryParse(dpiText?.Trim().TrimEnd('%'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var newScale)
                 || newScale is < 100 or > 500)
             {
                 errorText.Text = Locale.Get("Resolution.Error.DpiRange");

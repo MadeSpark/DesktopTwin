@@ -149,8 +149,18 @@ internal sealed class RdpActiveXHost : AxHost
             SetComProperty(advancedSettings, "EnableCredSspSupport", true));
         RunComStep(Locale.Get("Rdp.Step.RemoteWindowsKey"), () =>
             SetComProperty(advancedSettings, "EnableWindowsKey", 1));
-        RunComStep(Locale.Get("Rdp.Step.DesktopScale"), () =>
-            SetComProperty(advancedSettings, "DesktopScaleFactor", _desktopScaleFactor));
+        // DesktopScaleFactor 没有暴露在 AdvancedSettings7 的 IDispatch 上（实测
+        // DISP_E_UNKNOWNNAME，老属性如 SmartSizing 都在），要真正生效需要补一条
+        // 强类型 vtable 接口。目前是增强项：失败只记日志，不阻断连接。
+        try
+        {
+            RunComStep(Locale.Get("Rdp.Step.DesktopScale"), () =>
+                SetComProperty(advancedSettings, "DesktopScaleFactor", _desktopScaleFactor));
+        }
+        catch (Exception exception)
+        {
+            AppLog.Warn("远端 DPI 缩放未生效：当前 RDP 控件不通过 IDispatch 暴露该属性。", exception);
+        }
         // 每次连接重新确认设置，同时作废上一连接遗留的异步重排。
         _smartSizing.Reset();
         _smartSizing.Apply(_smartSizingEnabled);
