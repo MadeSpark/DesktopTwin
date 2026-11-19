@@ -39,7 +39,7 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
             nameof(IsEnabled),
             typeof(bool),
             typeof(WindowAspectRatioBehavior),
-            new PropertyMetadata(false));
+            new PropertyMetadata(false, OnIsEnabledChanged));
 
     /// <summary>
     /// 目标宽高比，默认 16:9。
@@ -81,7 +81,18 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     /// <summary>
     /// 比例本身变化（例如用户把分身分辨率从 16:9 改成 16:10）时也要重新校正一次，
     /// 否则只有下次尺寸变化才会生效。
+    ///
+    /// 另外，打开「保持宽高比」的瞬间就把窗口调正，不必等用户下一次拖拽；
+    /// 关闭时不动窗口尺寸——用户关掉它往往就是想自由拉伸。
     /// </summary>
+    private static void OnIsEnabledChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is WindowAspectRatioBehavior behavior && e.NewValue is true)
+        {
+            behavior.ScheduleSizeCorrection();
+        }
+    }
+
     private static void OnAspectRatioChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
         if (d is WindowAspectRatioBehavior behavior)

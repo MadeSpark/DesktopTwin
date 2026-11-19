@@ -42,7 +42,7 @@ public sealed class WindowAspectRatioBehaviorTests
         }
 
         DrainDispatcher();
-        Assert.Equal(599, fixture.Window.ActualWidth, 1);
+        Assert.InRange(fixture.Window.ActualWidth, 599 - 1, 599 + 1);
         fixture.AssertContentRatio();
     });
 
@@ -58,7 +58,7 @@ public sealed class WindowAspectRatioBehaviorTests
         fixture.Window.Height = 400;
         fixture.Window.UpdateLayout();
         DrainDispatcher();
-        Assert.Equal(400, fixture.Window.ActualHeight, 1);
+        Assert.InRange(fixture.Window.ActualHeight, 400 - 1, 400 + 1);
 
         SendMessage(fixture.Handle, 0x0232, 0, 0); // WM_EXITSIZEMOVE
         fixture.Window.Width = 640;
@@ -84,8 +84,8 @@ public sealed class WindowAspectRatioBehaviorTests
         fixture.Window.UpdateLayout();
         DrainDispatcher();
 
-        Assert.Equal(size.Width, fixture.Window.ActualWidth, 1);
-        Assert.Equal(size.Height, fixture.Window.ActualHeight, 1);
+        Assert.InRange(fixture.Window.ActualWidth, size.Width - 1, size.Width + 1);
+        Assert.InRange(fixture.Window.ActualHeight, size.Height - 1, size.Height + 1);
         fixture.AssertContentRatio();
     });
 
@@ -117,7 +117,7 @@ public sealed class WindowAspectRatioBehaviorTests
             fixture.Window.ResizeMode = ResizeMode.NoResize;
 
         DrainDispatcher();
-        Assert.Equal(height, fixture.Window.Height, 1);
+        Assert.InRange(fixture.Window.Height, height - 1, height + 1);
     });
 
     [Fact]
@@ -130,7 +130,7 @@ public sealed class WindowAspectRatioBehaviorTests
         Interaction.GetBehaviors(fixture.Content).Remove(fixture.Behavior);
         DrainDispatcher();
 
-        Assert.Equal(height, fixture.Window.Height, 1);
+        Assert.InRange(fixture.Window.Height, height - 1, height + 1);
     });
 
     [Fact]

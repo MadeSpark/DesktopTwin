@@ -691,6 +691,7 @@ public partial class MainWindow : FluentWindow
         ref bool handled)
     {
         const int WmDisplayChange = 0x007E;
+        const int WmExitSizeMove = 0x0232;
 
         if (message == WmDisplayChange && _isFullscreen)
         {
@@ -701,7 +702,38 @@ public partial class MainWindow : FluentWindow
                 DispatcherPriority.Background);
         }
 
+        // 拖动/缩放结束时校正一次位置：用户把窗口推到屏幕顶部以外时，标题栏会被挡住、
+        // 窗口再也抓不回来。放在 EXITSIZEMOVE 而不是 MOVE，避免和拖动过程抢位置。
+        if (message == WmExitSizeMove && !_isFullscreen)
+        {
+            EnsureTitleBarVisible();
+        }
+
         return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// 把窗口顶边压回所在显示器工作区的顶部，保证标题栏始终露得出来。
+    ///
+    /// 只处理「上边缘跑出屏幕」这一种：左右超出时系统会留一部分可见，用户还能拖回来；
+    /// 上边缘一旦越过工作区顶部，标题栏整条看不见，只能靠任务栏或 Alt+Space 找回来。
+    /// </summary>
+    private void EnsureTitleBarVisible()
+    {
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var screen = System.Windows.Forms.Screen.FromHandle(handle);
+        var dpi = VisualTreeHelper.GetDpi(this);
+        var workAreaTop = screen.WorkingArea.Top / (dpi.DpiScaleY > 0 ? dpi.DpiScaleY : 1);
+
+        if (Top < workAreaTop)
+        {
+            Top = workAreaTop;
+        }
     }
 
     private void OnDisplaySettingsChanged()
