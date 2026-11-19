@@ -108,6 +108,7 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
         base.OnAttached();
         AssociatedObject.Loaded += OnAssociatedObjectLoaded;
         AssociatedObject.Unloaded += OnAssociatedObjectUnloaded;
+        AssociatedObject.IsVisibleChanged += OnAssociatedObjectIsVisibleChanged;
 
         if (AssociatedObject.IsLoaded)
         {
@@ -120,6 +121,7 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     {
         AssociatedObject.Loaded -= OnAssociatedObjectLoaded;
         AssociatedObject.Unloaded -= OnAssociatedObjectUnloaded;
+        AssociatedObject.IsVisibleChanged -= OnAssociatedObjectIsVisibleChanged;
         DetachWindowHook();
         base.OnDetaching();
     }
@@ -127,6 +129,21 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     private void OnAssociatedObjectLoaded(object sender, RoutedEventArgs e)
     {
         AttachWindowHook();
+    }
+
+    /// <summary>
+    /// 宿主变可见时补一次校正。
+    ///
+    /// 未连接启动时 RDP 宿主是折叠的，它的 ActualWidth/Height 为 0，
+    /// TryGetSizingMetrics 会拒掉这次校正且不保留重试；连接完成后宿主变可见，
+    /// 但既不触发窗口 SizeChanged、也不改变比例绑定，窗口就一直停在连接前的尺寸。
+    /// </summary>
+    private void OnAssociatedObjectIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (e.NewValue is true)
+        {
+            ScheduleSizeCorrection();
+        }
     }
 
     private void OnAssociatedObjectUnloaded(object sender, RoutedEventArgs e)
