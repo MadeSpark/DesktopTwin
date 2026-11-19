@@ -1299,9 +1299,7 @@ public partial class MainWindowViewModel : ObservableObject
             return;
         }
 
-        // 预设分辨率只改尺寸，DPI 沿用当前值。
-        if (!Execute(() => _childSessionService.SetDesktopSize(
-                width, height, _settings.Current.Session.DesktopScaleFactor)))
+        if (!Execute(() => _childSessionService.SetDesktopSize(width, height)))
         {
             return;
         }
@@ -1316,14 +1314,12 @@ public partial class MainWindowViewModel : ObservableObject
     private async Task CustomResolutionAsync()
     {
         var session = _settings.Current.Session;
-        if (await ResolutionDialog.ShowAsync(
-                session.DesktopWidth, session.DesktopHeight, session.DesktopScaleFactor)
-            is not { } size)
+        if (await ResolutionDialog.ShowAsync(session.DesktopWidth, session.DesktopHeight) is not { } size)
         {
             return;
         }
 
-        if (!Execute(() => _childSessionService.SetDesktopSize(size.Width, size.Height, size.ScaleFactor)))
+        if (!Execute(() => _childSessionService.SetDesktopSize(size.Width, size.Height)))
         {
             return;
         }

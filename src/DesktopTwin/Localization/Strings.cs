@@ -158,9 +158,6 @@ internal static class Strings
         Pair("Resolution.Range", "允许范围：{0}×{1} ~ {2}×{3}"),
         Pair("Resolution.Error.NotInteger", "宽度和高度都必须是整数。"),
         Pair("Resolution.Error.OutOfRange", "分辨率必须在 {0}×{1} 到 {2}×{3} 之间。"),
-        Pair("Resolution.Dpi", "DPI 缩放"),
-        Pair("Resolution.Error.DpiRange", "DPI 缩放必须在 100%~500% 之间。"),
-        Pair("Rdp.Step.DesktopScale", "设置远端 DPI 缩放"),
 
         // ---- 快捷键设置对话框 ----
         Pair("Hotkey.Title", "设置切换快捷键"),
