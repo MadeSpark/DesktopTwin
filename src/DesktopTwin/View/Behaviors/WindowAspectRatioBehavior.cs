@@ -29,6 +29,10 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     private const int WmszBottomLeft = 7;
     private const int WmszBottomRight = 8;
 
+    /// <summary>进入 / 退出「拖动或调整窗口尺寸」模态循环。期间只由 WM_SIZING 约束。</summary>
+    private const int WmEnterSizeMove = 0x0231;
+    private const int WmExitSizeMove = 0x0232;
+
     /// <summary>
     /// 是否启用宽高比约束。
     /// </summary>
@@ -54,6 +58,9 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
 
     /// <summary>程序自己改尺寸时置位，避免 SizeChanged 再次触发校正形成回环。</summary>
     private bool _correctingSize;
+
+    /// <summary>用户正拖着窗口边缘。这段时间的尺寸变化已由 WM_SIZING 约束，不必再补。</summary>
+    private bool _isUserSizing;
 
     /// <summary>
     /// 是否启用宽高比约束。
@@ -141,6 +148,12 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
         _window.Closed += OnWindowClosed;
         _window.SizeChanged += OnWindowSizeChanged;
         _source.AddHook(WindowProc);
+
+        // 比例可能在窗口 Loaded 之前就已经绑定好（甚至分辨率已经改了），那次校正因为
+        // _window 还是 null 被跳过。挂载完成后补一次，否则要等用户手动拖一下才生效。
+        AssociatedObject.Dispatcher.BeginInvoke(
+            ConstrainHeightToRatio,
+            DispatcherPriority.Loaded);
     }
 
     private void DetachWindowHook()
@@ -160,7 +173,8 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
     {
         // 用户拖拽由 WM_SIZING 直接约束，这里只管「非拖拽」的尺寸变化：
         // 改分辨率、Win+方向键贴边、任务栏的并排/层叠，这些都不经过 WM_SIZING。
-        if (!IsEnabled || _window is null || _correctingSize)
+        // 拖拽过程中 SizeChanged 也会连续触发，此时再补一次会和 WM_SIZING 抢着改尺寸。
+        if (!IsEnabled || _window is null || _correctingSize || _isUserSizing)
         {
             return;
         }
@@ -283,6 +297,18 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
         nint lParam,
         ref bool handled)
     {
+        if (message == WmEnterSizeMove)
+        {
+            _isUserSizing = true;
+            return 0;
+        }
+
+        if (message == WmExitSizeMove)
+        {
+            _isUserSizing = false;
+            return 0;
+        }
+
         if (message != WmSizing ||
             !IsEnabled ||
             _window?.WindowState != WindowState.Normal ||
