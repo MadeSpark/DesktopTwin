@@ -284,6 +284,15 @@ public sealed class WindowAspectRatioBehavior : Behavior<FrameworkElement>
             targetWidth = Math.Max(minWidth, contentHeight * AspectRatio + frameWidth);
         }
 
+        // 上限：MaxHeight 有限值时 WPF 会夹住高度，宽度要按夹取后的高度重算。
+        var maxHeight = _window.MaxHeight;
+        if (double.IsFinite(maxHeight) && maxHeight > 0 && targetHeight > maxHeight)
+        {
+            targetHeight = Math.Max(minHeight, maxHeight);
+            contentHeight = Math.Max(1, targetHeight - frameHeight);
+            targetWidth = Math.Max(minWidth, contentHeight * AspectRatio + frameWidth);
+        }
+
         // 上限：窗口位置是固定的，高度只能长到「底部贴住工作区底部」为止，
         // 否则多出来的部分会跑到屏幕外，画面被裁掉一截。
         var workAreaBottom = screen.WorkingArea.Bottom / scaleY;
