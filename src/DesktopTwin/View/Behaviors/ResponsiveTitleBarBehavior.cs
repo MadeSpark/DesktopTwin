@@ -174,11 +174,14 @@ public sealed class ResponsiveTitleBarBehavior : Behavior<Panel>
 
         CacheMissingElementWidths();
         var availableWidth = CalculateAvailableWidth();
-        // 需求按「每个按钮都可能显示」算，包括此刻因状态而隐藏的：
-        // 例如「更多」下拉在启动按钮可见时是收起的，但一折叠启动按钮它就会露出来。
-        // 漏算这几十 DIP，后面的兜底判断会以为放得下，按钮就被系统按钮盖住了。
+        // 需求宽度只统计「可能同时出现」的控件：
+        // - 可折叠的控件一律计入（折叠别的按钮后它可能露出来，例如「更多」下拉）；
+        // - 不可折叠且当前隐藏的控件不计入——它们由绑定控制显隐，通常有另一个控件与之互斥
+        //   （「更多」下拉与「启动」按钮就是），两个都算会让可用宽度被低估几十 DIP，
+        //   结果是启动按钮被无谓地折叠掉。
         var requiredWidth = AssociatedObject.Children
             .OfType<FrameworkElement>()
+            .Where(element => GetCollapseOrder(element) > 0 || element.Visibility != Visibility.Collapsed)
             .Sum(GetCachedWidth);
         var collapsedElements = new HashSet<FrameworkElement>();
 
