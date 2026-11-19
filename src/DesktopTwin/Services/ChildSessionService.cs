@@ -1008,7 +1008,7 @@ public sealed class ChildSessionService : IDisposable
     /// <summary>
     /// 切换分身桌面分辨率。需要重连 RDP 才生效。
     /// </summary>
-    public void SetDesktopSize(int width, int height)
+    public void SetDesktopSize(int width, int height, int scaleFactor)
     {
         ThrowIfDisposed();
         if (!SessionSettings.IsValidDesktopSize(width, height))
@@ -1023,14 +1023,22 @@ public sealed class ChildSessionService : IDisposable
                     SessionSettings.MaxDesktopHeight));
         }
 
+        if (scaleFactor is < 100 or > 500)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(scaleFactor), "DPI 缩放必须在 100~500 之间。");
+        }
+
         _settings.Current.Session.DesktopWidth = width;
         _settings.Current.Session.DesktopHeight = height;
+        _settings.Current.Session.DesktopScaleFactor = scaleFactor;
         _settings.SaveSoon();
 
         // 分辨率变了，全屏下「1:1 还是自适应」的判定前提也变了，通知界面重新算。
         DesktopSizeChanged?.Invoke(this, EventArgs.Empty);
 
         var window = EnsureDesktopWindow();
+        window.RdpHost.SetDesktopScaleFactor(scaleFactor);
         if (window.RdpHost.ConnectedState == 0 && ChildSessionId is null)
         {
             RefreshState(Locale.Format("Svc.Status.ResolutionSetNext", width, height));

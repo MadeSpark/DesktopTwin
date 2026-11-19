@@ -26,10 +26,12 @@ internal static class ResolutionDialog
     /// </summary>
     /// <param name="width">初始宽度。</param>
     /// <param name="height">初始高度。</param>
-    /// <returns>用户确认且校验通过时返回新尺寸，取消或关闭返回 null。</returns>
-    internal static Task<(int Width, int Height)?> ShowAsync(int width, int height)
+    /// <param name="scaleFactor">初始 DPI 缩放百分比。</param>
+    /// <returns>用户确认且校验通过时返回新尺寸与 DPI，取消或关闭返回 null。</returns>
+    internal static Task<(int Width, int Height, int ScaleFactor)?> ShowAsync(
+        int width, int height, int scaleFactor)
     {
-        var completion = new TaskCompletionSource<(int Width, int Height)?>(
+        var completion = new TaskCompletionSource<(int Width, int Height, int ScaleFactor)?>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         var widthBox = CreateSizeBox(width);
@@ -74,6 +76,39 @@ internal static class ResolutionDialog
         });
         sizePanel.Children.Add(heightBox);
 
+        var dpiBox = new System.Windows.Controls.ComboBox { Width = 100, VerticalContentAlignment = VerticalAlignment.Center };
+        foreach (var factor in new[] { 100, 125, 150, 175, 200 })
+        {
+            dpiBox.Items.Add(new System.Windows.Controls.ComboBoxItem
+            {
+                Content = $"{factor}%",
+                IsSelected = factor == scaleFactor
+            });
+        }
+
+        // 当前值不在预设里（之前自定义过）时补一项，避免显示成空。
+        if (dpiBox.SelectedItem is null)
+        {
+            dpiBox.Items.Add(new System.Windows.Controls.ComboBoxItem
+            {
+                Content = $"{scaleFactor}%",
+                IsSelected = true
+            });
+        }
+
+        var dpiPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(0, 8, 0, 0)
+        };
+        dpiPanel.Children.Add(new TextBlock
+        {
+            Text = Locale.Get("Resolution.Dpi"),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 10, 0)
+        });
+        dpiPanel.Children.Add(dpiBox);
+
         var buttonPanel = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -90,6 +125,7 @@ internal static class ResolutionDialog
             TextWrapping = TextWrapping.Wrap
         });
         panel.Children.Add(sizePanel);
+        panel.Children.Add(dpiPanel);
         panel.Children.Add(new TextBlock
         {
             Text = Locale.Format(
@@ -129,7 +165,17 @@ internal static class ResolutionDialog
                 return;
             }
 
-            completion.TrySetResult((newWidth, newHeight));
+            var dpiText = (dpiBox.SelectedItem as System.Windows.Controls.ComboBoxItem)
+                ?.Content as string;
+            if (!int.TryParse(dpiText?.TrimEnd('%'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var newScale)
+                || newScale is < 100 or > 500)
+            {
+                errorText.Text = Locale.Get("Resolution.Error.DpiRange");
+                errorText.Visibility = Visibility.Visible;
+                return;
+            }
+
+            completion.TrySetResult((newWidth, newHeight, newScale));
             dialog.Close();
         };
 

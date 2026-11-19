@@ -98,6 +98,14 @@ public sealed class SessionSettings
     public int DesktopHeight { get; set; } = 1080;
 
     /// <summary>
+    /// 分身桌面的 DPI 缩放百分比（100~500，默认 100）。
+    ///
+    /// 对应 RDP 的 DesktopScaleFactor：远端桌面按这个比例渲染 UI，分辨率本身不变。
+    /// 需要重连生效；与本地 SmartSizing 是两层独立缩放，同时放大画面会更糊。
+    /// </summary>
+    public int DesktopScaleFactor { get; set; } = 100;
+
+    /// <summary>
     /// RDP 画面是否自适应窗口。关闭时按 1:1 像素显示。
     ///
     /// 默认关闭（1:1）：分身桌面通常是 1920×1080，而窗口大小取决于屏幕与用户拖动，

@@ -41,6 +41,7 @@ internal sealed class RdpActiveXHost : AxHost
     private int _reconnectGeneration;
     private DrawingSize? _pendingReconnectDesktopSize;
     private bool _smartSizingEnabled = true;
+    private int _desktopScaleFactor = 100;
     private readonly RdpSmartSizingController _smartSizing;
     private bool _inputBlocked;
     private Func<(string UserName, string Domain, string Password)?>? _credentialProvider;
@@ -148,6 +149,8 @@ internal sealed class RdpActiveXHost : AxHost
             SetComProperty(advancedSettings, "EnableCredSspSupport", true));
         RunComStep(Locale.Get("Rdp.Step.RemoteWindowsKey"), () =>
             SetComProperty(advancedSettings, "EnableWindowsKey", 1));
+        RunComStep(Locale.Get("Rdp.Step.DesktopScale"), () =>
+            SetComProperty(advancedSettings, "DesktopScaleFactor", _desktopScaleFactor));
         // 每次连接重新确认设置，同时作废上一连接遗留的异步重排。
         _smartSizing.Reset();
         _smartSizing.Apply(_smartSizingEnabled);
@@ -201,6 +204,15 @@ internal sealed class RdpActiveXHost : AxHost
         ];
 
         SendShortcut(strokes, "Win+Tab");
+    }
+
+    /// <summary>
+    /// 设置远端桌面的 DPI 缩放百分比。只更新期望值，实际写入在下次连接时发生：
+    /// DesktopScaleFactor 在已连接时修改不生效，必须走重连。
+    /// </summary>
+    internal void SetDesktopScaleFactor(int factor)
+    {
+        _desktopScaleFactor = factor;
     }
 
     internal void SetSmartSizing(bool enabled)
