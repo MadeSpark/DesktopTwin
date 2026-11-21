@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Net;
+using System.Runtime.InteropServices;
 using System.Xml.Linq;
 
 namespace DesktopTwin.Services;
@@ -101,6 +104,32 @@ public static class ScheduledTaskXml
         return xml.Contains("<LogonTrigger", StringComparison.Ordinal)
             || xml.Contains("<SessionStateChangeTrigger", StringComparison.Ordinal)
             || xml.Contains("<RegistrationTrigger", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 取出任务直接启动的命令。只用于子会话内按精确路径兜底拦截；
+    /// 命令行仍由计划任务自己执行。
+    /// </summary>
+    /// <param name="xml">任务的 XML 定义。</param>
+    public static string? GetExecutable(string? xml)
+    {
+        if (string.IsNullOrWhiteSpace(xml) || !TryExtractBlock(xml, "Command", out var command))
+        {
+            return null;
+        }
+
+        var value = command.Trim();
+        if (value.StartsWith("<![CDATA[", StringComparison.Ordinal)
+            && value.EndsWith("]]>", StringComparison.Ordinal))
+        {
+            value = value.Substring(9, value.Length - 12).Trim();
+        }
+        else
+        {
+            value = WebUtility.HtmlDecode(value).Trim();
+        }
+
+        return value.Length == 0 ? null : value;
     }
 
     /// <summary>
@@ -230,7 +259,8 @@ public static class RunOnceClassifier
     }
 
     /// <summary>
-    /// 从命令行里取出可执行文件路径：带引号时取引号内，否则取第一个空格之前。
+    /// 从命令行里取出可执行文件路径：带引号时取引号内；未加引号时先按
+    /// <c>.exe</c> 边界保留带空格的路径，再退回第一个空格之前。
     /// </summary>
     /// <param name="commandLine">注册表里的命令行。</param>
     public static string? ParseExecutable(string? commandLine)
@@ -247,8 +277,127 @@ public static class RunOnceClassifier
             return end > 1 ? trimmed.Substring(1, end - 1) : trimmed.Trim('"');
         }
 
+        // 不少安装程序把未加引号的 "C:\Program Files\Vendor\app.exe --flag"
+        // 直接写进 Run。只按空格切会把路径截成 "C:\Program"，后面的兜底守卫
+        // 永远匹配不到真实进程。以 .exe 作为边界只影响解析结果；实际拦截时
+        // StartupGuardService 仍要求路径存在、位于子会话且完全相等。
+        var searchFrom = 0;
+        while (searchFrom < trimmed.Length)
+        {
+            var exe = trimmed.IndexOf(".exe", searchFrom, StringComparison.OrdinalIgnoreCase);
+            if (exe < 0)
+            {
+                break;
+            }
+
+            var end = exe + 4;
+            if (end == trimmed.Length || char.IsWhiteSpace(trimmed[end]))
+            {
+                return trimmed.Substring(0, end);
+            }
+
+            searchFrom = end;
+        }
+
         var space = trimmed.IndexOf(' ');
         return space > 0 ? trimmed.Substring(0, space) : trimmed;
+    }
+}
+
+/// <summary>
+/// 把启动文件夹里的快捷方式解析成真实 EXE，供子会话兜底守卫精确匹配。
+///
+/// 只解析 .lnk，不执行任何东西。WScript.Shell 可能被杀软拦截或 COM 注册损坏，
+/// 这种时候保守地返回 null：漏掉一个兜底目标，好过拿 .lnk 文件名误杀进程。
+/// </summary>
+internal static class ShortcutTargetResolver
+{
+    public static string? ResolveExecutable(string? candidate)
+    {
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return null;
+        }
+
+        var path = Expand(candidate);
+        if (!string.Equals(Path.GetExtension(path), ".lnk", StringComparison.OrdinalIgnoreCase))
+        {
+            return path;
+        }
+
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        object? shell = null;
+        object? shortcut = null;
+        try
+        {
+            var shellType = Type.GetTypeFromProgID("WScript.Shell", throwOnError: false);
+            if (shellType is null)
+            {
+                return null;
+            }
+
+            shell = Activator.CreateInstance(shellType);
+            if (shell is null)
+            {
+                return null;
+            }
+
+            // COM 对象的 GetType() 只是 System.__ComObject，不能靠普通反射读
+            // TargetPath；dynamic 会走 IDispatch，才能真正取到快捷方式目标。
+            dynamic shellApi = shell;
+            shortcut = shellApi.CreateShortcut(path);
+            if (shortcut is null)
+            {
+                return null;
+            }
+
+            dynamic shortcutApi = shortcut;
+            string? target = shortcutApi.TargetPath;
+            if (string.IsNullOrWhiteSpace(target))
+            {
+                return null;
+            }
+
+            var executable = Expand(target);
+            return string.Equals(Path.GetExtension(executable), ".exe", StringComparison.OrdinalIgnoreCase)
+                ? executable
+                : null;
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            // 快捷方式解析只是兜底路径：COM 被拦截、快捷方式损坏、目标类型不对
+            // 都只能让这一项失去兜底保护，绝不能让整轮启动项关停失败。
+            return null;
+        }
+        finally
+        {
+            ReleaseComObject(shortcut);
+            ReleaseComObject(shell);
+        }
+    }
+
+    private static string Expand(string path) =>
+        Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
+
+    private static void ReleaseComObject(object? value)
+    {
+        if (value is null || !Marshal.IsComObject(value))
+        {
+            return;
+        }
+
+        try
+        {
+            Marshal.FinalReleaseComObject(value);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            // COM 对象已经断开或已被运行时释放；没有需要补救的状态。
+        }
     }
 }
 
@@ -304,6 +453,9 @@ public sealed class StartupSnoozeTaskEntry
 
     /// <summary>任务路径。</summary>
     public string TaskPath { get; set; } = string.Empty;
+
+    /// <summary>任务直接启动的可执行文件（能解析时）；只用于子会话内的短时兜底。</summary>
+    public string? Executable { get; set; }
 
     /// <summary>原来的启用状态。</summary>
     public bool OriginalEnabled { get; set; }
@@ -361,6 +513,12 @@ public sealed class StartupSnoozeJournal
 
     /// <summary>未能关闭、但已明确告知用户的项。</summary>
     public List<string> Warnings { get; set; } = new();
+
+    /// <summary>
+    /// 系统拒绝关闭、需要在子会话里按精确路径拦截的启动程序。
+    /// 只记录可执行文件路径，不记录或修改启动项内容。
+    /// </summary>
+    public List<string> DeferredExecutables { get; set; } = new();
 
     /// <summary>所有写入是否都完成（false 表示中途失败，必须恢复）。</summary>
     public bool Completed { get; set; }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using DesktopTwin.Services;
 
@@ -103,6 +104,21 @@ public sealed class StartupSnoozeServiceTests
     }
 
     [Fact]
+    public void 计划任务能取出直接启动的程序路径()
+    {
+        const string xml = """
+            <Task><Actions><Exec>
+              <Command>"C:\Program Files\Vendor &amp; Co\app.exe"</Command>
+              <Arguments>--startup</Arguments>
+            </Exec></Actions></Task>
+            """;
+
+        Assert.Equal(
+            "\"C:\\Program Files\\Vendor & Co\\app.exe\"",
+            ScheduledTaskXml.GetExecutable(xml));
+    }
+
+    [Fact]
     public void 商店应用只有状态二才算确认启用()
     {
         Assert.True(UwpStartupState.IsEnabled(2));
@@ -154,8 +170,57 @@ public sealed class StartupSnoozeServiceTests
         Assert.Equal(@"C:\a b\app.exe", RunOnceClassifier.ParseExecutable("\"C:\\a b\\app.exe\" --flag"));
         Assert.Equal(@"C:\app.exe", RunOnceClassifier.ParseExecutable("C:\\app.exe --flag"));
         Assert.Equal(@"C:\app.exe", RunOnceClassifier.ParseExecutable("  C:\\app.exe  "));
+        Assert.Equal(
+            @"C:\Program Files\Vendor\app.exe",
+            RunOnceClassifier.ParseExecutable(@"C:\Program Files\Vendor\app.exe --startup"));
         Assert.Null(RunOnceClassifier.ParseExecutable("   "));
         Assert.Null(RunOnceClassifier.ParseExecutable(null));
+    }
+
+    [Fact]
+    public void 启动文件夹快捷方式能解析到快捷方式指向的exe()
+    {
+        var target = Environment.ProcessPath;
+        Assert.False(string.IsNullOrWhiteSpace(target));
+
+        var shortcutPath = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-shortcut-" + Guid.NewGuid().ToString("N") + ".lnk");
+        object? shell = null;
+        object? shortcut = null;
+        try
+        {
+            var shellType = Type.GetTypeFromProgID("WScript.Shell", throwOnError: false);
+            Assert.NotNull(shellType);
+            shell = Activator.CreateInstance(shellType!);
+            Assert.NotNull(shell);
+
+            dynamic shellApi = shell!;
+            shortcut = shellApi.CreateShortcut(shortcutPath);
+            Assert.NotNull(shortcut);
+
+            dynamic shortcutApi = shortcut!;
+            shortcutApi.TargetPath = target;
+            shortcutApi.Save();
+
+            Assert.Equal(
+                Path.GetFullPath(target!),
+                Path.GetFullPath(ShortcutTargetResolver.ResolveExecutable(shortcutPath)!),
+                ignoreCase: true);
+        }
+        finally
+        {
+            File.Delete(shortcutPath);
+            if (shortcut is not null && Marshal.IsComObject(shortcut))
+            {
+                Marshal.FinalReleaseComObject(shortcut);
+            }
+
+            if (shell is not null && Marshal.IsComObject(shell))
+            {
+                Marshal.FinalReleaseComObject(shell);
+            }
+        }
     }
 
     [Fact]
@@ -186,6 +251,7 @@ public sealed class StartupSnoozeServiceTests
         {
             Relative = @"\Clash Verge",
             TaskName = "Clash Verge",
+            Executable = @"C:\Program Files\Clash Verge\clash-verge.exe",
             OriginalEnabled = true,
             ConfirmedDisabled = true
         });
@@ -198,6 +264,7 @@ public sealed class StartupSnoozeServiceTests
             WrittenState = 0
         });
         journal.Warnings.Add("无法关闭：sysdiag");
+        journal.DeferredExecutables.Add(@"C:\Program Files\Huorong\Sysdiag\bin\hipstray.exe");
 
         var json = JsonSerializer.Serialize(journal, new JsonSerializerOptions { WriteIndented = true });
         var back = JsonSerializer.Deserialize<StartupSnoozeJournal>(json);
@@ -213,9 +280,293 @@ public sealed class StartupSnoozeServiceTests
         Assert.True(back.Registry[0].Applied);
         Assert.Single(back.Tasks);
         Assert.True(back.Tasks[0].ConfirmedDisabled);
+        Assert.Equal(journal.Tasks[0].Executable, back.Tasks[0].Executable);
+        Assert.Equal(
+            journal.DeferredExecutables[0],
+            Assert.Single(back.DeferredExecutables));
         Assert.Single(back.Uwp);
         Assert.Equal(2, back.Uwp[0].OriginalState);
         Assert.Equal("无法关闭：sysdiag", Assert.Single(back.Warnings));
+    }
+
+    [Fact]
+    public void 启动项守卫只接受用户程序并跳过系统外壳()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-guard-targets-" + Guid.NewGuid().ToString("N"));
+        System.IO.Directory.CreateDirectory(directory);
+        try
+        {
+            var app = Path.Combine(directory, "app.exe");
+            var duplicate = Path.Combine(directory, "APP.EXE");
+            var text = Path.Combine(directory, "script.cmd");
+            File.WriteAllBytes(app, [0]);
+            File.WriteAllText(text, "echo test");
+
+            var targets = StartupGuardService.NormalizeTargets(
+            [
+                app,
+                duplicate,
+                text,
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                Path.Combine(directory, "missing.exe")
+            ]);
+
+            Assert.Equal(app, Assert.Single(targets));
+        }
+        finally
+        {
+            System.IO.Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void 启动项守卫只终止目标会话且路径必须精确匹配()
+    {
+        var exact = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            @"C:\Apps\Twin\app.exe"
+        };
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "app" };
+
+        Assert.True(StartupGuardService.ShouldTerminate(
+            7, 7, 1, @"c:\apps\twin\APP.EXE", "app", exact, names));
+        Assert.False(StartupGuardService.ShouldTerminate(
+            1, 7, 1, @"C:\Apps\Twin\app.exe", "app", exact, names));
+        Assert.False(StartupGuardService.ShouldTerminate(
+            8, 7, 1, @"C:\Apps\Twin\app.exe", "app", exact, names));
+        Assert.False(StartupGuardService.ShouldTerminate(
+            7, 7, 1, @"C:\Apps\Other\app.exe", "app", exact, names));
+
+        // 读不到模块路径时才允许按进程名兜底，且仍然受会话号约束。
+        Assert.True(StartupGuardService.ShouldTerminate(
+            7, 7, 1, null, "app", exact, names));
+        Assert.False(StartupGuardService.ShouldTerminate(
+            1, 7, 1, null, "app", exact, names));
+    }
+
+    [Fact]
+    public void 关停日志安全校验接受正常条目()
+    {
+        StartupSnoozeService.ValidateJournal(CreateValidJournal());
+    }
+
+    [Fact]
+    public void 恢复日志拒绝不在_StartupApproved_下的注册表路径()
+    {
+        var error = AssertInvalidJournal(journal =>
+            journal.Registry[0].KeyPath =
+                @"Software\Microsoft\Windows\CurrentVersion\Run");
+
+        Assert.Contains("Run", error.Message);
+    }
+
+    [Fact]
+    public void 恢复日志拒绝未知注册表配置单元()
+    {
+        var error = AssertInvalidJournal(journal => journal.Registry[0].Hive = "HKLM");
+
+        Assert.Contains("配置单元", error.Message);
+    }
+
+    [Fact]
+    public void 恢复日志拒绝非_64_位的_StartupApproved_视图()
+    {
+        var error = AssertInvalidJournal(journal =>
+            journal.Registry[0].ApprovedView = "Registry32");
+
+        Assert.Contains("视图", error.Message);
+    }
+
+    [Fact]
+    public void 恢复日志拒绝损坏的注册表原始字节()
+    {
+        var error = AssertInvalidJournal(journal =>
+        {
+            journal.Registry[0].OriginalExists = true;
+            journal.Registry[0].OriginalBase64 = "not-base64";
+        });
+
+        Assert.Contains("Base64", error.Message);
+    }
+
+    [Fact]
+    public void 恢复日志拒绝_Microsoft_系统计划任务()
+    {
+        var error = AssertInvalidJournal(journal =>
+            journal.Tasks[0].Relative = @"\Microsoft\Windows\Defrag\ScheduledDefrag");
+
+        Assert.Contains("Microsoft", error.Message);
+    }
+
+    [Fact]
+    public void 恢复日志拒绝计划任务路径穿越()
+    {
+        var error = AssertInvalidJournal(journal =>
+            journal.Tasks[0].Relative = @"\Folder\..\Task");
+
+        Assert.Contains("任务", error.Message);
+    }
+
+    [Fact]
+    public void 恢复日志拒绝越界的_UWP_键路径()
+    {
+        var error = AssertInvalidJournal(journal =>
+            journal.Uwp[0].KeyPath =
+                @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppDataEvil\Contoso");
+
+        Assert.Contains("UWP", error.Message);
+    }
+
+    [Fact]
+    public void 恢复日志拒绝空_UWP_任务名()
+    {
+        var error = AssertInvalidJournal(journal => journal.Uwp[0].Task = string.Empty);
+
+        Assert.Contains("UWP", error.Message);
+    }
+
+    [Fact]
+    public void 启动项守卫绝不终止主会话或非目标会话()
+    {
+        const uint mainSession = 1;
+        const uint childSession = 2;
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            @"C:\Apps\Contoso\contoso.exe"
+        };
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "contoso" };
+
+        // 即使主会话里运行着同一个程序，也绝不能因为路径命中就去终止它。
+        Assert.False(StartupGuardService.ShouldTerminate(
+            mainSession, childSession, mainSession,
+            @"C:\Apps\Contoso\contoso.exe", "contoso", paths, names));
+        Assert.False(StartupGuardService.ShouldTerminate(
+            3, childSession, mainSession,
+            @"C:\Apps\Contoso\contoso.exe", "contoso", paths, names));
+
+        // 目标会话号本身等于主会话号时，整条守卫都必须拒绝工作。
+        Assert.False(StartupGuardService.ShouldTerminate(
+            mainSession, mainSession, mainSession,
+            @"C:\Apps\Contoso\contoso.exe", "contoso", paths, names));
+    }
+
+    [Fact]
+    public void 启动项守卫只按精确路径匹配_读不到路径时才用进程名兜底()
+    {
+        const uint mainSession = 1;
+        const uint childSession = 2;
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            @"C:\Apps\Contoso\contoso.exe"
+        };
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "contoso" };
+
+        Assert.True(StartupGuardService.ShouldTerminate(
+            childSession, childSession, mainSession,
+            @"c:\apps\contoso\CONTOSO.EXE", "contoso", paths, names));
+
+        // 同名但不在启动项路径里的程序不能被杀。
+        Assert.False(StartupGuardService.ShouldTerminate(
+            childSession, childSession, mainSession,
+            @"C:\Other\contoso.exe", "contoso", paths, names));
+
+        // 只有主模块路径不可读时才允许按进程名兜底。
+        Assert.True(StartupGuardService.ShouldTerminate(
+            childSession, childSession, mainSession,
+            null, "contoso", paths, names));
+    }
+
+    [Fact]
+    public void 启动项守卫只兜底未确认关闭的项目()
+    {
+        var journal = new StartupSnoozeJournal();
+        journal.Registry.Add(new StartupSnoozeRegistryEntry
+        {
+            ValueName = "confirmed",
+            CommandLine = "\"C:\\Apps\\confirmed.exe\" --startup",
+            Applied = true
+        });
+        journal.Registry.Add(new StartupSnoozeRegistryEntry
+        {
+            ValueName = "unconfirmed",
+            CommandLine = "\"C:\\Apps\\unconfirmed.exe\" --startup",
+            Applied = false
+        });
+        journal.Tasks.Add(new StartupSnoozeTaskEntry
+        {
+            Relative = @"\ConfirmedTask",
+            Executable = @"C:\Apps\task-confirmed.exe",
+            ConfirmedDisabled = true
+        });
+        journal.Tasks.Add(new StartupSnoozeTaskEntry
+        {
+            Relative = @"\UnconfirmedTask",
+            Executable = @"C:\Apps\task-unconfirmed.exe",
+            ConfirmedDisabled = false
+        });
+        journal.DeferredExecutables.Add(@"C:\Apps\deferred.exe");
+
+        var method = typeof(StartupSnoozeService).GetMethod(
+            "NormalizeStartupExecutables",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+        var targets = (IReadOnlyList<string>)method!.Invoke(null, [journal])!;
+
+        Assert.Contains(@"C:\Apps\unconfirmed.exe", targets);
+        Assert.Contains(@"C:\Apps\task-unconfirmed.exe", targets);
+        Assert.Contains(@"C:\Apps\deferred.exe", targets);
+        Assert.DoesNotContain(@"C:\Apps\confirmed.exe", targets);
+        Assert.DoesNotContain(@"C:\Apps\task-confirmed.exe", targets);
+    }
+
+    private static InvalidDataException AssertInvalidJournal(Action<StartupSnoozeJournal> mutate)
+    {
+        var journal = CreateValidJournal();
+        mutate(journal);
+        return Assert.Throws<InvalidDataException>(
+            () => StartupSnoozeService.ValidateJournal(journal));
+    }
+
+    private static StartupSnoozeJournal CreateValidJournal()
+    {
+        var journal = new StartupSnoozeJournal
+        {
+            Machine = Environment.MachineName,
+            User = Environment.UserName,
+            Completed = true
+        };
+        journal.Registry.Add(new StartupSnoozeRegistryEntry
+        {
+            Kind = "RunValue",
+            Hive = "CurrentUser",
+            RunView = "Registry64",
+            ApprovedView = "Registry64",
+            KeyPath = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+            ValueName = "ContosoStartup",
+            CommandLine = "\"C:\\Program Files\\Contoso\\contoso.exe\"",
+            OriginalExists = true,
+            OriginalBase64 = Convert.ToBase64String(new byte[] { 0x02, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 }),
+            WrittenBase64 = Convert.ToBase64String(new byte[] { 0x03, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9 })
+        });
+        journal.Tasks.Add(new StartupSnoozeTaskEntry
+        {
+            Relative = @"\ContosoStartup",
+            TaskName = "ContosoStartup",
+            TaskPath = @"\",
+            Executable = @"C:\Program Files\Contoso\contoso.exe",
+            OriginalEnabled = true
+        });
+        journal.Uwp.Add(new StartupSnoozeUwpEntry
+        {
+            KeyPath = @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Contoso.App_8wekyb3d8bbwe\ContosoStartup",
+            PackageFamilyName = "Contoso.App_8wekyb3d8bbwe",
+            Task = "ContosoStartup",
+            OriginalState = 2,
+            WrittenState = 2
+        });
+        return journal;
     }
 
     [Fact]

@@ -157,12 +157,22 @@ public sealed class ChildSessionService : IDisposable
     private string? _lastOperationMessage;
 
     private readonly StartupSnoozeService _startupSnooze;
+    private StartupGuardService? _startupGuard;
 
     /// <summary>本次连接是否已经把启动项关掉（置 true 后必须成对恢复）。</summary>
     private bool _startupIsolationActive;
 
+    /// <summary>孤儿恢复是否已在后台执行，避免每个状态轮询都重复排队。</summary>
+    private int _startupIsolationRestoreInProgress;
+
+    /// <summary>串行化注销、释放和孤儿兜底三条恢复路径。</summary>
+    private readonly object _startupIsolationRestoreGate = new();
+
     /// <summary>关停动作完成的时间点，用来给「会话还没建起来」留一段宽限。</summary>
     private long _startupIsolationArmedTick;
+
+    /// <summary>孤儿恢复失败后的下一次重试时间，避免每 500ms 轮询都重复打系统接口。</summary>
+    private long _startupIsolationRestoreNotBeforeTick;
     private System.Collections.Generic.IReadOnlyList<ChildSessionEnvironmentCheck.Issue> _environmentIssues = [];
 
     /// <summary>
@@ -523,19 +533,47 @@ public sealed class ChildSessionService : IDisposable
                 // 分身用同一账户登录，Windows 会把用户和公共启动项在子会话里再跑一遍；
                 // 单实例软件收到协议 / IPC 调用后还会把窗口拉回主桌面，于是「分身里启动」
                 // 变成「主桌面又冒出来一堆窗口」。连接前先按日志把这些启动源临时关掉。
-                await PrepareStartupIsolationAsync().ConfigureAwait(true);
+                var startupIsolation = await PrepareStartupIsolationAsync().ConfigureAwait(true);
                 if (_disposed || startGeneration != _startGeneration)
                 {
+                    // EnsureSnoozed 可能刚好在 Dispose 的恢复之后才落盘。这里必须
+                    // 再按日志恢复一次，否则应用退出后会留下「开机启动被关掉」的状态。
+                    if (_startupSnooze.IsSnoozed)
+                    {
+                        try
+                        {
+                            var cleanup = await Task.Run(_startupSnooze.Restore).ConfigureAwait(true);
+                            if (!cleanup.Success)
+                            {
+                                AppLog.Warn("被取消的启动流程未能恢复启动项：" + cleanup.Message);
+                            }
+                        }
+                        catch (Exception exception) when (IsStartupSnoozeException(exception))
+                        {
+                            AppLog.Warn("被取消的启动流程恢复启动项时出错。", exception);
+                        }
+                    }
+
                     AppLog.Info("关停启动项期间启动已被注销或释放取代，放弃后续步骤。");
                     return;
                 }
 
+                // 启动项隔离失败时绝不能继续连接：日志、注册表或计划任务可能只改到一半，
+                // 此时启动分身会把重复的启动程序带进子会话，还会让用户误以为隔离成功。
+                if (!startupIsolation.Success)
+                {
+                    throw new InvalidOperationException(
+                        "启动项隔离未完成，已取消连接：" + startupIsolation.Message);
+                }
+
+                StartStartupGuard(startupIsolation.StartupExecutables);
                 ConnectCore(Locale.Get("Svc.Status.Starting"));
             }
             catch
             {
                 _autoLaunchPending = false;
                 _initialConnectionRetriesRemaining = 0;
+                StopStartupGuard();
                 completionSource.TrySetResult(false);
                 _connectionAttemptCompletionSource = null;
                 throw;
@@ -1126,6 +1164,7 @@ public sealed class ChildSessionService : IDisposable
             _rdpSettingsReconnectRetriesRemaining = 0;
             _connectionAttemptCompletionSource?.TrySetResult(false);
 
+            StopStartupGuard();
             TryDisconnectRdpHost();
             RefreshState(Locale.Get("Svc.Status.LoggingOff"));
 
@@ -1159,7 +1198,7 @@ public sealed class ChildSessionService : IDisposable
     /// 默认关掉本机启动项；用户显式勾了「在分身里运行开机自启动项」就反过来，
     /// 把可能残留的关停日志恢复掉，让启动项照常运行。
     /// </summary>
-    private async Task PrepareStartupIsolationAsync()
+    private async Task<StartupSnoozeResult> PrepareStartupIsolationAsync()
     {
         var suppress = !_settings.Current.Session.StartupAppsEnabled;
         var service = _startupSnooze;
@@ -1174,13 +1213,79 @@ public sealed class ChildSessionService : IDisposable
         catch (Exception exception) when (IsStartupSnoozeException(exception))
         {
             AppLog.Warn("准备启动项隔离时出错。", exception);
-            App.ShowTrayBalloon(Locale.Get("Snooze.Title"), exception.Message);
+            result = StartupSnoozeResult.Fail(
+                "准备启动项隔离时出错，已取消连接：" + exception.Message);
+        }
+
+        if (!result.Success && suppress && service.IsSnoozed)
+        {
+            // EnsureSnoozed 通常已经自行回滚；这里再补一次，覆盖回滚本身失败、
+            // 或异常发生在落盘与回滚之间的极端情况。日志仍读不出来时保持原日志，
+            // 下次启动会继续尝试恢复，不能为了「看起来干净」把证据删掉。
+            StartupSnoozeResult recovery;
+            try
+            {
+                recovery = await Task.Run(service.Restore).ConfigureAwait(true);
+            }
+            catch (Exception exception) when (IsStartupSnoozeException(exception))
+            {
+                AppLog.Warn("补做启动项恢复时出错。", exception);
+                recovery = StartupSnoozeResult.Fail(exception.Message);
+            }
+
+            result = recovery.Success
+                ? StartupSnoozeResult.Fail(
+                    result.Message + "；已按日志恢复原启动项。",
+                    result.Warnings)
+                : StartupSnoozeResult.Fail(
+                    result.Message + "；再次恢复原启动项失败：" + recovery.Message,
+                    result.Warnings);
+        }
+
+        // 只要日志还在，就仍有需要恢复的系统状态；即使本次连接失败或恢复失败，
+        // 也必须让注销/释放路径继续重试，不能把日志留在磁盘上却认为隔离未生效。
+        // 恢复模式（用户显式启用）成功时日志应已删除，因此不会在断线时再改回去。
+        _startupIsolationActive = suppress && service.IsSnoozed;
+        _startupIsolationArmedTick = Environment.TickCount64;
+        Interlocked.Exchange(ref _startupIsolationRestoreNotBeforeTick, 0);
+        ReportStartupSnoozeResult(result);
+        return result;
+    }
+
+    /// <summary>
+    /// 在连接前启动子会话启动项守卫。守卫只按日志里记录的精确程序路径匹配，
+    /// 且必须在子会话里；主桌面进程永远不在扫描范围内。
+    /// </summary>
+    private void StartStartupGuard(System.Collections.Generic.IReadOnlyList<string>? startupExecutables)
+    {
+        StopStartupGuard();
+        if (startupExecutables is null || startupExecutables.Count == 0)
+        {
             return;
         }
 
-        _startupIsolationActive = suppress && result.Success;
-        _startupIsolationArmedTick = Environment.TickCount64;
-        ReportStartupSnoozeResult(result);
+        try
+        {
+            _startupGuard = new StartupGuardService(
+                startupExecutables,
+                ChildSessionNativeMethods.TryGetChildSessionId,
+                _disposeCancellationTokenSource.Token);
+        }
+        catch (Exception exception) when (exception is ArgumentException or IOException
+                                              or InvalidOperationException
+                                              or System.Security.SecurityException)
+        {
+            AppLog.Warn("启动子会话启动项守卫失败，继续使用启动项关停结果。", exception);
+        }
+    }
+
+    private void StopStartupGuard()
+    {
+        var guard = System.Threading.Interlocked.Exchange(ref _startupGuard, null);
+        if (guard is not null)
+        {
+            guard.Dispose();
+        }
     }
 
     /// <summary>
@@ -1188,29 +1293,36 @@ public sealed class ChildSessionService : IDisposable
     /// </summary>
     private StartupSnoozeResult RestoreStartupIsolationCore()
     {
-        if (!_startupSnooze.IsSnoozed)
+        // 注销和孤儿兜底可能同时发现会话消失；两次 Restore 并发会争抢同一份
+        // 日志并把已经恢复的启动项再按旧值写一遍，必须串行执行。
+        lock (_startupIsolationRestoreGate)
         {
-            _startupIsolationActive = false;
-            return StartupSnoozeResult.Ok("没有需要恢复的启动项。");
-        }
+            if (!_startupSnooze.IsSnoozed)
+            {
+                _startupIsolationActive = false;
+                Interlocked.Exchange(ref _startupIsolationRestoreNotBeforeTick, 0);
+                return StartupSnoozeResult.Ok("没有需要恢复的启动项。");
+            }
 
-        StartupSnoozeResult result;
-        try
-        {
-            result = _startupSnooze.Restore();
-        }
-        catch (Exception exception) when (IsStartupSnoozeException(exception))
-        {
-            AppLog.Warn("恢复启动项失败。", exception);
-            return StartupSnoozeResult.Fail("恢复启动项失败：" + exception.Message);
-        }
+            StartupSnoozeResult result;
+            try
+            {
+                result = _startupSnooze.Restore();
+            }
+            catch (Exception exception) when (IsStartupSnoozeException(exception))
+            {
+                AppLog.Warn("恢复启动项失败。", exception);
+                return StartupSnoozeResult.Fail("恢复启动项失败：" + exception.Message);
+            }
 
-        if (result.Success)
-        {
-            _startupIsolationActive = false;
-        }
+            if (result.Success)
+            {
+                _startupIsolationActive = false;
+                Interlocked.Exchange(ref _startupIsolationRestoreNotBeforeTick, 0);
+            }
 
-        return result;
+            return result;
+        }
     }
 
     /// <summary>
@@ -1231,20 +1343,40 @@ public sealed class ChildSessionService : IDisposable
             return;
         }
 
-        if (Environment.TickCount64 - _startupIsolationArmedTick < 20_000)
+        var now = Environment.TickCount64;
+        if (now - _startupIsolationArmedTick < 20_000
+            || now < Interlocked.Read(ref _startupIsolationRestoreNotBeforeTick))
         {
             return;
         }
 
-        // 立刻置 false，避免恢复过程（可能几秒）里每 500ms 再排一次。
-        _startupIsolationActive = false;
+        // 恢复可能要几秒，用独立标记避免每 500ms 重复排队；不能提前把
+        // _startupIsolationActive 置 false，否则恢复失败后本轮再也不会重试。
+        if (Interlocked.CompareExchange(ref _startupIsolationRestoreInProgress, 1, 0) != 0)
+        {
+            return;
+        }
+
+        StopStartupGuard();
         AppLog.Info("分身会话已不存在，正在恢复开机启动项。");
         _ = Task.Run(() =>
         {
-            var result = RestoreStartupIsolationCore();
-            if (!result.Success)
+            try
             {
-                App.ShowTrayBalloon(Locale.Get("Snooze.Title"), result.Message);
+                var result = RestoreStartupIsolationCore();
+                if (!result.Success)
+                {
+                    // 恢复失败通常意味着杀软/权限暂时未放行；给系统接口留出
+                    // 冷却时间，避免状态轮询每 500ms 都触发一轮 schtasks。
+                    Interlocked.Exchange(
+                        ref _startupIsolationRestoreNotBeforeTick,
+                        Environment.TickCount64 + 30_000);
+                    App.ShowTrayBalloon(Locale.Get("Snooze.Title"), result.Message);
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _startupIsolationRestoreInProgress, 0);
             }
         });
     }
@@ -1292,7 +1424,8 @@ public sealed class ChildSessionService : IDisposable
             or System.Security.SecurityException
             or System.Text.Json.JsonException
             or InvalidOperationException
-            or ArgumentException;
+            or ArgumentException
+            or NotSupportedException;
 
     /// <summary>
     /// 关闭 Windows 的 Child Sessions 功能。属于高级操作，界面会二次确认。
@@ -1525,6 +1658,7 @@ public sealed class ChildSessionService : IDisposable
         _statusTimer.Stop();
         _statusTimer.Tick -= OnStatusTimerTick;
         _disposeCancellationTokenSource.Cancel();
+        StopStartupGuard();
         _autoLaunchPending = false;
         _connectionAttemptCompletionSource?.TrySetCanceled();
         _connectionAttemptCompletionSource = null;
@@ -1849,6 +1983,10 @@ public sealed class ChildSessionService : IDisposable
         // 登录已经完成，再盯着凭据弹窗只会误填下一个（比如用户手动打开的安全对话框）。
         _autoLogin?.StopWatching();
 
+        // 登录完成后启动项通常很快稳定；通知守卫再守固定时间即可，
+        // 不能因为它启动得早而在真正的登录/延迟启动之前就过期。
+        _startupGuard?.NotifyLoginCompleted();
+
         // 输入窗口每次连接都会新建，观看模式需要重新施加到新窗口上。
         _desktopWindow?.RdpHost.SetInputBlocked(WatchModeEnabled);
 
@@ -2095,6 +2233,10 @@ public sealed class ChildSessionService : IDisposable
         _autoLaunchPending = false;
         _initialConnectionRetriesRemaining = 0;
         _credentialFailureSuspected = IsLikelyCredentialFailure(diagnosed);
+
+        // 已经是最终失败，不能再让子会话守卫空转五分钟。启动项本身仍由孤儿
+        // 恢复逻辑在确认子会话不存在后按日志恢复；若会话还在，则保留隔离以便重试。
+        StopStartupGuard();
 
         // 留给「复制环境信息」：环境全绿却连不上时，这一行通常才是关键。
         // 用 e.Message 而不是 diagnosed.Message：后者带上了整段环境诊断，不适合塞进一行。
