@@ -74,6 +74,11 @@ public partial class MainWindowViewModel : ObservableObject
     private bool _isTopmost;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StartupAppsMenuText))]
+    [NotifyPropertyChangedFor(nameof(StartupAppsMenuToolTip))]
+    private bool _startupAppsEnabled;
+
+    [ObservableProperty]
     private bool _isAdaptive = true;
 
     [ObservableProperty]
@@ -166,6 +171,7 @@ public partial class MainWindowViewModel : ObservableObject
         _settings = settings;
 
         _isTopmost = childSessionService.TopmostEnabled;
+        _startupAppsEnabled = settings.Current.Session.StartupAppsEnabled;
         _isAdaptive = childSessionService.SmartSizingEnabled;
         _keepAspectRatio = childSessionService.KeepAspectRatio;
         _normalWindowPosition = childSessionService.NormalWindowPosition;
@@ -217,6 +223,20 @@ public partial class MainWindowViewModel : ObservableObject
     /// 置顶按钮提示文本。
     /// </summary>
     public string TopmostButtonToolTip => IsTopmost ? Locale.Get("Main.Topmost.Off") : Locale.Get("Main.Topmost.On");
+
+    /// <summary>
+    /// 菜单里「开机自启动项」那一项的当前状态。
+    /// </summary>
+    public string StartupAppsMenuText => StartupAppsEnabled
+        ? Locale.Get("Main.StartupApps.Allowed")
+        : Locale.Get("Main.StartupApps.Suppressed");
+
+    /// <summary>
+    /// 「开机自启动项」菜单项的按下后行为。
+    /// </summary>
+    public string StartupAppsMenuToolTip => StartupAppsEnabled
+        ? Locale.Get("Main.StartupApps.Off")
+        : Locale.Get("Main.StartupApps.On");
 
     /// <summary>
     /// 音频按钮提示文本。
@@ -362,6 +382,12 @@ public partial class MainWindowViewModel : ObservableObject
     partial void OnIsTopmostChanged(bool value)
     {
         OnPropertyChanged(nameof(TopmostButtonToolTip));
+    }
+
+    partial void OnStartupAppsEnabledChanged(bool value)
+    {
+        _settings.Current.Session.StartupAppsEnabled = value;
+        _settings.SaveSoon();
     }
 
     partial void OnIsSmallWindowModeChanged(bool value)
@@ -1706,6 +1732,14 @@ public partial class MainWindowViewModel : ObservableObject
     private void ShowTaskView()
     {
         Execute(_childSessionService.ShowChildSessionTaskView);
+    }
+
+    [RelayCommand]
+    private void ToggleStartupApps()
+    {
+        // 只改设置，真正的关停/恢复发生在下一次连接和断开时：
+        // 会话正开着的时候改这个开关，不能悄悄把用户已经在用的启动项砍掉。
+        StartupAppsEnabled = !StartupAppsEnabled;
     }
 
     [RelayCommand]
