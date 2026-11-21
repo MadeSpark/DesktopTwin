@@ -460,6 +460,9 @@ public sealed class StartupSnoozeTaskEntry
     /// <summary>原来的启用状态。</summary>
     public bool OriginalEnabled { get; set; }
 
+    /// <summary>是否已经准备调用 schtasks 禁用。用于区分「本次写入」和外部修改。</summary>
+    public bool WriteAttempted { get; set; }
+
     /// <summary>禁用后回读确认的结果。</summary>
     public bool ConfirmedDisabled { get; set; }
 }
@@ -490,8 +493,8 @@ public sealed class StartupSnoozeUwpEntry
 /// </summary>
 public sealed class StartupSnoozeJournal
 {
-    /// <summary>日志格式版本。</summary>
-    public int Version { get; set; } = 1;
+    /// <summary>日志格式版本。版本 2 起为计划任务记录写入前标记。</summary>
+    public int Version { get; set; } = 2;
 
     /// <summary>创建时间。</summary>
     public DateTimeOffset CreatedAt { get; set; }

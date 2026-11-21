@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Microsoft.Win32;
 using DesktopTwin.Services;
 
 namespace DesktopTwin.Tests;
@@ -253,6 +254,7 @@ public sealed class StartupSnoozeServiceTests
             TaskName = "Clash Verge",
             Executable = @"C:\Program Files\Clash Verge\clash-verge.exe",
             OriginalEnabled = true,
+            WriteAttempted = true,
             ConfirmedDisabled = true
         });
         journal.Uwp.Add(new StartupSnoozeUwpEntry
@@ -278,7 +280,9 @@ public sealed class StartupSnoozeServiceTests
         Assert.Equal("Registry64", back.Registry[0].ApprovedView);
         Assert.Equal(journal.Registry[0].OriginalBase64, back.Registry[0].OriginalBase64);
         Assert.True(back.Registry[0].Applied);
+        Assert.Equal(2, back.Version);
         Assert.Single(back.Tasks);
+        Assert.True(back.Tasks[0].WriteAttempted);
         Assert.True(back.Tasks[0].ConfirmedDisabled);
         Assert.Equal(journal.Tasks[0].Executable, back.Tasks[0].Executable);
         Assert.Equal(
@@ -290,7 +294,7 @@ public sealed class StartupSnoozeServiceTests
     }
 
     [Fact]
-    public void 启动项守卫只接受用户程序并跳过系统外壳()
+    public void 启动项守卫接受延迟出现的用户程序并跳过系统外壳()
     {
         var directory = Path.Combine(
             Path.GetTempPath(),
@@ -313,7 +317,9 @@ public sealed class StartupSnoozeServiceTests
                 Path.Combine(directory, "missing.exe")
             ]);
 
-            Assert.Equal(app, Assert.Single(targets));
+            Assert.Contains(app, targets);
+            Assert.Contains(duplicate, targets);
+            Assert.Contains(Path.Combine(directory, "missing.exe"), targets);
         }
         finally
         {
@@ -519,6 +525,93 @@ public sealed class StartupSnoozeServiceTests
         Assert.Contains(@"C:\Apps\deferred.exe", targets);
         Assert.DoesNotContain(@"C:\Apps\confirmed.exe", targets);
         Assert.DoesNotContain(@"C:\Apps\task-confirmed.exe", targets);
+    }
+
+    [Fact]
+    public void 审批值分类不会把错误类型当成已读取()
+    {
+        var method = typeof(StartupSnoozeService).GetMethod(
+            "ClassifyApprovalValue",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        object?[] wrongTypeArguments = [RegistryValueKind.String, "not-bytes", null];
+        Assert.Null(method!.Invoke(null, wrongTypeArguments));
+        Assert.NotNull(wrongTypeArguments[2]);
+
+        var bytes = new byte[] { 0x02, 1, 2, 3 };
+        object?[] binaryArguments = [RegistryValueKind.Binary, bytes, null];
+        Assert.Same(bytes, method.Invoke(null, binaryArguments));
+        Assert.Null(binaryArguments[2]);
+
+        object?[] nullArguments = [RegistryValueKind.Binary, null, null];
+        Assert.Null(method.Invoke(null, nullArguments));
+        Assert.NotNull(nullArguments[2]);
+    }
+
+    [Fact]
+    public void 启动项恢复标记必须逐字节一致()
+    {
+        var method = typeof(StartupSnoozeService).GetMethod(
+            "IsWrittenValue",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var written = new byte[] { 0x03, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9 };
+        var sameFlagDifferentTimestamp = new byte[] { 0x03, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4 };
+
+        Assert.True((bool)method!.Invoke(null, [written, written])!);
+        Assert.False((bool)method.Invoke(null, [sameFlagDifferentTimestamp, written])!);
+        Assert.False((bool)method.Invoke(null, [null, written])!);
+    }
+
+    [Fact]
+    public void 计划任务恢复能区分新版标记和旧版日志()
+    {
+        var method = typeof(StartupSnoozeService).GetMethod(
+            "CanRestoreScheduledTask",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var current = new StartupSnoozeJournal { Version = 2 };
+        Assert.True((bool)method!.Invoke(null,
+            [current, new StartupSnoozeTaskEntry { WriteAttempted = true }])!);
+        Assert.False((bool)method.Invoke(null,
+            [current, new StartupSnoozeTaskEntry { WriteAttempted = false, ConfirmedDisabled = true }])!);
+
+        // 旧版日志没有 WriteAttempted，只能把回读确认过的禁用视为旧版自己的写入。
+        var legacy = new StartupSnoozeJournal { Version = 1 };
+        Assert.True((bool)method.Invoke(null,
+            [legacy, new StartupSnoozeTaskEntry { ConfirmedDisabled = true }])!);
+        Assert.False((bool)method.Invoke(null,
+            [legacy, new StartupSnoozeTaskEntry { ConfirmedDisabled = false }])!);
+    }
+
+    [Fact]
+    public void 关停日志版本接受旧版并拒绝未来版本()
+    {
+        var legacy = CreateValidJournal();
+        legacy.Version = 1;
+        StartupSnoozeService.ValidateJournal(legacy);
+
+        AssertInvalidJournal(journal => journal.Version = 3);
+    }
+
+    [Fact]
+    public void UWP恢复只接受记录过的关闭状态()
+    {
+        var method = typeof(StartupSnoozeService).GetMethod(
+            "CanRestoreUwpState",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var entry = new StartupSnoozeUwpEntry { OriginalState = 2, WrittenState = 0 };
+        var unrelatedEntry = new StartupSnoozeUwpEntry { OriginalState = 2, WrittenState = 2 };
+
+        Assert.True((bool)method!.Invoke(null, [0, entry])!);
+        Assert.False((bool)method.Invoke(null, [0, unrelatedEntry])!);
+        Assert.False((bool)method.Invoke(null, [1, entry])!);
+        Assert.False((bool)method.Invoke(null, [3, entry])!);
     }
 
     private static InvalidDataException AssertInvalidJournal(Action<StartupSnoozeJournal> mutate)

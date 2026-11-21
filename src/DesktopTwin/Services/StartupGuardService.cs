@@ -92,8 +92,8 @@ internal sealed class StartupGuardService : IDisposable
     public int InterceptedCount => Volatile.Read(ref _intercepted);
 
     /// <summary>
-    /// RDP 登录完成通知。登录后启动项通常在一分钟内趋于稳定；收到通知后
-    /// 再守 60 秒即可，不必让兜底守卫一直跑到绝对上限。
+    /// RDP 登录完成通知。登录后启动项通常在两分钟内趋于稳定；收到通知后
+    /// 再守两分钟即可，不必让兜底守卫一直跑到绝对上限。
     /// </summary>
     public void NotifyLoginCompleted()
     {
@@ -134,7 +134,8 @@ internal sealed class StartupGuardService : IDisposable
     }
 
     /// <summary>
-    /// 归一化启动程序路径。只接受确实存在的 .exe；跳过 Windows 系统目录和
+    /// 归一化启动程序路径。接受当前还不存在、但启动项指向的 .exe，
+    /// 以便拦截登录后才被下载或解压出来的延迟程序；跳过 Windows 系统目录和
     /// 通用启动器，避免把子会话的桌面外壳或系统服务误当成用户启动项。
     /// </summary>
     internal static HashSet<string> NormalizeTargets(IEnumerable<string> startupExecutables)
@@ -166,7 +167,6 @@ internal sealed class StartupGuardService : IDisposable
             }
 
             if (!string.Equals(Path.GetExtension(fullPath), ".exe", StringComparison.OrdinalIgnoreCase)
-                || !File.Exists(fullPath)
                 || fullPath.StartsWith(windowsDirectory, StringComparison.OrdinalIgnoreCase)
                 || BlockedFileNames.Contains(Path.GetFileName(fullPath), StringComparer.OrdinalIgnoreCase)
                 || (currentExecutable is not null
