@@ -5,8 +5,11 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using DesktopTwin.Interop;
 using Microsoft.Win32;
 
 namespace DesktopTwin.Services;
@@ -14,30 +17,42 @@ namespace DesktopTwin.Services;
 /// <summary>
 /// 关停 / 恢复「开机自启动项」的结果。
 /// </summary>
-/// <param name="Success">流程是否走完（个别项关不掉不算失败，会出现在 <see cref="Warnings"/> 里）。</param>
+/// <param name="Success">是否已确认没有非例外启动项还能在分身里运行；无法确认时必须失败关闭。</param>
 /// <param name="Message">给用户看的结论。</param>
 /// <param name="Warnings">关不掉的项、以及需要注意的提示。</param>
-/// <param name="StartupExecutables">本次涉及的启动程序；子会话里只用于登录后的短时兜底拦截。</param>
+/// <param name="StartupExecutables">本次未能确认关停的启动程序；登录阶段按路径直接兜底拦截。</param>
+/// <param name="ManagedStartupExecutables">
+/// 本次日志涉及的全部启动程序；常驻阶段只拦截由会话 0 服务拉起的副本，
+/// 避免厂商服务绕过启动项开关后，在分身里长期留下重复程序。
+/// </param>
 public sealed record StartupSnoozeResult(
     bool Success,
     string Message,
     IReadOnlyList<string> Warnings,
-    IReadOnlyList<string> StartupExecutables)
+    IReadOnlyList<string> StartupExecutables,
+    IReadOnlyList<string> ManagedStartupExecutables)
 {
     /// <summary>创建一个成功结果。</summary>
     public static StartupSnoozeResult Ok(
         string message,
         IReadOnlyList<string>? warnings = null,
-        IReadOnlyList<string>? startupExecutables = null) =>
+        IReadOnlyList<string>? startupExecutables = null,
+        IReadOnlyList<string>? managedStartupExecutables = null) =>
         new(
             true,
             message,
             warnings ?? Array.Empty<string>(),
-            startupExecutables ?? Array.Empty<string>());
+            startupExecutables ?? Array.Empty<string>(),
+            managedStartupExecutables ?? startupExecutables ?? Array.Empty<string>());
 
     /// <summary>创建一个失败结果。</summary>
     public static StartupSnoozeResult Fail(string message, IReadOnlyList<string>? warnings = null) =>
-        new(false, message, warnings ?? Array.Empty<string>(), Array.Empty<string>());
+        new(
+            false,
+            message,
+            warnings ?? Array.Empty<string>(),
+            Array.Empty<string>(),
+            Array.Empty<string>());
 }
 
 /// <summary>
@@ -68,6 +83,45 @@ public sealed class StartupSnoozeService
     private const string TaskCacheTreePath = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree";
     private const string UwpRootPath =
         @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData";
+    private const string RestoreMutexName = @"Global\DesktopTwin.StartupSnooze.Restore";
+    private const string JournalStoreKeyPath = @"SOFTWARE\DesktopTwin\StartupIsolation";
+    private const string JournalValuePrefix = "Journal.";
+    private const int MaxJournalBytes = 512 * 1024;
+    private static readonly TimeSpan RestoreMutexTimeout = TimeSpan.FromSeconds(45);
+
+    internal enum ChildSessionPresence
+    {
+        Present,
+        Absent,
+        Unknown
+    }
+
+    internal enum ScheduledTaskPresence
+    {
+        Present,
+        Absent,
+        Unknown
+    }
+
+    internal readonly record struct ScheduledTaskXmlQueryResult(
+        ScheduledTaskPresence Presence,
+        string? Xml)
+    {
+        public bool IsPresent => Presence == ScheduledTaskPresence.Present && Xml is not null;
+
+        public bool IsAbsent => Presence == ScheduledTaskPresence.Absent;
+
+        public bool IsUnknown => Presence == ScheduledTaskPresence.Unknown;
+
+        public static ScheduledTaskXmlQueryResult Present(string xml) =>
+            new(ScheduledTaskPresence.Present, xml);
+
+        public static ScheduledTaskXmlQueryResult Absent =>
+            new(ScheduledTaskPresence.Absent, null);
+
+        public static ScheduledTaskXmlQueryResult Unknown =>
+            new(ScheduledTaskPresence.Unknown, null);
+    }
 
     private static readonly JsonSerializerOptions JournalJsonOptions = new()
     {
@@ -75,31 +129,88 @@ public sealed class StartupSnoozeService
     };
 
     private readonly object _gate = new();
+    private readonly bool _useMachineJournal;
+    private readonly string? _journalValueName;
+    private readonly string? _legacyJournalPath;
+    private readonly Func<ChildSessionPresence> _childSessionPresenceProvider;
+    private bool _appliedInThisInstance;
 
     /// <summary>
     /// 创建服务。
     /// </summary>
-    /// <param name="directory">数据目录，默认 <c>%AppData%\DesktopTwin</c>；测试里传临时目录。</param>
+    /// <param name="directory">
+    /// 测试用数据目录。生产环境传 <see langword="null"/>，关停日志写入仅管理员可写的
+    /// <c>HKLM\SOFTWARE\DesktopTwin\StartupIsolation</c>，不读取用户可写的 AppData。
+    /// </param>
     public StartupSnoozeService(string? directory = null)
+        : this(directory, childSessionPresence: null)
+    {
+    }
+
+    /// <summary>
+    /// 创建可注入分身会话存在性查询的测试实例。生产环境必须走公开构造函数，
+    /// 由 WTS 查询真实子会话；测试数据目录默认按“不存在”处理。
+    /// </summary>
+    internal StartupSnoozeService(
+        string? directory,
+        Func<ChildSessionPresence>? childSessionPresence)
     {
         Directory = directory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "DesktopTwin");
-        JournalPath = Path.Combine(Directory, "startup-snooze.json");
+        _useMachineJournal = directory is null;
+        _childSessionPresenceProvider = childSessionPresence
+            ?? (_useMachineJournal
+                ? QueryNativeChildSessionPresence
+                : static () => ChildSessionPresence.Absent);
+        _journalValueName = _useMachineJournal ? BuildJournalValueName() : null;
+        _legacyJournalPath = _useMachineJournal
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "DesktopTwin",
+                "startup-snooze.json")
+            : null;
+        JournalPath = _useMachineJournal
+            ? @"HKLM\" + JournalStoreKeyPath + @"\" + _journalValueName
+            : Path.Combine(Directory, "startup-snooze.json");
         ExceptionsPath = Path.Combine(Directory, "startup-snooze-exceptions.json");
     }
 
-    /// <summary>数据目录。</summary>
+    /// <summary>测试数据目录；生产环境仅用于例外清单和诊断输出。</summary>
     public string Directory { get; }
 
-    /// <summary>关停日志路径。</summary>
+    /// <summary>关停日志位置；生产环境是当前用户的 HKLM 注册表值。</summary>
     public string JournalPath { get; }
 
     /// <summary>例外清单路径（写入被系统拒绝的项，用户明确知情后可放行）。</summary>
     public string ExceptionsPath { get; }
 
-    /// <summary>当前是否处于「已关停」状态（以日志文件是否存在为准）。</summary>
-    public bool IsSnoozed => File.Exists(JournalPath);
+    /// <summary>当前是否处于「已关停」状态（以日志存储中是否存在关停记录为准）。</summary>
+    public bool IsSnoozed
+    {
+        get
+        {
+            if (!_useMachineJournal)
+            {
+                return File.Exists(JournalPath);
+            }
+
+            try
+            {
+                return ReadMachineJournalBytes() is not null;
+            }
+            catch (Exception exception) when (exception is IOException
+                                                  or UnauthorizedAccessException
+                                                  or SecurityException
+                                                  or NotSupportedException)
+            {
+                // 读不出日志时按「有日志」处理，让恢复流程失败关闭，绝不能当作
+                // “没有改动过启动项”而直接开始新一轮写入。
+                AppLog.Warn("无法读取管理员级启动项关停日志。", exception);
+                return true;
+            }
+        }
+    }
 
     /// <summary>
     /// 上次退出时没来得及恢复（日志还在）——下次启动必须先恢复再连分身。
@@ -107,51 +218,205 @@ public sealed class StartupSnoozeService
     public bool HasPendingJournal => IsSnoozed;
 
     /// <summary>
+    /// 查询 WTS 中是否仍有子会话。查询失败不能等同于不存在。
+    /// </summary>
+    internal ChildSessionPresence QueryChildSessionPresence()
+    {
+        try
+        {
+            return _childSessionPresenceProvider();
+        }
+        catch (Exception exception)
+        {
+            AppLog.Warn("查询分身会话存在性失败，按未知处理并保留启动项关停日志。", exception);
+            return ChildSessionPresence.Unknown;
+        }
+    }
+
+    private static ChildSessionPresence QueryNativeChildSessionPresence()
+    {
+        if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
+        {
+            return ChildSessionPresence.Unknown;
+        }
+
+        return sessionId.HasValue ? ChildSessionPresence.Present : ChildSessionPresence.Absent;
+    }
+
+    /// <summary>
+    /// 隐式恢复启动项前的统一闸门：只有连续确认没有子会话时才能恢复。
+    /// </summary>
+    internal StartupSnoozeResult? GetRestoreBlockResult()
+    {
+        return QueryChildSessionPresence() switch
+        {
+            ChildSessionPresence.Present => StartupSnoozeResult.Fail(
+                "检测到分身会话仍在运行，已保留启动项关停日志。"
+                + "必须先注销该分身，确认会话结束后才能恢复启动项。"),
+            ChildSessionPresence.Unknown => StartupSnoozeResult.Fail(
+                "无法确认分身会话是否已经结束，已保留启动项关停日志。"
+                + "请关闭 DesktopTwin 后稍后重试，确认没有分身会话后才能恢复启动项。"),
+            _ => null
+        };
+    }
+
+    /// <summary>
     /// 关停本机所有能覆盖的第三方启动源。
+    ///
+    /// 这是“新开一个分身”的路径：已有子会话时不能把它当成没有会话而重新关停启动项，
+    /// 否则会改到一个无法核对来源的旧会话下面。接管旧会话必须走专用方法。
     /// </summary>
     public StartupSnoozeResult EnsureSnoozed()
     {
         lock (_gate)
         {
-            if (IsSnoozed)
+            var presence = QueryChildSessionPresence();
+            if (presence == ChildSessionPresence.Present)
             {
-                // 已有关停日志时不能悄悄把它当成空清单继续连接：日志损坏意味着
-                // 不知道哪些启动项曾被改过，只有明确失败才能避免把用户启动项留在关闭状态。
-                StartupSnoozeJournal existing;
-                try
+                return StartupSnoozeResult.Fail(
+                    "检测到已有分身会话，但没有走旧会话接管流程，已拒绝修改启动项。"
+                    + "请先关闭已有分身，或使用可核对的关停日志接管它。");
+            }
+
+            if (presence == ChildSessionPresence.Unknown)
+            {
+                return StartupSnoozeResult.Fail(
+                    "无法确认是否已有分身会话，已拒绝修改启动项。请关闭 DesktopTwin 后重试。");
+            }
+
+            return WithRestoreMutex(() => EnsureSnoozedCore(adoptExistingJournal: false));
+        }
+    }
+
+    /// <summary>
+    /// 已有一个子会话时接管启动项隔离。只允许复用“已完成且当前状态仍与日志一致”
+    /// 的关停日志；没有日志、日志未完成或状态不一致时都必须失败关闭，绝不能在这里恢复。
+    /// </summary>
+    internal StartupSnoozeResult EnsureSnoozedForExistingChildSession()
+    {
+        lock (_gate)
+        {
+            if (QueryChildSessionPresence() != ChildSessionPresence.Present)
+            {
+                return StartupSnoozeResult.Fail(
+                    "无法确认已有分身会话仍在运行，已拒绝接管启动项隔离。");
+            }
+
+            if (!IsSnoozed)
+            {
+                return StartupSnoozeResult.Fail(
+                    "检测到已有分身会话，但没有可核对的启动项关停日志。"
+                    + "为避免在未知会话下修改启动项，已拒绝连接；请先注销已有分身再重试。");
+            }
+
+            return WithRestoreMutex(() => EnsureSnoozedCore(adoptExistingJournal: true));
+        }
+    }
+
+    private StartupSnoozeResult EnsureSnoozedCore(bool adoptExistingJournal)
+    {
+        if (_legacyJournalPath is not null && File.Exists(_legacyJournalPath) && !IsSnoozed)
+        {
+            AppLog.Warn("发现旧版用户可写目录中的启动项关停日志，拒绝把它当作提权恢复指令：" + _legacyJournalPath);
+            return StartupSnoozeResult.Fail(
+                "发现旧版启动项关停日志，但其完整性无法验证，已拒绝连接。"
+                + "请由管理员先核对并恢复当前启动项，再删除旧日志："
+                + _legacyJournalPath);
+        }
+
+        if (IsSnoozed)
+        {
+            // 已有关停日志时不能悄悄把它当成空清单继续连接：日志损坏意味着
+            // 不知道哪些启动项曾被改过，只有明确失败才能避免把用户启动项留在关闭状态。
+            StartupSnoozeJournal existing;
+            try
+            {
+                existing = LoadJournal();
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                                                  or JsonException or InvalidOperationException
+                                                  or NotSupportedException or InvalidDataException
+                                                  or SecurityException or ArgumentException)
+            {
+                AppLog.Warn("已有关停日志无法读取，拒绝在状态不明时启动分身。", exception);
+                return StartupSnoozeResult.Fail(
+                    "已有关停日志但无法读取，无法确认启动项状态；请先修复日志或重新启动 DesktopTwin：" +
+                    exception.Message);
+            }
+
+            if (!existing.Completed)
+            {
+                // 旧会话仍存在时恢复半成品日志，会让启动项在被使用的会话下重新打开。
+                // 这里必须保留日志，等会话结束后由显式恢复路径按原值收尾。
+                if (adoptExistingJournal)
                 {
-                    existing = LoadJournal();
-                }
-                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
-                                                      or JsonException or InvalidOperationException
-                                                      or NotSupportedException or InvalidDataException
-                                                      or SecurityException or ArgumentException)
-                {
-                    AppLog.Warn("已有关停日志无法读取，拒绝在状态不明时启动分身。", exception);
+                    AppLog.Warn("检测到已有分身会话，但上次启动项关停日志未完成；保留日志并拒绝接管。");
                     return StartupSnoozeResult.Fail(
-                        "已有关停日志但无法读取，无法确认启动项状态；请先修复日志或重新启动 DesktopTwin：" +
-                        exception.Message);
+                        "检测到已有分身会话，但上次启动项关停未完成。为避免在会话仍运行时重新打开启动项，"
+                        + "已保留关停日志并拒绝连接；请先注销该分身，再重新启动 DesktopTwin。");
                 }
 
-                if (!existing.Completed)
+                // 上次在「日志已写、系统状态可能改到一半」时中断。先恢复原始状态，
+                // 再按本次流程重新关停；绝不能把半成品日志当成已经完成。
+                AppLog.Warn("发现上次未完成的启动项关停日志，先恢复原始状态。");
+                var recovery = RestoreCore();
+                if (!recovery.Success)
                 {
-                    // 上次在「日志已写、系统状态可能改到一半」时中断。先恢复原始状态，
-                    // 再按本次流程重新关停；绝不能把半成品日志当成已经完成。
-                    AppLog.Warn("发现上次未完成的启动项关停日志，先恢复原始状态。");
+                    return StartupSnoozeResult.Fail(
+                        "上次关停启动项未完成，且恢复原始状态失败：" + recovery.Message);
+                }
+            }
+            else
+            {
+                if (!_appliedInThisInstance && !adoptExistingJournal)
+                {
+                    return StartupSnoozeResult.Fail(
+                        "发现上次运行留下的已完成关停日志。为避免把已失效的开关当成隔离成功，"
+                        + "必须先按日志恢复原启动项，再重新关停。");
+                }
+
+                if (!IsCompletedJournalStillApplied(existing))
+                {
+                    // 接管旧会话时绝不能恢复：即使日志显示“已完成”，当前系统状态变了，
+                    // 也可能意味着有启动程序已经在旧会话里跑起来。
+                    if (adoptExistingJournal)
+                    {
+                        AppLog.Warn("已有分身会话，但已完成关停日志与当前系统状态不一致；保留日志并拒绝接管。");
+                        return StartupSnoozeResult.Fail(
+                            "检测到已有分身会话，但已完成关停日志与当前系统状态不一致。"
+                            + "为避免在会话仍运行时重新打开启动项，已保留关停日志并拒绝连接；"
+                            + "请先注销该分身，再重新启动 DesktopTwin。");
+                    }
+
+                    AppLog.Warn("已完成关停日志与当前系统状态不一致，先恢复原值后重新隔离。");
                     var recovery = RestoreCore();
                     if (!recovery.Success)
                     {
                         return StartupSnoozeResult.Fail(
-                            "上次关停启动项未完成，且恢复原始状态失败：" + recovery.Message);
+                            "启动项状态已发生变化，且恢复原值失败：" + recovery.Message,
+                            recovery.Warnings);
                     }
                 }
-                else
+
+                if (!_appliedInThisInstance)
                 {
-                    return StartupSnoozeResult.Ok(
-                        "启动项已处于关停状态。",
-                        startupExecutables: NormalizeStartupExecutables(existing));
+                    if (!adoptExistingJournal)
+                    {
+                        return StartupSnoozeResult.Fail(
+                            "发现上次运行留下的已完成关停日志。为避免把已失效的开关当成隔离成功，"
+                            + "必须先按日志恢复原启动项，再重新关停。");
+                    }
+
+                    _appliedInThisInstance = true;
+                    AppLog.Info("检测到旧分身会话和仍匹配的已完成关停日志，已接管启动项隔离。");
                 }
+
+                return StartupSnoozeResult.Ok(
+                    "启动项已处于关停状态。",
+                    startupExecutables: NormalizeStartupExecutables(existing),
+                    managedStartupExecutables: NormalizeManagedStartupExecutables(existing));
             }
+        }
 
             var refusals = GetRefusalReasons();
             if (refusals.Count > 0)
@@ -169,11 +434,17 @@ public sealed class StartupSnoozeService
                 User = Environment.UserName
             };
             var warnings = new List<string>();
+            var blockedStartupItems = new List<string>();
+            var exceptions = LoadExceptions();
             journal.Warnings = warnings;
 
             try
             {
-                journal.Registry = CollectRegistryEntries(warnings, journal.DeferredExecutables);
+                journal.Registry = CollectRegistryEntries(
+                    warnings,
+                    journal.DeferredExecutables,
+                    exceptions,
+                    blockedStartupItems);
                 journal.Tasks = CollectScheduledTasks();
                 journal.Uwp = CollectUwpTasks();
             }
@@ -198,8 +469,8 @@ public sealed class StartupSnoozeService
                 return StartupSnoozeResult.Fail("保存启动项关停日志失败，未做任何修改：" + exception.Message);
             }
 
-            DropUncoveredEntries(journal, warnings);
-            DropExceptionEntries(journal, warnings);
+            DropUncoveredEntries(journal, warnings, blockedStartupItems, exceptions);
+            DropExceptionEntries(journal, warnings, exceptions);
             journal.Warnings = warnings;
 
             // 过滤后的日志也必须在写入任何系统状态前落盘。
@@ -216,6 +487,19 @@ public sealed class StartupSnoozeService
 
             if (journal.Registry.Count == 0 && journal.Tasks.Count == 0 && journal.Uwp.Count == 0)
             {
+                if (blockedStartupItems.Count > 0)
+                {
+                    blockedStartupItems = blockedStartupItems
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    var blockedReason = BuildBlockedReason(blockedStartupItems);
+                    AppLog.Warn(blockedReason);
+                    var blockedRollback = RestoreCore();
+                    return StartupSnoozeResult.Fail(
+                        blockedReason + "。启动项回滚：" + blockedRollback.Message,
+                        warnings.Concat(blockedStartupItems).ToArray());
+                }
+
                 // 没有可关的东西也要落一份日志：否则「已关停」状态无法表示，
                 // 断开时也就不会走恢复流程。
                 journal.Completed = true;
@@ -234,17 +518,21 @@ public sealed class StartupSnoozeService
                         warnings);
                 }
 
+                // 空清单同样由本次实例完成并落盘；否则同一实例的重试会把它
+                // 误认成上次运行遗留的日志并拒绝继续。
+                _appliedInThisInstance = true;
                 return StartupSnoozeResult.Ok(
                     "没有需要关停的启动项。",
                     warnings,
-                    NormalizeStartupExecutables(journal));
+                    NormalizeStartupExecutables(journal),
+                    NormalizeManagedStartupExecutables(journal));
             }
 
             try
             {
-                ApplyRegistryEntries(journal, warnings);
-                ApplyScheduledTasks(journal, warnings);
-                ApplyUwpTasks(journal, warnings);
+                ApplyRegistryEntries(journal, warnings, blockedStartupItems);
+                ApplyScheduledTasks(journal, warnings, blockedStartupItems);
+                ApplyUwpTasks(journal, warnings, blockedStartupItems);
             }
             catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException
                                                   or IOException or InvalidOperationException)
@@ -254,6 +542,22 @@ public sealed class StartupSnoozeService
                 return StartupSnoozeResult.Fail(
                     "关停启动项失败，已回滚：" + exception.Message + "；" + rollback.Message,
                     warnings);
+            }
+
+            blockedStartupItems = blockedStartupItems
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (blockedStartupItems.Count > 0)
+            {
+                // 只要还有一个非例外启动项可能进入子会话，就不能把“部分关停”
+                // 当成隔离成功。继续连接会让单实例程序把主桌面窗口拉出来，
+                // 因此先按日志回滚，再让连接流程失败关闭。
+                var reason = BuildBlockedReason(blockedStartupItems);
+                AppLog.Warn(reason);
+                var rollback = RestoreCore();
+                return StartupSnoozeResult.Fail(
+                    reason + "。启动项回滚：" + rollback.Message,
+                    warnings.Concat(blockedStartupItems).ToArray());
             }
 
             journal.Warnings = warnings;
@@ -281,11 +585,12 @@ public sealed class StartupSnoozeService
                 journal.Tasks.Count(entry => entry.ConfirmedDisabled),
                 journal.Uwp.Count(entry => entry.WrittenState == 0));
             AppLog.Info(summary + (warnings.Count == 0 ? string.Empty : "；未能关停：" + string.Join("；", warnings)));
+            _appliedInThisInstance = true;
             return StartupSnoozeResult.Ok(
                 summary,
                 warnings,
-                NormalizeStartupExecutables(journal));
-        }
+                NormalizeStartupExecutables(journal),
+                NormalizeManagedStartupExecutables(journal));
     }
 
     /// <summary>
@@ -295,7 +600,144 @@ public sealed class StartupSnoozeService
     {
         lock (_gate)
         {
-            return RestoreCore();
+            return WithRestoreMutex(RestoreCore);
+        }
+    }
+
+    /// <summary>
+    /// 所有会修改启动项或恢复日志的路径都必须经过这里。隔离与恢复共用同一把
+    /// 跨进程互斥体，独立恢复助手才不会和主进程的同时写操作交错。
+    /// </summary>
+    private static StartupSnoozeResult WithRestoreMutex(Func<StartupSnoozeResult> action) =>
+        WithRestoreMutex(action, message => StartupSnoozeResult.Fail(message));
+
+    private static T WithRestoreMutex<T>(Func<T> action, Func<string, T> failureFactory)
+    {
+        Mutex mutex;
+        try
+        {
+            mutex = new Mutex(initiallyOwned: false, RestoreMutexName);
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException
+                                              or IOException
+                                              or NotSupportedException)
+        {
+            return failureFactory("无法创建启动项恢复互斥体：" + exception.Message);
+        }
+
+        using (mutex)
+        {
+            var acquired = false;
+            try
+            {
+                try
+                {
+                    acquired = mutex.WaitOne(RestoreMutexTimeout);
+                }
+                catch (AbandonedMutexException)
+                {
+                    // 上一个恢复进程在持锁时退出。日志和系统状态都按幂等
+                    // 恢复处理，接管互斥体比永远等待更安全。
+                    acquired = true;
+                }
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException
+                                                  or IOException
+                                                  or NotSupportedException
+                                                  or ObjectDisposedException)
+            {
+                return failureFactory("等待启动项恢复互斥体失败：" + exception.Message);
+            }
+
+            if (!acquired)
+            {
+                return failureFactory(
+                    "另一个 DesktopTwin 恢复进程仍在操作启动项，已拒绝并发修改。");
+            }
+
+            try
+            {
+                return action();
+            }
+            finally
+            {
+                try
+                {
+                    mutex.ReleaseMutex();
+                }
+                catch (ApplicationException)
+                {
+                    // 锁已经不归当前线程时不能让退出路径再次失败。
+                }
+            }
+        }
+    }
+
+    private bool IsCompletedJournalStillApplied(StartupSnoozeJournal journal)
+    {
+        try
+        {
+            foreach (var entry in journal.Registry.Where(item => item.Applied))
+            {
+                if (string.IsNullOrWhiteSpace(entry.WrittenBase64))
+                {
+                    return false;
+                }
+
+                using var baseKey = RegistryKey.OpenBaseKey(
+                    ParseHive(entry.Hive),
+                    ParseView(entry.ApprovedView));
+                using var key = baseKey.OpenSubKey(entry.KeyPath, writable: false);
+                var current = ReadApprovalValue(
+                    key,
+                    entry.ValueName,
+                    out var exists,
+                    out var problem);
+                if (problem is not null || !exists || current is null)
+                {
+                    return false;
+                }
+
+                if (!current.SequenceEqual(Convert.FromBase64String(entry.WrittenBase64)))
+                {
+                    return false;
+                }
+            }
+
+            foreach (var task in journal.Tasks.Where(item => item.ConfirmedDisabled))
+            {
+                var query = QueryTaskXml(task.Relative);
+                if (!query.IsPresent
+                    || ScheduledTaskXml.GetEnabledState(query.Xml) != TaskEnabledState.Disabled
+                    || !ScheduledTaskIdentityMatches(journal, task, query.Xml!))
+                {
+                    return false;
+                }
+            }
+
+            foreach (var uwp in journal.Uwp.Where(item => item.WriteConfirmed && item.WrittenState == 0))
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(uwp.KeyPath, writable: false);
+                if (key?.GetValue("State", null, RegistryValueOptions.DoNotExpandEnvironmentNames)
+                    is not int state
+                    || state != 0)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception exception) when (exception is SecurityException
+                                              or UnauthorizedAccessException
+                                              or IOException
+                                              or InvalidOperationException
+                                              or ArgumentException
+                                              or FormatException
+                                              or NotSupportedException)
+        {
+            AppLog.Warn("核对已完成关停日志的当前状态失败，将重新恢复并隔离。", exception);
+            return false;
         }
     }
 
@@ -374,10 +816,17 @@ public sealed class StartupSnoozeService
                 continue;
             }
 
-            // 已经是启用状态时不要为了“执行恢复”再跑一次 schtasks：
-            // 某些受保护任务即使状态正确也可能拒绝修改，直接回读确认即可。
-            if (WaitForTaskEnabled(task.Relative, expected: true))
+            var currentQuery = QueryTaskXml(task.Relative);
+            if (!currentQuery.IsPresent)
             {
+                if (currentQuery.IsUnknown)
+                {
+                    // 读取失败时必须保留日志，下一次启动或恢复仍会重试；
+                    // 若误判为删除，这个任务会永久保持被关停状态。
+                    problems.Add(task.Relative + "：无法读取或解析当前任务定义，未重新启用");
+                    continue;
+                }
+
                 task.WriteAttempted = false;
                 task.ConfirmedDisabled = false;
                 journal.Tasks.Remove(task);
@@ -385,7 +834,31 @@ public sealed class StartupSnoozeService
                 continue;
             }
 
-            if (!ScheduledTaskExists(task.Relative))
+            var currentXml = currentQuery.Xml!;
+            var currentState = ScheduledTaskXml.GetEnabledState(currentXml);
+            if (currentState == TaskEnabledState.Unknown)
+            {
+                // Unknown 既不是启用也不是禁用：不能据此重新启用，也不能丢弃日志。
+                problems.Add(task.Relative + "：启用状态无法确定，保留当前状态和恢复日志");
+                continue;
+            }
+
+            if (!ScheduledTaskIdentityMatches(journal, task, currentXml))
+            {
+                // 任务已被重建、动作/主体/触发器/注册信息发生变化，或旧日志没有
+                // 身份：都不是 DesktopTwin 关停的原任务，绝不能重新启用。
+                warnings.Add(task.Relative + "：任务定义已变化或日志缺少身份，保留当前状态");
+                AppLog.Warn("计划任务身份不匹配，拒绝重新启用：" + task.Relative);
+                task.WriteAttempted = false;
+                task.ConfirmedDisabled = false;
+                journal.Tasks.Remove(task);
+                preserved++;
+                continue;
+            }
+
+            // 已经是启用状态时不要为了“执行恢复”再跑一次 schtasks：
+            // 某些受保护任务即使状态正确也可能拒绝修改，直接回读确认即可。
+            if (currentState == TaskEnabledState.Enabled)
             {
                 task.WriteAttempted = false;
                 task.ConfirmedDisabled = false;
@@ -411,7 +884,8 @@ public sealed class StartupSnoozeService
             {
                 // 用户在分身会话期间删除了任务时，任务已经不可能再启动，
                 // 不应因此永久保留日志并让每次启动都报恢复失败。
-                if (!ScheduledTaskExists(task.Relative))
+                var presenceAfterFailure = GetScheduledTaskPresence(task.Relative);
+                if (presenceAfterFailure == ScheduledTaskPresence.Absent)
                 {
                     task.WriteAttempted = false;
                     task.ConfirmedDisabled = false;
@@ -420,7 +894,37 @@ public sealed class StartupSnoozeService
                     continue;
                 }
 
-                if (WaitForTaskEnabled(task.Relative, expected: true))
+                // 命令失败后仍可能已经生效；只有身份和开关都回读确认才清日志。
+                var afterFailureQuery = QueryTaskXml(task.Relative);
+                if (afterFailureQuery.IsAbsent)
+                {
+                    task.WriteAttempted = false;
+                    task.ConfirmedDisabled = false;
+                    journal.Tasks.Remove(task);
+                    restored++;
+                    continue;
+                }
+
+                if (afterFailureQuery.IsUnknown)
+                {
+                    problems.Add(
+                        task.Relative + "：命令失败且无法复核任务状态，保留恢复日志；" + output);
+                    continue;
+                }
+
+                var afterFailureXml = afterFailureQuery.Xml!;
+                if (!ScheduledTaskIdentityMatches(journal, task, afterFailureXml))
+                {
+                    warnings.Add(task.Relative + "：任务定义已变化，保留当前状态");
+                    AppLog.Warn("计划任务身份不匹配，拒绝继续恢复：" + task.Relative);
+                    task.WriteAttempted = false;
+                    task.ConfirmedDisabled = false;
+                    journal.Tasks.Remove(task);
+                    preserved++;
+                    continue;
+                }
+
+                if (ScheduledTaskXml.GetEnabledState(afterFailureXml) == TaskEnabledState.Enabled)
                 {
                     task.WriteAttempted = false;
                     task.ConfirmedDisabled = false;
@@ -433,7 +937,7 @@ public sealed class StartupSnoozeService
                 continue;
             }
 
-            if (!WaitForTaskEnabled(task.Relative, expected: true))
+            if (!WaitForTaskEnabled(task.Relative, expected: true, expectedIdentity: task.Identity))
             {
                 problems.Add(task.Relative + "：启用后回读未确认");
                 continue;
@@ -475,7 +979,7 @@ public sealed class StartupSnoozeService
         {
             try
             {
-                File.Delete(JournalPath);
+                DeleteJournalStorage();
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
                                                   or SecurityException or NotSupportedException
@@ -513,6 +1017,7 @@ public sealed class StartupSnoozeService
             restored,
             preserved);
         AppLog.Info(message);
+        _appliedInThisInstance = false;
         if (warnings.Count > 0)
         {
             AppLog.Warn("恢复时保留了外部修改：" + string.Join("；", warnings));
@@ -524,18 +1029,55 @@ public sealed class StartupSnoozeService
     /// <summary>
     /// 启动时调用：上次没恢复完就补一次，返回给用户的提示（无需提示时为 null）。
     /// </summary>
-    public string? RecoverOnStartup()
+    public StartupSnoozeResult? RecoverOnStartup()
     {
-        if (!HasPendingJournal)
+        lock (_gate)
+        {
+            if (_legacyJournalPath is not null && File.Exists(_legacyJournalPath) && !HasPendingJournal)
+            {
+                AppLog.Warn("发现无法验证完整性的旧版启动项关停日志，拒绝按其内容恢复：" + _legacyJournalPath);
+                return StartupSnoozeResult.Fail(
+                    "发现旧版启动项关停日志，但其完整性无法验证，已拒绝执行恢复。"
+                    + "请由管理员先核对并恢复启动项，再删除旧日志："
+                    + _legacyJournalPath);
+            }
+
+            if (!HasPendingJournal)
+            {
+                return null;
+            }
+
+            return WithRestoreMutex<StartupSnoozeResult?>(
+                RecoverOnStartupCore,
+                message => StartupSnoozeResult.Fail(message));
+        }
+    }
+
+    private StartupSnoozeResult? RecoverOnStartupCore()
+    {
+        if (!IsSnoozed)
         {
             return null;
         }
 
-        AppLog.Warn("发现上次未恢复的启动项关停日志，正在恢复。");
-        var result = Restore();
-        return result.Success
-            ? "上次退出时未能恢复开机启动项，已按日志自动恢复：" + result.Message
-            : "上次关停的开机启动项未能全部恢复，请检查：" + result.Message;
+        switch (QueryChildSessionPresence())
+        {
+            case ChildSessionPresence.Present:
+                // 崩溃恢复会刻意保留断线的子会话。此时恢复启动项，会让下次登录
+                // 在该会话里重新拉起启动程序；日志必须原样保留给接管流程核对。
+                AppLog.Info("检测到上次的分身会话仍未结束，保留启动项关停日志，等待连接时接管。");
+                return null;
+
+            case ChildSessionPresence.Unknown:
+                AppLog.Warn("无法确认上次的分身会话是否已经结束，保留启动项关停日志并拒绝恢复。");
+                return StartupSnoozeResult.Fail(
+                    "无法确认上次的分身会话是否已经结束，已保留启动项关停日志，不会重新打开启动项。"
+                    + "请稍后重试；若持续失败，请关闭 DesktopTwin 并检查系统会话状态。");
+
+            default:
+                AppLog.Warn("确认没有分身会话，正在按上次未完成的日志恢复启动项。");
+                return RestoreCore();
+        }
     }
 
     // ===== 枚举 =====
@@ -561,9 +1103,26 @@ public sealed class StartupSnoozeService
             "LocalMachine", new[] { ApprovedRootPath + @"\Run32" })
     };
 
+    /// <summary>
+    /// Run 键的空值名就是注册表默认值 <c>(Default)</c>，Windows 同样会启动它，
+    /// 因此只有 null 是非法/不可收集项，空字符串必须保留。
+    /// </summary>
+    internal static bool IsCollectableRunValueName(string? valueName) => valueName is not null;
+
+    /// <summary>
+    /// Policies\Explorer\Run 只要存在任何值（包括空名字的默认值）或子键，就属于
+    /// 未覆盖的组策略启动面，必须阻断，不能因为值名是空字符串而漏掉。
+    /// </summary>
+    internal static bool HasPolicyStartupEntries(
+        IReadOnlyCollection<string> valueNames,
+        IReadOnlyCollection<string> subKeyNames) =>
+        valueNames.Count > 0 || subKeyNames.Count > 0;
+
     private static List<StartupSnoozeRegistryEntry> CollectRegistryEntries(
         List<string> warnings,
-        List<string> deferredExecutables)
+        List<string> deferredExecutables,
+        HashSet<string> exceptions,
+        List<string> blockedStartupItems)
     {
         var entries = new List<StartupSnoozeRegistryEntry>();
 
@@ -578,7 +1137,8 @@ public sealed class StartupSnoozeService
 
             foreach (var valueName in runKey.GetValueNames())
             {
-                if (string.IsNullOrWhiteSpace(valueName))
+                // 空字符串是 Run 的默认值名，同样会被 Windows 启动；只过滤 null。
+                if (!IsCollectableRunValueName(valueName))
                 {
                     continue;
                 }
@@ -603,6 +1163,14 @@ public sealed class StartupSnoozeService
                     RecordUnsupportedApproval(
                         warnings,
                         deferredExecutables,
+                        blockedStartupItems,
+                        exceptions,
+                        string.Format(
+                            CultureInfo.InvariantCulture,
+                            "{0}|{1}|{2}",
+                            target.HiveName,
+                            target.ApprovedView,
+                            valueName),
                         "RunValue",
                         valueName,
                         commandLine,
@@ -611,16 +1179,70 @@ public sealed class StartupSnoozeService
                 }
 
                 // 已经关掉的不要重复关：恢复时也就不用动它。
-                if (exists && StartupApproval.IsDisabled(originalBytes))
+                if (exists)
                 {
-                    continue;
+                    var approvalState = StartupApproval.Classify(originalBytes);
+                    if (approvalState is StartupApprovalState.Disabled
+                        or StartupApprovalState.DisabledLocked)
+                    {
+                        continue;
+                    }
+
+                    // 0x08 是策略锁定启用，未知值也不能猜测。若强行写 0x03，
+                    // 既可能被系统回滚，也可能破坏组策略/安全软件维护的状态。
+                    if (approvalState != StartupApprovalState.Enabled)
+                    {
+                        RecordUnsupportedApproval(
+                            warnings,
+                            deferredExecutables,
+                            blockedStartupItems,
+                            exceptions,
+                            string.Format(
+                                CultureInfo.InvariantCulture,
+                                "{0}|{1}|{2}",
+                                target.HiveName,
+                                target.ApprovedView,
+                                valueName),
+                            "RunValue",
+                            valueName,
+                            commandLine,
+                            approvalState == StartupApprovalState.EnabledLocked
+                                ? "启动项被策略锁定为启用，无法安全关闭"
+                                : "启动项审批值状态未知，拒绝覆盖");
+                        continue;
+                    }
                 }
 
-                // 命令行的可执行文件不存在时 Windows 本来就不会启动它（启动项「已失效」），
-                // 这种情况不需要写开关，否则反而会把它变成「启用」。
-                if (!exists && !ExecutableExists(commandLine))
+                // 没有审批值时，只有「已证明目标不存在」才能跳过：Windows 本就不会
+                // 启动失效项，写开关反而会把它变成启用。路径不可验证/解析失败属于
+                // 「无法证明不存在」，必须阻断，绝不能静默跳过。
+                if (!exists)
                 {
-                    continue;
+                    var presence = ProveExecutablePresence(commandLine);
+                    if (presence == ExecutablePresence.Missing)
+                    {
+                        continue;
+                    }
+
+                    if (presence == ExecutablePresence.Unknown)
+                    {
+                        RecordUnsupportedApproval(
+                            warnings,
+                            deferredExecutables,
+                            blockedStartupItems,
+                            exceptions,
+                            string.Format(
+                                CultureInfo.InvariantCulture,
+                                "{0}|{1}|{2}",
+                                target.HiveName,
+                                target.ApprovedView,
+                                valueName),
+                            "RunValue",
+                            valueName,
+                            commandLine,
+                            "无法证明启动程序是否存在（命令解析失败或路径不可验证）");
+                        continue;
+                    }
                 }
 
                 entries.Add(new StartupSnoozeRegistryEntry
@@ -640,7 +1262,11 @@ public sealed class StartupSnoozeService
             }
         }
 
-        entries.AddRange(CollectStartupFolderEntries(warnings, deferredExecutables));
+        entries.AddRange(CollectStartupFolderEntries(
+            warnings,
+            deferredExecutables,
+            exceptions,
+            blockedStartupItems));
         return entries;
     }
 
@@ -734,11 +1360,22 @@ public sealed class StartupSnoozeService
     private static void RecordUnsupportedApproval(
         List<string> warnings,
         List<string> deferredExecutables,
+        List<string> blockedStartupItems,
+        HashSet<string> exceptions,
+        string key,
         string kind,
         string valueName,
         string? commandLine,
         string problem)
     {
+        if (exceptions.Contains(key))
+        {
+            // 例外项本来就要留在子会话里启动；审批值格式异常也不能
+            // 反过来把它加入阻断清单或守卫名单。
+            warnings.Add(valueName + "：已按例外清单保持启用（审批值无法处理：" + problem + "）");
+            return;
+        }
+
         warnings.Add(valueName + "：" + problem + "，保持原值");
         AppLog.Warn("启动项审批值无法安全处理：" + valueName + " -> " + problem);
 
@@ -751,11 +1388,24 @@ public sealed class StartupSnoozeService
         {
             AppLog.Warn("启动项审批值无法安全处理，且无法解析出兜底程序：" + valueName);
         }
+
+        // 例外清单允许该启动项保持原样。其余审批值无法读写的项都必须
+        // 阻止连接，不能只靠事后守卫把已经启动的主桌面单实例程序杀回去。
+        if (!exceptions.Contains(key))
+        {
+            blockedStartupItems.Add(
+                valueName
+                + (string.IsNullOrWhiteSpace(executable)
+                    ? "（" + commandLine + "）"
+                    : "（" + executable + "）"));
+        }
     }
 
     private static List<StartupSnoozeRegistryEntry> CollectStartupFolderEntries(
         List<string> warnings,
-        List<string> deferredExecutables)
+        List<string> deferredExecutables,
+        HashSet<string> exceptions,
+        List<string> blockedStartupItems)
     {
         var entries = new List<StartupSnoozeRegistryEntry>();
         var folders = new (string Path, RegistryHive Hive, string HiveName)[]
@@ -795,6 +1445,14 @@ public sealed class StartupSnoozeService
                     RecordUnsupportedApproval(
                         warnings,
                         deferredExecutables,
+                        blockedStartupItems,
+                        exceptions,
+                        string.Format(
+                            CultureInfo.InvariantCulture,
+                            "{0}|{1}|{2}",
+                            folder.HiveName,
+                            "Registry64",
+                            fileName),
                         "StartupFolderItem",
                         fileName,
                         file,
@@ -802,9 +1460,36 @@ public sealed class StartupSnoozeService
                     continue;
                 }
 
-                if (exists && StartupApproval.IsDisabled(bytes))
+                if (exists)
                 {
-                    continue;
+                    var approvalState = StartupApproval.Classify(bytes);
+                    if (approvalState is StartupApprovalState.Disabled
+                        or StartupApprovalState.DisabledLocked)
+                    {
+                        continue;
+                    }
+
+                    if (approvalState != StartupApprovalState.Enabled)
+                    {
+                        RecordUnsupportedApproval(
+                            warnings,
+                            deferredExecutables,
+                            blockedStartupItems,
+                            exceptions,
+                            string.Format(
+                                CultureInfo.InvariantCulture,
+                                "{0}|{1}|{2}",
+                                folder.HiveName,
+                                "Registry64",
+                                fileName),
+                            "StartupFolderItem",
+                            fileName,
+                            file,
+                            approvalState == StartupApprovalState.EnabledLocked
+                                ? "启动文件夹项被策略锁定为启用，无法安全关闭"
+                                : "启动文件夹项审批值状态未知，拒绝覆盖");
+                        continue;
+                    }
                 }
 
                 entries.Add(new StartupSnoozeRegistryEntry
@@ -845,7 +1530,10 @@ public sealed class StartupSnoozeService
         using var tree = baseKey.OpenSubKey(TaskCacheTreePath, writable: false);
         if (tree is null)
         {
-            return entries;
+            // 读不到计划任务树就无法证明没有登录启动任务。此时继续连接会
+            // 让任务栏 / 托盘程序在分身里重复启动，因此必须按隔离失败处理。
+            throw new InvalidOperationException(
+                "无法读取计划任务注册表，无法确认登录启动任务是否已关停。");
         }
 
         Collect(tree, string.Empty, depth: 0);
@@ -853,27 +1541,57 @@ public sealed class StartupSnoozeService
 
         void Collect(RegistryKey node, string relative, int depth)
         {
-            if (depth > 6)
+            if (depth > 32)
             {
-                return;
+                // 正常任务路径远达不到这个深度；超过它说明注册表结构异常，
+                // 不能静默跳过可能存在的登录启动任务。
+                throw new InvalidOperationException("计划任务树嵌套过深，拒绝在覆盖不完整时继续。");
             }
 
             var isTask = node.GetValue("Id") is not null;
-            if (isTask && !relative.StartsWith(@"\Microsoft", StringComparison.OrdinalIgnoreCase))
+            if (isTask && !IsMicrosoftSystemTaskPath(relative))
             {
-                var xml = QueryTaskXml(relative);
-                if (xml is not null && ScheduledTaskXml.IsEnabled(xml) && ScheduledTaskXml.HasSessionStartTrigger(xml))
+                var query = QueryTaskXml(relative);
+                if (!query.IsPresent)
                 {
-                    var trimmed = relative.TrimStart('\\');
-                    var slash = trimmed.LastIndexOf('\\');
-                    entries.Add(new StartupSnoozeTaskEntry
+                    // TaskCache 已证明任务存在，但读不到 XML 就无法判断它是否
+                    // 会在登录/会话切换时启动程序。静默跳过会把重复启动留给
+                    // 分身，因此这里按「无法完整隔离」拒绝继续。
+                    throw new InvalidOperationException($"无法读取计划任务 XML：{relative}");
+                }
+
+                var xml = query.Xml!;
+                var identity = ScheduledTaskXml.GetIdentity(xml);
+                if (identity is null)
+                {
+                    // 读到了字符串但解析失败时，不能把任务当成“未启用”跳过。
+                    throw new InvalidOperationException($"无法解析计划任务 XML：{relative}");
+                }
+
+                switch (ScheduledTaskIsolation.Classify(xml))
+                {
+                    case ScheduledTaskIsolationDecision.Block:
+                        // Settings/Enabled 缺失以外的未知值、空值、重复元素或
+                        // XML 语义异常都无法证明任务是否会在登录时启动。这里
+                        // 必须失败关闭，不能把 Unknown 当成「已禁用」跳过。
+                        throw new InvalidOperationException(
+                            $"无法确定计划任务的启用状态：{relative}");
+
+                    case ScheduledTaskIsolationDecision.Isolate:
                     {
-                        Relative = relative,
-                        TaskName = slash < 0 ? trimmed : trimmed.Substring(slash + 1),
-                        TaskPath = slash < 0 ? "\\" : "\\" + trimmed.Substring(0, slash) + "\\",
-                        Executable = ScheduledTaskXml.GetExecutable(xml),
-                        OriginalEnabled = true
-                    });
+                        var trimmed = relative.TrimStart('\\');
+                        var slash = trimmed.LastIndexOf('\\');
+                        entries.Add(new StartupSnoozeTaskEntry
+                        {
+                            Relative = relative,
+                            TaskName = slash < 0 ? trimmed : trimmed.Substring(slash + 1),
+                            TaskPath = slash < 0 ? "\\" : "\\" + trimmed.Substring(0, slash) + "\\",
+                            Identity = identity,
+                            Executable = ScheduledTaskXml.GetExecutable(xml),
+                            OriginalEnabled = true
+                        });
+                        break;
+                    }
                 }
             }
 
@@ -888,33 +1606,213 @@ public sealed class StartupSnoozeService
         }
     }
 
+    /// <summary>
+    /// Windows 自带计划任务所在的显式文件夹清单。只有这些文件夹下的任务才被
+    /// 视为系统任务而排除，不能按 <c>\Microsoft\</c> 前缀一刀切：Office、
+    /// Microsoft.Office.Desktop、Microsoft.YourPhone 及任意用户安装的
+    /// Microsoft.* 软件同样使用该命名空间，必须照常隔离。未列出的路径一律
+    /// 不排除（失败关闭），宁可多关一个用户任务，也不能漏掉登录启动项。
+    /// </summary>
+    private static readonly string[] WindowsSystemTaskFolders =
+    {
+        @"\Microsoft\Windows\AppID",
+        @"\Microsoft\Windows\Application Experience",
+        @"\Microsoft\Windows\ApplicationData",
+        @"\Microsoft\Windows\AppxDeploymentClient",
+        @"\Microsoft\Windows\Autochk",
+        @"\Microsoft\Windows\BitLocker",
+        @"\Microsoft\Windows\Bluetooth",
+        @"\Microsoft\Windows\CertificateServicesClient",
+        @"\Microsoft\Windows\Chkdsk",
+        @"\Microsoft\Windows\CloudExperienceHost",
+        @"\Microsoft\Windows\CloudRestore",
+        @"\Microsoft\Windows\Customer Experience Improvement Program",
+        @"\Microsoft\Windows\Data Integrity Scan",
+        @"\Microsoft\Windows\Defrag",
+        @"\Microsoft\Windows\Device Information",
+        @"\Microsoft\Windows\Device Setup",
+        @"\Microsoft\Windows\Diagnosis",
+        @"\Microsoft\Windows\DiskCleanup",
+        @"\Microsoft\Windows\DiskDiagnostic",
+        @"\Microsoft\Windows\Feedback",
+        @"\Microsoft\Windows\File Classification Infrastructure",
+        @"\Microsoft\Windows\FileHistory",
+        @"\Microsoft\Windows\Flighting",
+        @"\Microsoft\Windows\Input",
+        @"\Microsoft\Windows\InstallService",
+        @"\Microsoft\Windows\LanguageComponentsInstaller",
+        @"\Microsoft\Windows\Location",
+        @"\Microsoft\Windows\Maintenance",
+        @"\Microsoft\Windows\Management",
+        @"\Microsoft\Windows\MapUpdate",
+        @"\Microsoft\Windows\MemoryDiagnostic",
+        @"\Microsoft\Windows\Mobile Broadband Accounts",
+        @"\Microsoft\Windows\MUI",
+        @"\Microsoft\Windows\NetTrace",
+        @"\Microsoft\Windows\Network Accessibility",
+        @"\Microsoft\Windows\NlaSvc",
+        @"\Microsoft\Windows\PI",
+        @"\Microsoft\Windows\Plug and Play",
+        @"\Microsoft\Windows\Policy",
+        @"\Microsoft\Windows\Power Efficiency Diagnostics",
+        @"\Microsoft\Windows\Recovery",
+        @"\Microsoft\Windows\Registry",
+        @"\Microsoft\Windows\Servicing",
+        @"\Microsoft\Windows\SettingSync",
+        @"\Microsoft\Windows\Shell",
+        @"\Microsoft\Windows\Software Inventory Logging",
+        @"\Microsoft\Windows\SoftwareProtectionPlatform",
+        @"\Microsoft\Windows\SpacePort",
+        @"\Microsoft\Windows\Sysmain",
+        @"\Microsoft\Windows\SystemRestore",
+        @"\Microsoft\Windows\Task Manager",
+        @"\Microsoft\Windows\Time Synchronization",
+        @"\Microsoft\Windows\TPM",
+        @"\Microsoft\Windows\UNP",
+        @"\Microsoft\Windows\UpdateOrchestrator",
+        @"\Microsoft\Windows\UPnP",
+        @"\Microsoft\Windows\User Profile Service",
+        @"\Microsoft\Windows\WDI",
+        @"\Microsoft\Windows\Windows Defender",
+        @"\Microsoft\Windows\Windows Error Reporting",
+        @"\Microsoft\Windows\Windows Filtering Platform",
+        @"\Microsoft\Windows\Windows Media Sharing",
+        @"\Microsoft\Windows\Windows Update",
+        @"\Microsoft\Windows\WindowsBackup",
+        @"\Microsoft\Windows\WindowsUpdate",
+        @"\Microsoft\Windows\Wininet",
+        @"\Microsoft\Windows\WlanSvc",
+        @"\Microsoft\Windows\Work Folders",
+        @"\Microsoft\Windows\Workplace Join",
+        @"\Microsoft\Windows\WS",
+        @"\Microsoft\Windows\WwanSvc",
+        @"\Microsoft\Windows\XblGameSave",
+        @"\Microsoft\Windows\Xbox"
+    };
+
+    /// <summary>
+    /// 判断是否为不能关停的 Windows 系统任务。只认可显式清单里的 Windows
+    /// 系统任务文件夹，以及根目录下 Explorer 用于阻止提权启动的
+    /// <c>\CreateExplorerShellUnelevatedTask</c>。Office、Microsoft.YourPhone、
+    /// Microsoft.Office.Desktop 等用户软件任务不在清单内，必须照常隔离。
+    /// </summary>
+    internal static bool IsMicrosoftSystemTaskPath(string relative)
+    {
+        if (string.Equals(
+                relative,
+                @"\CreateExplorerShellUnelevatedTask",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        foreach (var folder in WindowsSystemTaskFolders)
+        {
+            if (relative.StartsWith(folder + "\\", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 只有同时具备「原状态为启用」「写入前已记日志」「严格回读确认已禁用」
+    /// 「版本 3 稳定身份」的证据，才允许恢复时重新启用。仅有 WriteAttempted
+    /// （写成败未知）或旧版日志都必须保持禁用，绝不能把外部关闭误当成本程序写入。
+    /// </summary>
     private static bool CanRestoreScheduledTask(
         StartupSnoozeJournal journal,
         StartupSnoozeTaskEntry task) =>
-        journal.Version >= 2 ? task.WriteAttempted : task.ConfirmedDisabled;
+        journal.Version >= 3
+        && task.OriginalEnabled
+        && task.WriteAttempted
+        && task.ConfirmedDisabled
+        && ScheduledTaskXml.IsValidIdentity(task.Identity);
 
-    private static bool ScheduledTaskExists(string relative)
+    /// <summary>
+    /// 只有版本 3 日志且记录的身份与当前 XML 完全一致时，才允许把任务视为
+    /// DesktopTwin 关停过的原任务。旧日志没有身份，必须失败关闭。
+    /// </summary>
+    private static bool ScheduledTaskIdentityMatches(
+        StartupSnoozeJournal journal,
+        StartupSnoozeTaskEntry task,
+        string currentXml)
+    {
+        if (journal.Version < 3 || !ScheduledTaskXml.IsValidIdentity(task.Identity))
+        {
+            return false;
+        }
+
+        var currentIdentity = ScheduledTaskXml.GetIdentity(currentXml);
+        return currentIdentity is not null
+               && string.Equals(task.Identity, currentIdentity, StringComparison.Ordinal);
+    }
+
+    private static ScheduledTaskPresence GetScheduledTaskPresence(string relative)
     {
         try
         {
             using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
             using var tree = baseKey.OpenSubKey(TaskCacheTreePath, writable: false);
-            using var task = tree?.OpenSubKey(relative.TrimStart('\\'), writable: false);
-            return task?.GetValue("Id") is not null;
+            if (tree is null)
+            {
+                return ScheduledTaskPresence.Unknown;
+            }
+
+            using var task = tree.OpenSubKey(relative.TrimStart('\\'), writable: false);
+            if (task is null)
+            {
+                return ScheduledTaskPresence.Absent;
+            }
+
+            // TaskCache 中每个任务都带 Id。同名键存在却缺少 Id 属于异常缓存，
+            // 不能据此删除恢复日志。
+            return task.GetValue("Id") is not null
+                ? ScheduledTaskPresence.Present
+                : ScheduledTaskPresence.Unknown;
         }
         catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException
                                               or IOException or ArgumentException or NotSupportedException)
         {
-            // 读不到 TaskCache 时按“仍存在”处理，避免把恢复失败误判成任务已删除。
             AppLog.Warn("无法确认计划任务是否仍存在：" + relative, exception);
-            return true;
+            return ScheduledTaskPresence.Unknown;
         }
     }
 
-    private static string? QueryTaskXml(string relative)
+    internal static ScheduledTaskXmlQueryResult InterpretFailedTaskXmlQuery(
+        ScheduledTaskPresence presence) =>
+        presence switch
+        {
+            ScheduledTaskPresence.Absent => ScheduledTaskXmlQueryResult.Absent,
+            ScheduledTaskPresence.Present => ScheduledTaskXmlQueryResult.Unknown,
+            _ => ScheduledTaskXmlQueryResult.Unknown
+        };
+
+    internal static ScheduledTaskXmlQueryResult ParseTaskXmlQueryOutput(string? output)
+    {
+        var trimmed = output?.Trim().TrimStart('\uFEFF');
+        // schtasks 的成功输出声称 XML 是 UTF-16，实际却按 OEM 代码页写字节。
+        // ScheduledTaskXml 会安全移除声明并用禁用 DTD 的严格解析器校验；
+        // 空输出、截断、错误命名空间或格式错误都按“读不到定义”处理。
+        return trimmed is not null && ScheduledTaskXml.GetIdentity(trimmed) is not null
+            ? ScheduledTaskXmlQueryResult.Present(trimmed)
+            : ScheduledTaskXmlQueryResult.Unknown;
+    }
+
+    private static ScheduledTaskXmlQueryResult QueryTaskXml(string relative)
     {
         var (exitCode, output) = RunSchtasks("/Query", "/XML", "ONE", "/TN", relative);
-        return exitCode == 0 && output.Contains('<') ? output : null;
+        if (exitCode != 0)
+        {
+            var presence = GetScheduledTaskPresence(relative);
+            AppLog.Warn(
+                $"查询计划任务定义失败，TaskCache 状态={presence}：" + relative + "；" + output);
+            return InterpretFailedTaskXmlQuery(presence);
+        }
+
+        return ParseTaskXmlQueryOutput(output);
     }
 
     private static List<StartupSnoozeUwpEntry> CollectUwpTasks()
@@ -954,7 +1852,7 @@ public sealed class StartupSnoozeService
             }
 
             if (node.GetValue("State", null, RegistryValueOptions.DoNotExpandEnvironmentNames) is int state
-                && state == UwpStartupState.EnabledConfirmed)
+                && UwpStartupState.IsEnabled(state))
             {
                 entries.Add(new StartupSnoozeUwpEntry
                 {
@@ -979,7 +1877,20 @@ public sealed class StartupSnoozeService
 
     // ===== 写入 =====
 
-    private void ApplyRegistryEntries(StartupSnoozeJournal journal, List<string> warnings)
+    private static string BuildBlockedReason(IReadOnlyList<string> blockedStartupItems)
+    {
+        var application = Environment.ProcessPath ?? "DesktopTwin.exe";
+        return "启动项隔离不完整，已取消连接："
+            + string.Join("；", blockedStartupItems)
+            + "。如果系统或安全软件拦截，请只允许精确程序 "
+            + application
+            + " 修改启动项和结束分身内启动程序；不要放行被拦截的启动程序，也不要关闭安全软件自保护。";
+    }
+
+    private void ApplyRegistryEntries(
+        StartupSnoozeJournal journal,
+        List<string> warnings,
+        List<string> blockedStartupItems)
     {
         var disabledBytes = StartupApproval.CreateDisabled(DateTime.UtcNow);
         var disabledBase64 = Convert.ToBase64String(disabledBytes);
@@ -987,6 +1898,15 @@ public sealed class StartupSnoozeService
         {
             try
             {
+                if (entry.OriginalExists
+                    && !StartupApproval.CanDisable(Convert.FromBase64String(
+                        entry.OriginalBase64
+                        ?? throw new InvalidDataException("关停日志缺少原始注册表值"))))
+                {
+                    throw new InvalidOperationException(
+                        "启动项审批值已不是可安全关闭的用户启用状态");
+                }
+
                 using var baseKey = RegistryKey.OpenBaseKey(ParseHive(entry.Hive), ParseView(entry.ApprovedView));
 
                 // 枚举和真正写入之间可能隔了一段时间。先比对收集时的快照，
@@ -997,6 +1917,10 @@ public sealed class StartupSnoozeService
                 {
                     warnings.Add(entry.ValueName + "：" + snapshotProblem + "，保持原值");
                     AppLog.Warn("启动项在关停前已发生变化，跳过写入：" + entry.ValueName + " -> " + snapshotProblem);
+                    if (!IsRegistryEntryDisabledNow(entry))
+                    {
+                        blockedStartupItems.Add(entry.ValueName + "（外部修改后仍可能启动）");
+                    }
                     continue;
                 }
 
@@ -1010,6 +1934,10 @@ public sealed class StartupSnoozeService
                 {
                     warnings.Add(entry.ValueName + "：" + snapshotProblem + "，保持原值");
                     AppLog.Warn("启动项在关停前已发生变化，跳过写入：" + entry.ValueName + " -> " + snapshotProblem);
+                    if (!IsRegistryEntryDisabledNow(entry))
+                    {
+                        blockedStartupItems.Add(entry.ValueName + "（外部修改后仍可能启动）");
+                    }
                     continue;
                 }
 
@@ -1022,8 +1950,8 @@ public sealed class StartupSnoozeService
                 key.SetValue(entry.ValueName, disabledBytes, RegistryValueKind.Binary);
 
                 // SetValue 不抛异常不等于系统真的接受了写入：自保护驱动可能静默
-                // 回滚。必须回读确认低半字节是 0x03，否则该启动项继续保持启用，
-                // 要在子会话里用守卫兜底。
+                // 回滚。必须回读确认状态确实为关闭（含策略锁定关闭），否则该启动项
+                // 继续保持启用，要在子会话里用守卫兜底。
                 var written = key.GetValue(
                     entry.ValueName,
                     null,
@@ -1048,10 +1976,36 @@ public sealed class StartupSnoozeService
                     exception.Message);
                 warnings.Add(message);
                 AppLog.Warn("无法关闭启动项 " + entry.ValueName, exception);
+                blockedStartupItems.Add(entry.ValueName + "（" + exception.Message + "）");
                 TryRestoreRegistryEntryQuietly(entry);
             }
         }
     }
+
+    private static bool IsRegistryEntryDisabledNow(StartupSnoozeRegistryEntry entry)
+    {
+        try
+        {
+            using var baseKey = RegistryKey.OpenBaseKey(ParseHive(entry.Hive), ParseView(entry.ApprovedView));
+            using var key = baseKey.OpenSubKey(entry.KeyPath, writable: false);
+            var current = ReadApprovalValue(key, entry.ValueName, out var exists, out var problem);
+            return IsApprovalConfirmedDisabled(exists, problem, current);
+        }
+        catch (Exception exception) when (exception is SecurityException
+                                              or UnauthorizedAccessException
+                                              or IOException
+                                              or ArgumentException)
+        {
+            AppLog.Warn("无法确认启动项是否仍处于关闭状态：" + entry.ValueName, exception);
+            return false;
+        }
+    }
+
+    internal static bool IsApprovalConfirmedDisabled(
+        bool exists,
+        string? problem,
+        byte[]? current) =>
+        problem is null && exists && StartupApproval.IsDisabled(current);
 
     private static string? CompareRegistrySnapshot(
         RegistryKey? key,
@@ -1084,20 +2038,23 @@ public sealed class StartupSnoozeService
             : "原值已被外部修改";
     }
 
-    private void ApplyScheduledTasks(StartupSnoozeJournal journal, List<string> warnings)
+    private void ApplyScheduledTasks(
+        StartupSnoozeJournal journal,
+        List<string> warnings,
+        List<string> blockedStartupItems)
     {
         foreach (var task in journal.Tasks)
         {
-            var snapshotXml = QueryTaskXml(task.Relative);
-            if (snapshotXml is null)
+            var snapshotQuery = QueryTaskXml(task.Relative);
+            if (!snapshotQuery.IsPresent)
             {
                 task.WriteAttempted = false;
-                if (ScheduledTaskExists(task.Relative))
+                if (snapshotQuery.IsUnknown)
                 {
-                    // 任务还在但读不到定义时不能当成“不存在”。那会让它的
-                    // 登录启动继续在分身里执行，违背整次隔离的前提。
+                    // 查询失败与任务不存在必须区分。把失败当成不存在会跳过
+                    // 关停，让任务继续在分身登录时执行。
                     throw new InvalidOperationException(
-                        "无法读取计划任务的当前定义：" + task.Relative);
+                        "无法读取或解析计划任务的当前定义：" + task.Relative);
                 }
 
                 warnings.Add(task.Relative + "：任务在关停前已不存在，保持原状");
@@ -1105,11 +2062,72 @@ public sealed class StartupSnoozeService
                 continue;
             }
 
-            if (!ScheduledTaskXml.IsEnabled(snapshotXml))
+            var snapshotXml = snapshotQuery.Xml!;
+            var snapshotState = ScheduledTaskXml.GetEnabledState(snapshotXml);
+            if (snapshotState == TaskEnabledState.Disabled)
             {
                 task.WriteAttempted = false;
                 warnings.Add(task.Relative + "：任务在关停前已被外部禁用，保持原状");
                 AppLog.Warn("计划任务在关停前已被外部禁用，跳过写入：" + task.Relative);
+                continue;
+            }
+
+            if (snapshotState == TaskEnabledState.Unknown)
+            {
+                // 未知状态既不能当成启用去写，也不能当成禁用而跳过；只能阻断。
+                throw new InvalidOperationException(
+                    "计划任务的启用状态无法确定，拒绝在覆盖不完整时继续：" + task.Relative);
+            }
+
+            if (!ScheduledTaskIdentityMatches(journal, task, snapshotXml))
+            {
+                task.WriteAttempted = false;
+                warnings.Add(task.Relative + "：任务定义在关停前已变化，保持原状");
+                AppLog.Warn("计划任务定义在关停前已变化，拒绝写入：" + task.Relative);
+                blockedStartupItems.Add(task.Relative + "（任务定义在关停前已变化）");
+                continue;
+            }
+
+            // SaveJournal 会刷盘，可能给外部程序留下几百毫秒的窗口。写盘后
+            // 在真正执行 /Disable 前再读一次定义；若任务刚被用户或应用禁用，
+            // 绝不能把它记成 DesktopTwin 的改动，否则恢复时会错误地重新启用。
+            var beforeDisableQuery = QueryTaskXml(task.Relative);
+            if (!beforeDisableQuery.IsPresent)
+            {
+                if (beforeDisableQuery.IsAbsent)
+                {
+                    task.WriteAttempted = false;
+                    warnings.Add(task.Relative + "：任务在关停前已不存在，保持原状");
+                    AppLog.Warn("计划任务在关停前已不存在，跳过写入：" + task.Relative);
+                    continue;
+                }
+
+                throw new InvalidOperationException(
+                    "无法在关停前复核计划任务定义：" + task.Relative);
+            }
+
+            var beforeDisableXml = beforeDisableQuery.Xml!;
+            var beforeDisableState = ScheduledTaskXml.GetEnabledState(beforeDisableXml);
+            if (beforeDisableState == TaskEnabledState.Disabled)
+            {
+                task.WriteAttempted = false;
+                warnings.Add(task.Relative + "：任务在关停前已被外部禁用，保持原状");
+                AppLog.Warn("计划任务在关停前已被外部禁用，跳过写入：" + task.Relative);
+                continue;
+            }
+
+            if (beforeDisableState == TaskEnabledState.Unknown)
+            {
+                throw new InvalidOperationException(
+                    "计划任务的启用状态无法确定，拒绝在覆盖不完整时继续：" + task.Relative);
+            }
+
+            if (!ScheduledTaskIdentityMatches(journal, task, beforeDisableXml))
+            {
+                task.WriteAttempted = false;
+                warnings.Add(task.Relative + "：任务定义在关停前已变化，保持原状");
+                AppLog.Warn("计划任务定义在关停前已变化，拒绝写入：" + task.Relative);
+                blockedStartupItems.Add(task.Relative + "（任务定义在关停前已变化）");
                 continue;
             }
 
@@ -1118,14 +2136,39 @@ public sealed class StartupSnoozeService
             var (exitCode, output) = RunSchtasks("/Change", "/TN", task.Relative, "/Disable");
             if (exitCode != 0)
             {
+                // schtasks 可能在改动生效后仍返回失败（超时、被安全软件拦截输出、
+                // 退出码异常）。直接清掉 WriteAttempted 会让回滚跳过这条任务，
+                // 启动项被永远留在禁用状态。这里必须重新查询：只有身份仍匹配
+                // 且 Settings/Enabled 明确为 false 时才保留所有权；查询 Unknown
+                // 绝不能当作“安全未启用”，只能清标记并让本轮失败关闭。
+                var postFailureQuery = QueryTaskXml(task.Relative);
+                if (postFailureQuery.IsPresent
+                    && ScheduledTaskXml.IsDisabled(postFailureQuery.Xml)
+                    && ScheduledTaskIdentityMatches(journal, task, postFailureQuery.Xml!))
+                {
+                    task.ConfirmedDisabled = false;
+                    task.WriteAttempted = true;
+                    SaveJournal(journal);
+                    warnings.Add(task.Relative + "：" + output + "（已复核为禁用，保留恢复日志）");
+                    AppLog.Warn(
+                        "禁用计划任务命令失败但状态已确认禁用：" + task.Relative + " -> " + output);
+                    blockedStartupItems.Add(task.Relative + "（" + output + "）");
+                    continue;
+                }
+
+                task.WriteAttempted = false;
+                task.ConfirmedDisabled = false;
+                SaveJournal(journal);
                 warnings.Add(task.Relative + "：" + output);
                 AppLog.Warn("禁用计划任务失败：" + task.Relative + " -> " + output);
+                blockedStartupItems.Add(task.Relative + "（" + output + "）");
                 continue;
             }
 
-            if (!WaitForTaskEnabled(task.Relative, expected: false))
+            if (!WaitForTaskEnabled(task.Relative, expected: false, expectedIdentity: task.Identity))
             {
                 warnings.Add(task.Relative + "：禁用后回读未确认");
+                blockedStartupItems.Add(task.Relative + "（禁用后回读未确认）");
                 continue;
             }
 
@@ -1134,7 +2177,10 @@ public sealed class StartupSnoozeService
         }
     }
 
-    private void ApplyUwpTasks(StartupSnoozeJournal journal, List<string> warnings)
+    private void ApplyUwpTasks(
+        StartupSnoozeJournal journal,
+        List<string> warnings,
+        List<string> blockedStartupItems)
     {
         foreach (var uwp in journal.Uwp)
         {
@@ -1145,6 +2191,10 @@ public sealed class StartupSnoozeService
                 {
                     warnings.Add(uwp.Task + "：" + snapshotProblem + "，保持原值");
                     AppLog.Warn("UWP 启动项在关停前已发生变化，跳过写入：" + uwp.Task + " -> " + snapshotProblem);
+                    if (!IsUwpEntryDisabledNow(uwp))
+                    {
+                        blockedStartupItems.Add(uwp.Task + "（外部修改后仍可能启动）");
+                    }
                     continue;
                 }
 
@@ -1156,6 +2206,10 @@ public sealed class StartupSnoozeService
                 {
                     warnings.Add(uwp.Task + "：" + snapshotProblem + "，保持原值");
                     AppLog.Warn("UWP 启动项在关停前已发生变化，跳过写入：" + uwp.Task + " -> " + snapshotProblem);
+                    if (!IsUwpEntryDisabledNow(uwp))
+                    {
+                        blockedStartupItems.Add(uwp.Task + "（外部修改后仍可能启动）");
+                    }
                     continue;
                 }
 
@@ -1174,6 +2228,7 @@ public sealed class StartupSnoozeService
                 }
 
                 uwp.WrittenState = 0;
+                uwp.WriteConfirmed = true;
                 SaveJournal(journal);
             }
             catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException
@@ -1181,10 +2236,39 @@ public sealed class StartupSnoozeService
             {
                 warnings.Add(uwp.Task + "：" + exception.Message);
                 AppLog.Warn("关闭 UWP 启动任务失败：" + uwp.Task, exception);
+                blockedStartupItems.Add(uwp.Task + "（" + exception.Message + "）");
                 TryRestoreUwpEntryQuietly(uwp);
             }
         }
     }
+
+    private static bool IsUwpEntryDisabledNow(StartupSnoozeUwpEntry entry)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(entry.KeyPath, writable: false);
+            if (key is null)
+            {
+                return true;
+            }
+
+            var current = key.GetValue(
+                "State",
+                null,
+                RegistryValueOptions.DoNotExpandEnvironmentNames);
+            return IsUwpStateDisabled(current);
+        }
+        catch (Exception exception) when (exception is SecurityException
+                                              or UnauthorizedAccessException
+                                              or IOException)
+        {
+            AppLog.Warn("无法确认 UWP 启动项是否仍处于关闭状态：" + entry.Task, exception);
+            return false;
+        }
+    }
+
+    internal static bool IsUwpStateDisabled(object? current) =>
+        current is int state && state == 0;
 
     private static string? CompareUwpSnapshot(
         StartupSnoozeUwpEntry entry,
@@ -1416,9 +2500,17 @@ public sealed class StartupSnoozeService
         }
     }
 
-    private static bool CanRestoreUwpState(int state, StartupSnoozeUwpEntry entry)
+    /// <summary>
+    /// 只有「严格回读确认过本程序写入的 0」「原状态确实是启用」「当前值仍是本程序
+    /// 写入的 0」三项同时成立，才允许恢复成原值。仅有 WrittenState=0（写入失败或
+    /// 旧日志）时必须保持禁用并保留日志，绝不能把外部关闭误当成本程序写入。
+    /// </summary>
+    internal static bool CanRestoreUwpState(int state, StartupSnoozeUwpEntry entry)
     {
-        return state == 0 && entry.WrittenState == 0;
+        return state == 0
+               && entry.WriteConfirmed
+               && entry.WrittenState == 0
+               && UwpStartupState.IsEnabled(entry.OriginalState);
     }
 
     private static void TryRestoreUwpEntryQuietly(StartupSnoozeUwpEntry entry)
@@ -1488,7 +2580,9 @@ public sealed class StartupSnoozeService
 
             foreach (var name in key.GetValueNames())
             {
-                if (string.IsNullOrWhiteSpace(name))
+                // 空字符串是 RunOnce 的默认值名，和普通值名一样可能承载启动命令，
+                // 不能跳过；只过滤理论上的 null。
+                if (name is null)
                 {
                     continue;
                 }
@@ -1519,9 +2613,11 @@ public sealed class StartupSnoozeService
                 using var baseKey = RegistryKey.OpenBaseKey(hive, view);
                 using var policies = baseKey.OpenSubKey(
                     @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run");
+                // 默认值（名字为空字符串）同样属于策略启动项，必须阻断。
                 if (policies is not null
-                    && (policies.GetValueNames().Any(name => !string.IsNullOrWhiteSpace(name))
-                        || policies.GetSubKeyNames().Length > 0))
+                    && HasPolicyStartupEntries(
+                        policies.GetValueNames(),
+                        policies.GetSubKeyNames()))
                 {
                     reasons.Add("组策略启动项 " + hive + "|" + view + @"\Policies\Explorer\Run");
                 }
@@ -1599,6 +2695,10 @@ public sealed class StartupSnoozeService
     private static string? ResolveGuardExecutable(StartupSnoozeRegistryEntry entry) =>
         ResolveGuardExecutable(entry.Kind, entry.CommandLine);
 
+    private static string? ResolveGuardExecutable(StartupSnoozeTaskEntry entry) =>
+        ShortcutTargetResolver.ResolveExecutable(
+            RunOnceClassifier.ParseExecutable(entry.Executable));
+
     private static string? ResolveGuardExecutable(string kind, string? commandLine)
     {
         var candidate = string.Equals(kind, "StartupFolderItem", StringComparison.OrdinalIgnoreCase)
@@ -1608,9 +2708,12 @@ public sealed class StartupSnoozeService
         return ShortcutTargetResolver.ResolveExecutable(candidate);
     }
 
-    private void DropUncoveredEntries(StartupSnoozeJournal journal, List<string> warnings)
+    private static void DropUncoveredEntries(
+        StartupSnoozeJournal journal,
+        List<string> warnings,
+        List<string> blockedStartupItems,
+        HashSet<string> exceptions)
     {
-        var exceptions = LoadExceptions();
         var kept = new List<StartupSnoozeRegistryEntry>();
 
         foreach (var entry in journal.Registry)
@@ -1631,7 +2734,7 @@ public sealed class StartupSnoozeService
             var problem = ProbeWritable(entry);
             if (problem is not null)
             {
-                warnings.Add(entry.ValueName + "：系统拒绝写入（" + problem + "），仍会在分身里启动");
+                warnings.Add(entry.ValueName + "：系统拒绝写入（" + problem + "），无法安全隔离，已取消连接");
                 AppLog.Warn("启动项写入被系统拒绝：" + key + " -> " + problem);
 
                 // 日志里要留下精确程序，子会话登录后的短时守卫才能把它挡在分身内。
@@ -1645,6 +2748,9 @@ public sealed class StartupSnoozeService
                     AppLog.Warn("启动项被系统拒绝写入，且无法解析出兜底程序：" + entry.ValueName);
                 }
 
+                blockedStartupItems.Add(
+                    entry.ValueName
+                    + (string.IsNullOrWhiteSpace(executable) ? "（" + entry.CommandLine + "）" : "（" + executable + "）"));
                 continue;
             }
 
@@ -1654,9 +2760,11 @@ public sealed class StartupSnoozeService
         journal.Registry = kept;
     }
 
-    private void DropExceptionEntries(StartupSnoozeJournal journal, List<string> warnings)
+    private static void DropExceptionEntries(
+        StartupSnoozeJournal journal,
+        List<string> warnings,
+        HashSet<string> exceptions)
     {
-        var exceptions = LoadExceptions();
         if (!journal.Tasks.Any(task => exceptions.Contains(task.Relative, StringComparer.OrdinalIgnoreCase)))
         {
             return;
@@ -1689,10 +2797,22 @@ public sealed class StartupSnoozeService
             // 只写一个唯一的临时值，绝不触碰真实启动值的名称或原值。
             // 即使进程在这里崩溃，日志已经在探测前落盘，真实启动项也没有被修改。
             var probeName = "DesktopTwinProbe_" + Guid.NewGuid().ToString("N");
+            var probeValue = StartupApproval.CreateDisabled(DateTime.UtcNow);
             Exception? failure = null;
             try
             {
-                key.SetValue(probeName, StartupApproval.CreateDisabled(DateTime.UtcNow), RegistryValueKind.Binary);
+                key.SetValue(probeName, probeValue, RegistryValueKind.Binary);
+
+                // 安全软件或注册表虚拟化可能让 SetValue 无异常返回但实际没有落盘。
+                // 必须按唯一值名回读精确字节，删除后也要确认没有留下探测值。
+                if (key.GetValue(
+                        probeName,
+                        null,
+                        RegistryValueOptions.DoNotExpandEnvironmentNames) is not byte[] written
+                    || !written.SequenceEqual(probeValue))
+                {
+                    failure = new InvalidOperationException("临时探测值写入后回读不一致");
+                }
             }
             catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException
                                                   or IOException or InvalidOperationException
@@ -1705,6 +2825,13 @@ public sealed class StartupSnoozeService
                 try
                 {
                     key.DeleteValue(probeName, throwOnMissingValue: false);
+                    if (key.GetValue(
+                            probeName,
+                            null,
+                            RegistryValueOptions.DoNotExpandEnvironmentNames) is not null)
+                    {
+                        failure ??= new InvalidOperationException("临时探测值删除后回读仍存在");
+                    }
                 }
                 catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException
                                                       or IOException or InvalidOperationException
@@ -1746,12 +2873,25 @@ public sealed class StartupSnoozeService
 
     // ===== 计划任务 =====
 
-    private static bool WaitForTaskEnabled(string relative, bool expected)
+    private static bool WaitForTaskEnabled(
+        string relative,
+        bool expected,
+        string? expectedIdentity)
     {
         for (var attempt = 0; attempt < 5; attempt++)
         {
-            var xml = QueryTaskXml(relative);
-            if (xml is not null && ScheduledTaskXml.IsEnabled(xml) == expected)
+            var query = QueryTaskXml(relative);
+            var state = query.IsPresent
+                ? ScheduledTaskXml.GetEnabledState(query.Xml)
+                : TaskEnabledState.Unknown;
+            if (query.IsPresent
+                && ((expected && state == TaskEnabledState.Enabled)
+                    || (!expected && state == TaskEnabledState.Disabled))
+                && ScheduledTaskXml.IsValidIdentity(expectedIdentity)
+                && string.Equals(
+                    ScheduledTaskXml.GetIdentity(query.Xml),
+                    expectedIdentity,
+                    StringComparison.Ordinal))
             {
                 return true;
             }
@@ -1762,16 +2902,48 @@ public sealed class StartupSnoozeService
         return false;
     }
 
+    private static Encoding GetOemEncoding()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        try
+        {
+            return Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        {
+            AppLog.Warn("无法解析 schtasks 的 OEM 编码，暂按 UTF-8 读取。", exception);
+            return Encoding.UTF8;
+        }
+    }
+
     private static (int ExitCode, string Output) RunSchtasks(params string[] arguments)
     {
         try
         {
-            var startInfo = new ProcessStartInfo("schtasks.exe")
+            var oemEncoding = GetOemEncoding();
+            // 绝不能按 PATH 裸命令解析 schtasks：子会话或被篡改的环境可以把
+            // fake schtasks.exe 放进目录并劫持「关停/恢复」命令。System32 的
+            // 绝对路径是唯一可信位置；读环境变量只为定位系统目录，不作为命令名。
+            var systemRoot = Environment.GetEnvironmentVariable("SystemRoot");
+            if (string.IsNullOrWhiteSpace(systemRoot))
+            {
+                return (-1, "无法读取 SystemRoot 环境变量");
+            }
+
+            var schtasks = Path.Combine(systemRoot, "System32", "schtasks.exe");
+            if (!File.Exists(schtasks))
+            {
+                return (-1, "System32 中不存在 schtasks.exe");
+            }
+
+            var startInfo = new ProcessStartInfo(schtasks)
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
-                RedirectStandardError = true
+                RedirectStandardError = true,
+                StandardOutputEncoding = oemEncoding,
+                StandardErrorEncoding = oemEncoding
             };
 
             foreach (var argument in arguments)
@@ -1807,8 +2979,11 @@ public sealed class StartupSnoozeService
             }
 
             process.WaitForExit();
-            return (process.ExitCode, (standardOutput.GetAwaiter().GetResult() + " "
-                                      + standardError.GetAwaiter().GetResult()).Trim());
+            var output = standardOutput.GetAwaiter().GetResult().Trim();
+            var error = standardError.GetAwaiter().GetResult().Trim();
+            return (process.ExitCode, process.ExitCode == 0
+                ? output
+                : (output + " " + error).Trim());
         }
         catch (Exception exception) when (exception is System.ComponentModel.Win32Exception
                                               or InvalidOperationException
@@ -1822,8 +2997,21 @@ public sealed class StartupSnoozeService
 
     private void SaveJournal(StartupSnoozeJournal journal)
     {
-        System.IO.Directory.CreateDirectory(Directory);
         var json = JsonSerializer.Serialize(journal, JournalJsonOptions);
+        var bytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+            .GetBytes(json);
+        if (bytes.Length == 0 || bytes.Length > MaxJournalBytes)
+        {
+            throw new IOException("启动项关停日志大小超出安全上限。");
+        }
+
+        if (_useMachineJournal)
+        {
+            WriteMachineJournalBytes(bytes);
+            return;
+        }
+
+        System.IO.Directory.CreateDirectory(Directory);
         var temporary = JournalPath + ".tmp";
         try
         {
@@ -1834,14 +3022,8 @@ public sealed class StartupSnoozeService
                        FileShare.None,
                        bufferSize: 16 * 1024,
                        FileOptions.WriteThrough))
-            using (var writer = new StreamWriter(
-                       stream,
-                       new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-                       bufferSize: 16 * 1024,
-                       leaveOpen: true))
             {
-                writer.Write(json);
-                writer.Flush();
+                stream.Write(bytes, 0, bytes.Length);
                 stream.Flush(flushToDisk: true);
             }
 
@@ -1869,22 +3051,104 @@ public sealed class StartupSnoozeService
 
     private StartupSnoozeJournal LoadJournal()
     {
-        var json = File.ReadAllText(JournalPath, Encoding.UTF8);
+        var bytes = ReadJournalStorage();
+        if (bytes.Length == 0 || bytes.Length > MaxJournalBytes)
+        {
+            throw new InvalidDataException("启动项关停日志大小超出安全上限。");
+        }
+
+        var json = new UTF8Encoding(
+            encoderShouldEmitUTF8Identifier: false,
+            throwOnInvalidBytes: true).GetString(bytes);
         var journal = JsonSerializer.Deserialize<StartupSnoozeJournal>(json)
                       ?? throw new InvalidOperationException("关停日志内容为空。");
         ValidateJournal(journal);
         return journal;
     }
 
+    private byte[] ReadJournalStorage()
+    {
+        if (_useMachineJournal)
+        {
+            return ReadMachineJournalBytes()
+                   ?? throw new FileNotFoundException("找不到启动项关停日志。", JournalPath);
+        }
+
+        return File.ReadAllBytes(JournalPath);
+    }
+
+    private void DeleteJournalStorage()
+    {
+        if (!_useMachineJournal)
+        {
+            File.Delete(JournalPath);
+            return;
+        }
+
+        using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+        using var key = baseKey.OpenSubKey(JournalStoreKeyPath, writable: true);
+        if (key is null)
+        {
+            return;
+        }
+
+        key.DeleteValue(_journalValueName!, throwOnMissingValue: false);
+        key.Flush();
+    }
+
+    private void WriteMachineJournalBytes(byte[] bytes)
+    {
+        using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+        using var key = baseKey.CreateSubKey(JournalStoreKeyPath, writable: true)
+            ?? throw new IOException("无法创建管理员级启动项日志存储。");
+        key.SetValue(_journalValueName!, bytes, RegistryValueKind.Binary);
+        key.Flush();
+    }
+
+    private byte[]? ReadMachineJournalBytes()
+    {
+        using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+        using var key = baseKey.OpenSubKey(JournalStoreKeyPath, writable: false);
+        if (key is null)
+        {
+            return null;
+        }
+
+        var value = key.GetValue(
+            _journalValueName!,
+            null,
+            RegistryValueOptions.DoNotExpandEnvironmentNames);
+        if (value is null)
+        {
+            return null;
+        }
+
+        return value as byte[]
+            ?? throw new InvalidDataException("管理员级启动项日志存储的值类型无效。");
+    }
+
+    private static string BuildJournalValueName()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var sid = identity.User?.Value;
+        if (string.IsNullOrWhiteSpace(sid))
+        {
+            throw new InvalidOperationException("无法取得当前用户 SID，不能安全定位启动项关停日志。");
+        }
+
+        return JournalValuePrefix + sid;
+    }
+
     /// <summary>
-    /// 日志位于当前用户可写的 AppData，而恢复进程是提权进程。不能信任其中的
-    /// 注册表路径、任务名是否只指向启动项；否则篡改日志就能借恢复流程写 HKLM/任务计划。
+    /// 生产日志位于仅管理员可写的 HKLM，测试使用临时目录。无论存储位置如何，
+    /// 都不能信任日志中的注册表路径、任务名是否只指向启动项；否则篡改日志就能
+    /// 借恢复流程写 HKLM/任务计划。
     /// </summary>
     internal static void ValidateJournal(StartupSnoozeJournal journal)
     {
-        // 版本 1 没有计划任务写入标记；仍可安全读取，恢复时改用
-        // ConfirmedDisabled 作为旧版自己的写入证据。
-        if (journal.Version is < 1 or > 2)
+        // 版本 1 没有计划任务写入标记；版本 2 没有任务身份。两者仍可读取，
+        // 但计划任务恢复会因缺少身份而失败关闭；版本 3 起身份是必需字段。
+        if (journal.Version is < 1 or > 3)
         {
             throw new InvalidDataException("不支持的启动项关停日志版本：" + journal.Version);
         }
@@ -1916,7 +3180,7 @@ public sealed class StartupSnoozeService
 
         foreach (var task in journal.Tasks)
         {
-            ValidateTaskEntry(task);
+            ValidateTaskEntry(journal.Version, task);
         }
 
         foreach (var uwp in journal.Uwp)
@@ -1927,9 +3191,12 @@ public sealed class StartupSnoozeService
         foreach (var executable in journal.DeferredExecutables)
         {
             if (string.IsNullOrWhiteSpace(executable) || executable.Length > 32_768
-                || executable.IndexOf('\0') >= 0)
+                || executable.IndexOf('\0') >= 0
+                || !Path.IsPathFullyQualified(executable)
+                || executable.StartsWith(@"\\?\", StringComparison.Ordinal)
+                || executable.StartsWith(@"\\.\", StringComparison.Ordinal))
             {
-                throw new InvalidDataException("启动项关停日志包含无效的启动程序路径。");
+                throw new InvalidDataException("启动项关停日志包含无效的启动程序路径（必须是完整文件路径）。");
             }
         }
     }
@@ -1977,7 +3244,8 @@ public sealed class StartupSnoozeService
             throw new InvalidDataException("启动项关停日志包含不允许的注册表路径。");
         }
 
-        if (string.IsNullOrWhiteSpace(entry.ValueName) || entry.ValueName.Length > 1024
+        // 默认值名是合法的空字符串，必须允许它通过；只拒绝 null 和超长/含 NUL。
+        if (entry.ValueName is null || entry.ValueName.Length > 1024
             || entry.ValueName.IndexOf('\0') >= 0)
         {
             throw new InvalidDataException("启动项关停日志包含无效的注册表值名。");
@@ -2020,7 +3288,7 @@ public sealed class StartupSnoozeService
         }
     }
 
-    private static void ValidateTaskEntry(StartupSnoozeTaskEntry? task)
+    private static void ValidateTaskEntry(int journalVersion, StartupSnoozeTaskEntry? task)
     {
         if (task is null)
         {
@@ -2034,8 +3302,7 @@ public sealed class StartupSnoozeService
             throw new InvalidDataException("启动项关停日志包含无效的计划任务名。");
         }
 
-        if (string.Equals(task.Relative, @"\Microsoft", StringComparison.OrdinalIgnoreCase)
-            || task.Relative.StartsWith(@"\Microsoft\", StringComparison.OrdinalIgnoreCase))
+        if (IsMicrosoftSystemTaskPath(task.Relative))
         {
             throw new InvalidDataException("启动项关停日志不能指向 Microsoft 系统任务。");
         }
@@ -2052,6 +3319,11 @@ public sealed class StartupSnoozeService
             || task.Executable?.IndexOfAny(new[] { '\0', '\r', '\n' }) >= 0)
         {
             throw new InvalidDataException("启动项关停日志包含无效的任务程序路径。");
+        }
+
+        if (journalVersion >= 3 && !ScheduledTaskXml.IsValidIdentity(task.Identity))
+        {
+            throw new InvalidDataException("启动项关停日志缺少有效的计划任务身份。");
         }
     }
 
@@ -2084,7 +3356,7 @@ public sealed class StartupSnoozeService
             throw new InvalidDataException("启动项关停日志包含无效的 UWP 任务名。");
         }
 
-        if (uwp.OriginalState != UwpStartupState.EnabledConfirmed)
+        if (!UwpStartupState.IsEnabled(uwp.OriginalState))
         {
             throw new InvalidDataException("启动项关停日志包含无效的 UWP 原始状态。");
         }
@@ -2113,23 +3385,49 @@ public sealed class StartupSnoozeService
         // 启动，把它们也列为目标会误杀用户登录后手动打开的同名程序。
         foreach (var entry in journal.Registry.Where(entry => !entry.Applied))
         {
-            executables.Add(RunOnceClassifier.ParseExecutable(entry.CommandLine));
+            // 启动文件夹里的项是 .lnk，必须解析到真实 EXE 才能与进程路径精确匹配。
+            executables.Add(ResolveGuardExecutable(entry));
         }
 
         foreach (var entry in journal.Tasks.Where(task => !task.ConfirmedDisabled))
         {
-            executables.Add(RunOnceClassifier.ParseExecutable(entry.Executable));
+            executables.Add(ResolveGuardExecutable(entry));
         }
 
         executables.AddRange(journal.DeferredExecutables);
 
-        return executables
+        return NormalizeExecutableList(executables);
+    }
+
+    /// <summary>
+    /// 返回日志中所有可解析的启动程序，供常驻守卫拦截由会话 0 服务
+    /// 在子会话里重新拉起的副本。这里包含已确认关闭的项，因为禁用注册表
+    /// 或计划任务并不能阻止部分厂商服务直接调用会话内程序。
+    /// </summary>
+    private static IReadOnlyList<string> NormalizeManagedStartupExecutables(StartupSnoozeJournal journal)
+    {
+        var executables = new List<string?>();
+        foreach (var entry in journal.Registry)
+        {
+            executables.Add(ResolveGuardExecutable(entry));
+        }
+
+        foreach (var entry in journal.Tasks)
+        {
+            executables.Add(ResolveGuardExecutable(entry));
+        }
+
+        executables.AddRange(journal.DeferredExecutables);
+        return NormalizeExecutableList(executables);
+    }
+
+    private static IReadOnlyList<string> NormalizeExecutableList(IEnumerable<string?> executables) =>
+        executables
             .Select(NormalizeExecutablePath)
             .Where(path => path is not null)
             .Select(path => path!)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-    }
 
     private static string? NormalizeExecutablePath(string? path)
     {
@@ -2156,22 +3454,151 @@ public sealed class StartupSnoozeService
         }
     }
 
-    private static bool ExecutableExists(string? commandLine)
+    /// <summary>启动命令行指向的可执行文件是否存在：存在 / 已证明不存在 / 无法证明。</summary>
+    internal enum ExecutablePresence
     {
+        Unknown,
+        Exists,
+        Missing
+    }
+
+    /// <summary>
+    /// 判断启动命令行指向的程序是否存在。只使用可离线验证的信息（绝对路径或
+    /// PATH 目录里的文件），不执行任何东西。无法证明时返回 Unknown，调用方必须
+    /// 失败关闭，不能把「查不到」当成「不存在」。
+    /// </summary>
+    internal static ExecutablePresence ProveExecutablePresence(string? commandLine) =>
+        ProveExecutablePresence(
+            commandLine,
+            Environment.GetEnvironmentVariable("PATH"),
+            File.Exists);
+
+    /// <summary>可注入 PATH 与文件探测的纯函数版本，供离线测试使用。</summary>
+    internal static ExecutablePresence ProveExecutablePresence(
+        string? commandLine,
+        string? pathVariable,
+        Func<string, bool> fileExists)
+    {
+        // 未成对的引号无法确定第一个参数在哪里结束，不能猜成裸命令再去 PATH 里
+        // 查一个被剥掉引号的名字，否则解析失败会被误判为「已证明不存在」。
+        if (commandLine is null || commandLine.Count(character => character == '"') % 2 != 0)
+        {
+            return ExecutablePresence.Unknown;
+        }
+
         var executable = RunOnceClassifier.ParseExecutable(commandLine);
         if (string.IsNullOrWhiteSpace(executable))
         {
-            return false;
+            return ExecutablePresence.Unknown;
         }
 
+        string expanded;
         try
         {
-            return File.Exists(Environment.ExpandEnvironmentVariables(executable));
+            expanded = Environment.ExpandEnvironmentVariables(executable.Trim());
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        {
+            return ExecutablePresence.Unknown;
+        }
+
+        if (expanded.Length == 0)
+        {
+            return ExecutablePresence.Unknown;
+        }
+
+        // "C:foo" 是盘符相对路径，"\foo" 是当前盘根相对路径，都依赖进程当前目录，
+        // 不能当成绝对路径直接下存在/不存在结论。
+        if ((expanded.Length >= 2 && char.IsLetter(expanded[0]) && expanded[1] == ':'
+                && (expanded.Length == 2 || (expanded[2] != '\\' && expanded[2] != '/')))
+            || (expanded[0] == '\\' && (expanded.Length == 1 || expanded[1] != '\\'))
+            || expanded[0] == '/')
+        {
+            return ExecutablePresence.Unknown;
+        }
+
+        if (Path.IsPathRooted(expanded))
+        {
+            return SafeFileExists(expanded, fileExists)
+                ? ExecutablePresence.Exists
+                : ExecutablePresence.Missing;
+        }
+
+        // 带目录分隔符却不是根路径（如 "bin\app.exe"）会相对当前目录解析，
+        // 无法确定真实位置，必须失败关闭。
+        if (expanded.IndexOf('\\') >= 0
+            || expanded.IndexOf('/') >= 0
+            || expanded.IndexOf(':') >= 0)
+        {
+            return ExecutablePresence.Unknown;
+        }
+
+        if (string.IsNullOrWhiteSpace(pathVariable))
+        {
+            // 空 PATH 不能证明「找不到」，只能证明「没找」。
+            return ExecutablePresence.Unknown;
+        }
+
+        var extensions = Path.HasExtension(expanded)
+            ? new[] { string.Empty }
+            : new[] { string.Empty, ".exe", ".com", ".bat", ".cmd" };
+
+        foreach (var rawDirectory in pathVariable.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var directory = rawDirectory.Trim().Trim('"');
+            if (directory.Length == 0)
+            {
+                continue;
+            }
+
+            if (!Path.IsPathRooted(directory))
+            {
+                // 相对 PATH 目录依赖进程当前目录，同样无法静态证明。
+                return ExecutablePresence.Unknown;
+            }
+
+            foreach (var extension in extensions)
+            {
+                var candidate = SafeCombine(directory, expanded + extension);
+                if (candidate is null)
+                {
+                    return ExecutablePresence.Unknown;
+                }
+
+                if (SafeFileExists(candidate, fileExists))
+                {
+                    return ExecutablePresence.Exists;
+                }
+            }
+        }
+
+        return ExecutablePresence.Missing;
+    }
+
+    private static bool SafeFileExists(string path, Func<string, bool> fileExists)
+    {
+        try
+        {
+            return fileExists(path);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException
+                                              or PathTooLongException or IOException
+                                              or UnauthorizedAccessException or SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static string? SafeCombine(string directory, string fileName)
+    {
+        try
+        {
+            return Path.Combine(directory, fileName);
         }
         catch (Exception exception) when (exception is ArgumentException or NotSupportedException
                                               or PathTooLongException)
         {
-            return false;
+            return null;
         }
     }
 

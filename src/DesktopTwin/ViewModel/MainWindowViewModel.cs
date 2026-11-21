@@ -33,6 +33,7 @@ public partial class MainWindowViewModel : ObservableObject
     private readonly DispatcherTimer _notificationTimer;
     private readonly UuViewSwitchService _uuViewSwitchService;
     private readonly SessionAgentService _sessionAgent;
+    private readonly McpEnablementCoordinator _mcpEnablementCoordinator;
     private long _lastAgentStartTicks;
     private GlobalHotkeyService? _globalHotkey;
     private McpLoopbackServer? _mcpServer;
@@ -105,6 +106,9 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(WatchModeButtonText))]
     [NotifyPropertyChangedFor(nameof(WatchModeButtonToolTip))]
+    [NotifyCanExecuteChangedFor(nameof(SwitchWindowCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ShowDesktopCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ShowTaskViewCommand))]
     private bool _isWatchModeEnabled;
 
     [ObservableProperty]
@@ -153,6 +157,7 @@ public partial class MainWindowViewModel : ObservableObject
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(McpMenuHeader))]
+    [NotifyPropertyChangedFor(nameof(WatchModeButtonToolTip))]
     private bool _mcpEnabled;
 
     [ObservableProperty]
@@ -204,6 +209,46 @@ public partial class MainWindowViewModel : ObservableObject
         // 切换后串流端被自动恢复成功时告诉用户一声，免得用户以为得手动重连。
         _uuViewSwitchService.StreamerRecovered += OnStreamerRecovered;
 
+        _mcpEnablementCoordinator = new McpEnablementCoordinator(
+            new McpEnablementCoordinator.Operations(
+                persistEnabled: value =>
+                {
+                    _settings.Current.Mcp.Enabled = value;
+                    _settings.SaveSoon();
+                },
+                startMcp: () => ApplyMcpService(
+                    notifyUser: false,
+                    notifySuccess: false,
+                    rollbackOnFailure: false),
+                syncSessionAgent: SyncSessionAgent,
+                stopMcp: StopMcpService,
+                setUiEnabled: value => McpEnabled = value,
+                updateStatus: UpdateMcpStatus,
+                notifyError: (title, message, exception) =>
+                {
+                    if (exception is not null)
+                    {
+                        AppLog.Error("MCP 启用失败，已回滚。", exception);
+                    }
+
+                    ShowNotification(
+                        title,
+                        message,
+                        InfoBarSeverity.Error,
+                        TimeSpan.FromSeconds(10));
+                },
+                reportRollbackSyncWarning: (message, exception) =>
+                {
+                    if (exception is null)
+                    {
+                        AppLog.Warn(message);
+                    }
+                    else
+                    {
+                        AppLog.Warn(message, exception);
+                    }
+                }));
+
         _notificationTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
             Interval = TimeSpan.FromSeconds(5)
@@ -212,6 +257,7 @@ public partial class MainWindowViewModel : ObservableObject
 
         _childSessionService.StateChanged += OnChildSessionStateChanged;
         _childSessionService.ConnectionFailed += OnChildSessionConnectionFailed;
+        _childSessionService.IsolationFailed += OnChildSessionIsolationFailed;
         _childSessionService.SystemShortcutsReconnectCompleted += OnSystemShortcutsReconnectCompleted;
         _childSessionService.AudioReconnectCompleted += OnAudioReconnectCompleted;
         _childSessionService.AutoLaunchSkipped += OnAutoLaunchSkipped;
@@ -267,9 +313,11 @@ public partial class MainWindowViewModel : ObservableObject
     /// <summary>
     /// 观看/控制切换按钮的提示：说明当前模式，并告知点击后的去向。
     /// </summary>
-    public string WatchModeButtonToolTip => IsWatchModeEnabled
-        ? Locale.Get("Main.WatchMode.Button.Watch.ToolTip")
-        : Locale.Get("Main.WatchMode.Button.Control.ToolTip");
+    public string WatchModeButtonToolTip => McpEnabled && IsWatchModeEnabled
+        ? Locale.Get("Main.WatchMode.Button.Watch.McpLocked.ToolTip")
+        : IsWatchModeEnabled
+            ? Locale.Get("Main.WatchMode.Button.Watch.ToolTip")
+            : Locale.Get("Main.WatchMode.Button.Control.ToolTip");
 
     /// <summary>
     /// 尺寸切换目标宽度。
@@ -524,6 +572,34 @@ public partial class MainWindowViewModel : ObservableObject
             return;
         }
 
+        // 上次异常退出可能留下尚未恢复的启动项。启动阶段的首次恢复失败时，
+        // 用户再次点「启动并连接」必须重新尝试；恢复不成功就停止，不能把
+        // 残留的关闭状态继续叠加到下一次隔离里。
+        try
+        {
+            var recovery = await Task.Run(_childSessionService.RecoverStartupIsolationBeforeConnect);
+            if (recovery is { Success: false })
+            {
+                AppLog.Warn("连接前恢复开机启动项失败，已阻止启动：" + recovery.Message);
+                ShowNotification(
+                    Locale.Get("Snooze.RecoveryFailed.Title"),
+                    Locale.Format("Snooze.RecoveryFailed.Message", recovery.Message),
+                    InfoBarSeverity.Error,
+                    TimeSpan.FromSeconds(15));
+                return;
+            }
+        }
+        catch (Exception exception)
+        {
+            AppLog.Warn("连接前恢复开机启动项异常，已阻止启动。", exception);
+            ShowNotification(
+                Locale.Get("Snooze.RecoveryFailed.Title"),
+                Locale.Format("Snooze.RecoveryFailed.Message", exception.GetBaseException().Message),
+                InfoBarSeverity.Error,
+                TimeSpan.FromSeconds(15));
+            return;
+        }
+
         if (_childSessionService.ConnectedState != 1)
         {
             // 预检要读上千个计划任务 XML，放后台跑：这里在 UI 线程上，
@@ -617,10 +693,35 @@ public partial class MainWindowViewModel : ObservableObject
         Execute(_childSessionService.HideWindow);
     }
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanUseSessionNavigation))]
     private void SwitchWindow()
     {
+        if (!RejectSessionNavigationWhileWatchMode())
+        {
+            return;
+        }
+
         Execute(_childSessionService.ShowChildSessionTaskView);
+    }
+
+    private bool CanUseSessionNavigation() => !IsWatchModeEnabled;
+
+    /// <summary>
+    /// 观看模式锁住 RDP 输入窗口时，切换窗口/桌面视图都要发送系统组合键。
+    /// XAML 的 CanExecute 只是按钮提示，代码后置仍可直接 Execute，所以这里再守一道。
+    /// </summary>
+    private bool RejectSessionNavigationWhileWatchMode()
+    {
+        if (!IsWatchModeEnabled)
+        {
+            return true;
+        }
+
+        ShowNotification(
+            Locale.Get("Notify.WatchMode.NavigationBlocked.Title"),
+            Locale.Get("Notify.WatchMode.NavigationBlocked.Message"),
+            InfoBarSeverity.Informational);
+        return false;
     }
 
     /// <summary>
@@ -754,12 +855,30 @@ public partial class MainWindowViewModel : ObservableObject
     [RelayCommand]
     private void ToggleMcpControl()
     {
-        McpEnabled = !McpEnabled;
-        _settings.Current.Mcp.Enabled = McpEnabled;
-        _settings.SaveSoon();
+        var enabling = !McpEnabled;
 
-        ApplyMcpService(notifyUser: true);
-        SyncSessionAgent();
+        if (!enabling)
+        {
+            _settings.Current.Mcp.Enabled = false;
+            _settings.SaveSoon();
+            McpEnabled = false;
+            ApplyMcpService(notifyUser: true);
+            SyncSessionAgent();
+            return;
+        }
+
+        if (!_mcpEnablementCoordinator.Enable(
+                Locale.Get("Notify.McpFailed.Title"),
+                "MCP 已启动，但分身控制通道安装失败。"))
+        {
+            return;
+        }
+
+        ShowNotification(
+            Locale.Get("Notify.McpEnabled.Title"),
+            Locale.Format("Notify.McpEnabled.Message", _mcpServer?.Port ?? _settings.Current.Mcp.Port),
+            InfoBarSeverity.Success,
+            TimeSpan.FromSeconds(7));
     }
 
     /// <summary>
@@ -845,8 +964,15 @@ public partial class MainWindowViewModel : ObservableObject
     internal void AttachWindow(Window window)
     {
         _hotkeyWindow = window;
-        ApplyMcpService(notifyUser: false);
-        ApplyUuHotkey(notifySuccess: false);
+        var mcpApplied = ApplyMcpService(notifyUser: false, notifySuccess: false);
+        var agentReady = ApplyUuHotkey(notifySuccess: false);
+        if (mcpApplied && McpEnabled && !agentReady)
+        {
+            RollbackMcpEnablement(
+                Locale.Get("Notify.McpFailed.Title"),
+                "MCP 已启动，但分身控制通道安装失败。",
+                notifyUser: true);
+        }
     }
 
     /// <summary>
@@ -1329,11 +1455,11 @@ public partial class MainWindowViewModel : ObservableObject
     /// 注册或注销 UU 切换热键。
     /// </summary>
     /// <param name="notifySuccess">注册成功时是否提示用户。</param>
-    private void ApplyUuHotkey(bool notifySuccess)
+    private bool ApplyUuHotkey(bool notifySuccess)
     {
         if (_hotkeyWindow is null)
         {
-            return;
+            return false;
         }
 
         _globalHotkey ??= new GlobalHotkeyService();
@@ -1343,8 +1469,7 @@ public partial class MainWindowViewModel : ObservableObject
 
         if (!UuViewSwitchEnabled)
         {
-            SyncSessionAgent();
-            return;
+            return SyncSessionAgent();
         }
 
         var combination = _settings.Current.Automation.UuViewSwitchHotkey;
@@ -1363,7 +1488,7 @@ public partial class MainWindowViewModel : ObservableObject
                     TimeSpan.FromSeconds(7));
             }
 
-            return;
+            return agentReady;
         }
 
         // 注册失败就把开关退回去，避免界面显示「已启用」但按键没反应。
@@ -1371,12 +1496,13 @@ public partial class MainWindowViewModel : ObservableObject
         UuViewSwitchEnabled = false;
         _settings.Current.Automation.UuViewSwitchEnabled = false;
         _settings.SaveSoon();
-        SyncSessionAgent();
+        var fallbackAgentReady = SyncSessionAgent();
         ShowNotification(
             Locale.Get("Hotkey.Registered.Failed.Title"),
             error,
             InfoBarSeverity.Warning,
             TimeSpan.FromSeconds(7));
+        return fallbackAgentReady;
     }
 
     /// <summary>
@@ -1390,32 +1516,51 @@ public partial class MainWindowViewModel : ObservableObject
             return false;
         }
 
-        var hotkey = UuViewSwitchEnabled
-            ? _settings.Current.Automation.UuViewSwitchHotkey
-            : null;
-        var controlPipe = McpEnabled ? _settings.Current.Mcp.PipeName : null;
-
-        if (string.IsNullOrWhiteSpace(hotkey) && string.IsNullOrWhiteSpace(controlPipe))
+        try
         {
-            _sessionAgent.Uninstall();
+            var hotkey = UuViewSwitchEnabled
+                ? _settings.Current.Automation.UuViewSwitchHotkey
+                : null;
+            var controlPipe = McpEnabled ? _settings.Current.Mcp.PipeName : null;
+
+            // 子会话开着或关停日志尚未恢复时，HKCU Run 可能正被隔离。
+            // 这时只更新内存参数并显式拉起当前会话用的代理，绝不改写启动项。
+            var deferStartupMutation = _childSessionService.ShouldDeferSessionAgentStartupMutation();
+            if (string.IsNullOrWhiteSpace(hotkey) && string.IsNullOrWhiteSpace(controlPipe))
+            {
+                _sessionAgent.Uninstall(removeStartupEntry: !deferStartupMutation);
+                return true;
+            }
+
+            if (!_sessionAgent.EnsureInstalled(
+                    hotkey,
+                    controlPipe,
+                    out var error,
+                    updateStartupEntry: !deferStartupMutation))
+            {
+                AppLog.Warn($"分身端安装失败：{error}");
+                return false;
+            }
+
+            // 自启项只在下次登录时生效；当前分身已经在运行时立刻补拉一份。
+            _ = _sessionAgent.TryStartInChildSession();
             return true;
         }
-
-        if (!_sessionAgent.EnsureInstalled(hotkey, controlPipe, out var error))
+        catch (Exception exception)
         {
-            AppLog.Warn($"分身端安装失败：{error}");
+            AppLog.Warn("同步分身端参数失败。", exception);
             return false;
         }
-
-        // 自启项只在下次登录时生效；当前分身已经在运行时立刻补拉一份。
-        _ = _sessionAgent.TryStartInChildSession();
-        return true;
     }
 
     /// <summary>
     /// 启动或停止 MCP 环回监听。
     /// </summary>
-    private void ApplyMcpService(bool notifyUser)
+    /// <param name="rollbackOnFailure">
+    /// 为 false 时失败只停止 MCP 并返回 false，由 <see cref="McpEnablementCoordinator"/>
+    /// 统一执行回滚与通知，避免用户看到两次回滚提示。默认保留内部回滚语义。
+    /// </param>
+    private bool ApplyMcpService(bool notifyUser, bool notifySuccess = true, bool rollbackOnFailure = true)
     {
         if (!McpEnabled)
         {
@@ -1430,11 +1575,13 @@ public partial class MainWindowViewModel : ObservableObject
                     InfoBarSeverity.Informational);
             }
 
-            return;
+            return true;
         }
 
         try
         {
+            EnsureMcpWatchMode();
+
             var settings = _settings.Current.Mcp;
             if (McpSecretStore.Ensure(settings))
             {
@@ -1459,7 +1606,7 @@ public partial class MainWindowViewModel : ObservableObject
             }
 
             UpdateMcpStatus();
-            if (notifyUser)
+            if (notifyUser && notifySuccess)
             {
                 ShowNotification(
                     Locale.Get("Notify.McpEnabled.Title"),
@@ -1467,25 +1614,80 @@ public partial class MainWindowViewModel : ObservableObject
                     InfoBarSeverity.Success,
                     TimeSpan.FromSeconds(7));
             }
+
+            return true;
         }
         catch (Exception exception)
         {
-            StopMcpService();
-            McpEnabled = false;
-            _settings.Current.Mcp.Enabled = false;
-            _settings.SaveSoon();
-            UpdateMcpStatus();
-            AppLog.Error("MCP 控制服务启动失败。", exception);
-
-            if (notifyUser)
+            if (rollbackOnFailure)
             {
-                ShowNotification(
+                RollbackMcpEnablement(
                     Locale.Get("Notify.McpFailed.Title"),
                     exception.GetBaseException().Message,
-                    InfoBarSeverity.Error,
-                    TimeSpan.FromSeconds(10));
+                    notifyUser: true);
+                return false;
+            }
+
+            // 协调器路径：只保证失败后服务不再监听，回滚状态与通知由协调器统一完成。
+            // 原始异常只在这里落日志，避免统一回滚提示掩盖真实原因。
+            AppLog.Error("MCP 控制服务启动失败，将由协调器回滚。", exception);
+            StopMcpService();
+            return false;
+        }
+    }
+
+    private void RollbackMcpEnablement(string title, string message, bool notifyUser)
+    {
+        StopMcpService();
+        McpEnabled = false;
+        _settings.Current.Mcp.Enabled = false;
+        _settings.SaveSoon();
+        UpdateMcpStatus();
+        AppLog.Error("MCP 启用失败，已回滚。", new InvalidOperationException(message));
+
+        // 第二次同步在回滚路径上不能让异常逃出 Toggle 命令；失败只记录，MCP 保持关闭。
+        try
+        {
+            if (!SyncSessionAgent())
+            {
+                AppLog.Warn("MCP 回滚后未能重新同步分身代理；MCP 仍保持关闭。");
             }
         }
+        catch (Exception exception)
+        {
+            AppLog.Warn("MCP 回滚后同步分身代理失败；MCP 仍保持关闭。", exception);
+        }
+
+        if (notifyUser)
+        {
+            ShowNotification(
+                title,
+                message,
+                InfoBarSeverity.Error,
+                TimeSpan.FromSeconds(10));
+        }
+    }
+
+    /// <summary>
+    /// MCP 在观看模式下发送输入，避免 RDP 控件把远程指针映射到主桌面光标。
+    /// 只要 MCP 开启就必须保持该模式；失败时由 MCP 启动流程关闭服务。
+    /// </summary>
+    private void EnsureMcpWatchMode()
+    {
+        if (!_childSessionService.WatchModeEnabled)
+        {
+            _childSessionService.SetWatchModeEnabled(true);
+        }
+
+        IsWatchModeEnabled = _childSessionService.WatchModeEnabled;
+        if (!IsWatchModeEnabled)
+        {
+            throw new InvalidOperationException(Locale.Get("Mcp.WatchMode.Failed"));
+        }
+
+        // 设置里的布尔值可能是上次留下的，必须对当前 RDP 输入窗口重新读回。
+        _childSessionService.VerifyWatchModeIsolation();
+        AppLog.Info("MCP 已开启，观看模式已自动启用并验证主桌面输入隔离。");
     }
 
     private void StopMcpService()
@@ -1670,6 +1872,17 @@ public partial class MainWindowViewModel : ObservableObject
     private void ToggleWatchMode()
     {
         var enabled = !IsWatchModeEnabled;
+        if (!enabled && McpEnabled)
+        {
+            IsWatchModeEnabled = true;
+            ShowNotification(
+                Locale.Get("Notify.McpWatchLocked.Title"),
+                Locale.Get("Notify.McpWatchLocked.Message"),
+                InfoBarSeverity.Informational,
+                TimeSpan.FromSeconds(7));
+            return;
+        }
+
         if (!Execute(() => _childSessionService.SetWatchModeEnabled(enabled)))
         {
             IsWatchModeEnabled = _childSessionService.WatchModeEnabled;
@@ -1722,15 +1935,25 @@ public partial class MainWindowViewModel : ObservableObject
         return !IsAudioReconnectPending;
     }
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanUseSessionNavigation))]
     private void ShowDesktop()
     {
+        if (!RejectSessionNavigationWhileWatchMode())
+        {
+            return;
+        }
+
         Execute(_childSessionService.ShowChildSessionDesktop);
     }
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanUseSessionNavigation))]
     private void ShowTaskView()
     {
+        if (!RejectSessionNavigationWhileWatchMode())
+        {
+            return;
+        }
+
         Execute(_childSessionService.ShowChildSessionTaskView);
     }
 
@@ -1938,6 +2161,37 @@ public partial class MainWindowViewModel : ObservableObject
             ? "分身端脚本已更新，拉起新代理替换旧的。"
             : "分身端未在运行，重新拉起。");
         _ = _sessionAgent.TryStartInChildSession();
+    }
+
+    private void OnChildSessionIsolationFailed(
+        object? sender,
+        ChildSessionConnectionFailedEventArgs e)
+    {
+        _ = Application.Current.Dispatcher.BeginInvoke(
+            DispatcherPriority.Normal,
+            new Action(() =>
+            {
+                IsSystemShortcutsReconnectPending = false;
+                IsAudioReconnectPending = false;
+                IsWatchModeEnabled = _childSessionService.WatchModeEnabled;
+                UpdateConnectionStatus();
+
+                if (McpEnabled)
+                {
+                    StopMcpService();
+                    McpEnabled = false;
+                    _settings.Current.Mcp.Enabled = false;
+                    _settings.SaveSoon();
+                    UpdateMcpStatus();
+                }
+
+                AppLog.Error("输入或启动项隔离失败，已停止 MCP 并注销子会话：" + e.Message);
+                ShowNotification(
+                    Locale.Get("Notify.IsolationFailed.Title"),
+                    e.Message,
+                    InfoBarSeverity.Error,
+                    TimeSpan.FromSeconds(15));
+            }));
     }
 
     private void OnChildSessionConnectionFailed(

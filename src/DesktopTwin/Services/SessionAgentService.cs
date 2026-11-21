@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -74,7 +75,19 @@ internal sealed class SessionAgentService : IDisposable
     /// </summary>
     private static readonly TimeSpan AgentProbeInterval = TimeSpan.FromSeconds(3);
 
+    /// <summary>
+    /// 终止旧代理后确认其退出的上限。超时必须失败关闭，不能再补拉一个
+    /// 抢不到单实例互斥体的重复进程。
+    /// </summary>
+    private const int AgentExitTimeoutMilliseconds = 5_000;
+
     private readonly string _dataDirectory;
+
+    /// <summary>
+    /// 串行化「检查、替换、下发」整段流程，避免状态轮询在旧进程枚举或等待
+    /// 退出期间重入并下发第二次启动任务。
+    /// </summary>
+    private readonly object _agentStartSync = new();
     private readonly Dispatcher _dispatcher;
     private DispatcherTimer? _pollTimer;
     private DateTime _lastRequestSeen = DateTime.MinValue;
@@ -124,12 +137,20 @@ internal sealed class SessionAgentService : IDisposable
     public string HeartbeatPath => Path.Combine(_dataDirectory, HeartbeatFileName);
 
     /// <summary>
-    /// 安装（或更新）分身端：释放 exe、写自启项，并开始轮询请求。
+    /// 安装（或更新）分身端：释放 exe、按需写自启项，并开始轮询请求。
     /// </summary>
     /// <param name="hotkey">当前热键组合，形如 <c>Ctrl+Alt+U</c>；为空表示不注册热键。</param>
     /// <param name="controlPipe">MCP 控制管道名；为空表示不开放控制通道。</param>
     /// <param name="error">失败原因。</param>
-    public bool EnsureInstalled(string? hotkey, string? controlPipe, out string error)
+    /// <param name="updateStartupEntry">
+    /// 是否允许改写 HKCU Run。启动项隔离或子会话状态未知时必须为 false，
+    /// 否则会把刚关停的分身端自启项重新打开，破坏隔离日志与系统状态的一致性。
+    /// </param>
+    public bool EnsureInstalled(
+        string? hotkey,
+        string? controlPipe,
+        out string error,
+        bool updateStartupEntry = true)
     {
         error = string.Empty;
         ThrowIfDisposed();
@@ -139,8 +160,17 @@ internal sealed class SessionAgentService : IDisposable
             throw new ArgumentException("至少需要热键或控制管道中的一项。");
         }
 
-        _hotkeyArgument = string.IsNullOrWhiteSpace(hotkey) ? null : hotkey;
-        _controlPipeArgument = string.IsNullOrWhiteSpace(controlPipe) ? null : controlPipe;
+        var nextHotkey = string.IsNullOrWhiteSpace(hotkey) ? null : hotkey;
+        var nextControlPipe = string.IsNullOrWhiteSpace(controlPipe) ? null : controlPipe;
+        if (!string.Equals(_hotkeyArgument, nextHotkey, StringComparison.Ordinal)
+            || !string.Equals(_controlPipeArgument, nextControlPipe, StringComparison.Ordinal))
+        {
+            // 即使启动项隔离禁止写 Run，当前会话里的旧代理仍必须换成新参数。
+            NeedsRestart = true;
+        }
+
+        _hotkeyArgument = nextHotkey;
+        _controlPipeArgument = nextControlPipe;
 
         string? updateError = null;
 
@@ -169,22 +199,25 @@ internal sealed class SessionAgentService : IDisposable
             return false;
         }
 
-        try
+        if (updateStartupEntry)
         {
-            var commandLine = BuildCommandLine();
-            if (!string.Equals(ReadRunKey(), commandLine, StringComparison.Ordinal))
+            try
             {
-                WriteRunKey(commandLine);
-                NeedsRestart = true;
+                var commandLine = BuildCommandLine();
+                if (!string.Equals(ReadRunKey(), commandLine, StringComparison.Ordinal))
+                {
+                    WriteRunKey(commandLine);
+                    NeedsRestart = true;
+                }
             }
-        }
-        catch (Exception exception) when (exception is UnauthorizedAccessException
-                                              or System.Security.SecurityException
-                                              or IOException)
-        {
-            error = Locale.Format("Agent.Error.RunKeyFailed", exception.Message);
-            AppLog.Warn(error, exception);
-            return false;
+            catch (Exception exception) when (exception is UnauthorizedAccessException
+                                                  or System.Security.SecurityException
+                                                  or IOException)
+            {
+                error = Locale.Format("Agent.Error.RunKeyFailed", exception.Message);
+                AppLog.Warn(error, exception);
+                return false;
+            }
         }
 
         StartPolling();
@@ -211,55 +244,78 @@ internal sealed class SessionAgentService : IDisposable
     {
         ThrowIfDisposed();
 
-        var sessionId = ChildSessionNativeMethods.TryGetChildSessionId();
-        if (sessionId is null)
+        // 整个「确认会话 -> 找旧代理 -> 等退出 -> 下发任务」流程必须串行。
+        // 否则轮询在等待旧进程退出时重入，会再下发一个抢不到互斥体的进程。
+        lock (_agentStartSync)
         {
-            AppLog.Info("分身会话尚未创建，分身端会在下次登录时由自启项拉起。");
-            return false;
+            if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
+            {
+                AppLog.Warn("无法确认 RDP Child Session 状态，本次不下发分身端启动任务。");
+                return false;
+            }
+
+            if (sessionId is null)
+            {
+                AppLog.Info("分身会话尚未创建，分身端会在下次登录时由自启项拉起。");
+                return false;
+            }
+
+            // 只往「已经登录完成」的会话里拉：RDP 刚连上、桌面还没起来时下发任务，
+            // 任务计划程序会把进程起在一个没有交互桌面的会话里，进程活不下来，
+            // 却会让主程序以为「已经拉起过」。
+            if (!ChildSessionNativeMethods.IsSessionActive(sessionId.Value))
+            {
+                AppLog.Info($"分身会话 {sessionId} 还没进入 Active 状态，等登录完成后再拉起分身端。");
+                return false;
+            }
+
+            if (!File.Exists(AgentPath))
+            {
+                AppLog.Warn($"分身端文件不存在：{AgentPath}，跳过拉起。");
+                return false;
+            }
+
+            if (NeedsRestart)
+            {
+                // 参数或代理文件变过：不能相信 HasLiveAgentProcess 的缓存，必须重新
+                // 枚举当前子会话。只有精确匹配 AgentPath 的旧进程才允许被终止；
+                // 任何身份/路径不可读或不匹配都失败关闭，不能再拉起重复进程。
+                if (!TryStopExistingAgentProcess(sessionId.Value, out var foundExisting))
+                {
+                    return false;
+                }
+
+                if (!foundExisting)
+                {
+                    AppLog.Info("未发现需要替换的旧分身端，准备下发一次启动任务。");
+                }
+            }
+            else if (HasLiveAgentProcess())
+            {
+                // 同参数代理已在运行，继续复用；只有 NeedsRestart 才进入替换流程。
+                AppLog.Info("分身端已在运行，跳过本次拉起。");
+                return false;
+            }
+
+            var ok = ChildSessionProcessLauncher.RunInSession(
+                sessionId.Value,
+                AgentPath,
+                BuildAgentArguments(),
+                taskNamePrefix: "DesktopTwin-SessionAgent-");
+
+            AppLog.Info(ok
+                ? Locale.Format("Agent.Started", sessionId)
+                : Locale.Format("Agent.StartFailed", sessionId));
+
+            if (ok)
+            {
+                NeedsRestart = false;
+                // 进入启动宽限期：这段时间内即使没有心跳也按「在线」处理。
+                _lastLaunchTickCount = Environment.TickCount64;
+            }
+
+            return ok;
         }
-
-        // 只往「已经登录完成」的会话里拉：RDP 刚连上、桌面还没起来时下发任务，
-        // 任务计划程序会把进程起在一个没有交互桌面的会话里，进程活不下来，
-        // 却会让主程序以为「已经拉起过」。
-        if (!ChildSessionNativeMethods.IsSessionActive(sessionId.Value))
-        {
-            AppLog.Info($"分身会话 {sessionId} 还没进入 Active 状态，等登录完成后再拉起分身端。");
-            return false;
-        }
-
-        if (!File.Exists(AgentPath))
-        {
-            AppLog.Warn($"分身端文件不存在：{AgentPath}，跳过拉起。");
-            return false;
-        }
-
-        // 已经有一个活着的分身端就不要重复拉起：每次拉起都会新建进程、抢一次热键，
-        // 然后因为互斥体被占立刻退出——日志里那几十次「重新拉起」就是这样空转的。
-        // NeedsRestart 为真时是例外：那说明代理文件更新过，需要新进程去替换旧的。
-        if (!NeedsRestart && HasLiveAgentProcess())
-        {
-            AppLog.Info("分身端已在运行，跳过本次拉起。");
-            return false;
-        }
-
-        var ok = ChildSessionProcessLauncher.RunInSession(
-            sessionId.Value,
-            AgentPath,
-            BuildAgentArguments(),
-            taskNamePrefix: "DesktopTwin-SessionAgent-");
-
-        AppLog.Info(ok
-            ? Locale.Format("Agent.Started", sessionId)
-            : Locale.Format("Agent.StartFailed", sessionId));
-
-        if (ok)
-        {
-            NeedsRestart = false;
-            // 进入启动宽限期：这段时间内即使没有心跳也按「在线」处理。
-            _lastLaunchTickCount = Environment.TickCount64;
-        }
-
-        return ok;
     }
 
     /// <summary>
@@ -359,6 +415,243 @@ internal sealed class SessionAgentService : IDisposable
     }
 
     /// <summary>
+    /// 终止当前子会话里精确匹配 <see cref="AgentPath"/> 的旧代理，并等待其退出。
+    ///
+    /// 这个流程刻意不复用 <see cref="HasLiveAgentProcess"/> 的 3 秒缓存：替换参数
+    /// 或代理文件时，决策必须基于本次重新枚举。任何会阻止安全判断的情况都返回
+    /// false，让调用方失败关闭，而不是再拉起一个抢不到单实例互斥体的进程。
+    /// </summary>
+    /// <param name="sessionId">目标 WTS 子会话。</param>
+    /// <param name="foundExisting">是否发现并尝试终止了至少一个精确匹配的旧代理。</param>
+    private bool TryStopExistingAgentProcess(uint sessionId, out bool foundExisting)
+    {
+        foundExisting = false;
+
+        Process[] candidates;
+        try
+        {
+            candidates = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(AgentFileName));
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+                                              or System.ComponentModel.Win32Exception
+                                              or NotSupportedException
+                                              or System.Security.SecurityException)
+        {
+            AppLog.Warn("无法枚举分身端候选进程，本次不下发启动任务。", exception);
+            return false;
+        }
+
+        var matching = new List<Process>();
+        try
+        {
+            foreach (var process in candidates)
+            {
+                int processSessionId;
+                try
+                {
+                    processSessionId = process.SessionId;
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    AppLog.Warn(
+                        $"无法读取分身端候选进程 {process.Id} 的会话身份，为避免误杀或重复启动，本次不下发启动任务。",
+                        exception);
+                    return false;
+                }
+
+                // 主会话（或任何其他会话）里的同名进程都不是本次替换目标，
+                // 也绝不允许被终止。只有目标子会话内的候选才继续读取镜像路径。
+                if ((uint)processSessionId != sessionId)
+                {
+                    continue;
+                }
+
+                string? processPath;
+                try
+                {
+                    processPath = process.MainModule?.FileName;
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    AppLog.Warn(
+                        $"无法读取子会话 {sessionId} 内分身端候选进程 {process.Id} 的完整路径，为避免误杀或重复启动，本次不下发启动任务。",
+                        exception);
+                    return false;
+                }
+
+                if (!IsMatchingAgentProcess(AgentPath, sessionId, processSessionId, processPath))
+                {
+                    // 同名但不是 AgentPath（例如 .old 退役文件或另一个目录的副本）
+                    // 仍可能持有同名单实例互斥体。不杀它，但也绝不并发拉起新代理。
+                    AppLog.Warn(
+                        $"子会话 {sessionId} 内的同名进程 {process.Id} 不匹配代理完整路径："
+                        + $"期望 {AgentPath}，实际 {processPath ?? "<无法读取>"}。本次不下发启动任务。");
+                    return false;
+                }
+
+                matching.Add(process);
+            }
+
+            if (matching.Count == 0)
+            {
+                return true;
+            }
+
+            foundExisting = true;
+            foreach (var process in matching)
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        // 只结束精确匹配的代理本身，不能顺带结束它的子进程。
+                        process.Kill(entireProcessTree: false);
+                    }
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    if (!IsProcessExited(process))
+                    {
+                        AppLog.Warn(
+                            $"终止旧分身端进程 {process.Id} 失败，本次不下发启动任务。",
+                            exception);
+                        return false;
+                    }
+                }
+            }
+
+            var started = Environment.TickCount64;
+            foreach (var process in matching)
+            {
+                var remaining = AgentExitTimeoutMilliseconds
+                    - (int)Math.Min(
+                        int.MaxValue,
+                        Environment.TickCount64 - started);
+                if (remaining <= 0)
+                {
+                    AppLog.Warn(
+                        $"等待旧分身端进程 {process.Id} 退出超时（{AgentExitTimeoutMilliseconds} 毫秒），"
+                        + "本次不下发启动任务。");
+                    return false;
+                }
+
+                bool exited;
+                try
+                {
+                    exited = process.WaitForExit(remaining);
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    AppLog.Warn(
+                        $"等待旧分身端进程 {process.Id} 退出失败，本次不下发启动任务。",
+                        exception);
+                    return false;
+                }
+
+                if (!exited)
+                {
+                    AppLog.Warn(
+                        $"等待旧分身端进程 {process.Id} 退出超时（{AgentExitTimeoutMilliseconds} 毫秒），"
+                        + "本次不下发启动任务。");
+                    return false;
+                }
+            }
+
+            AppLog.Info($"已终止 {matching.Count} 个旧分身端进程，并确认其退出。");
+            return true;
+        }
+        finally
+        {
+            foreach (var process in candidates)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    private static bool IsProcessExited(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+                                              or System.ComponentModel.Win32Exception
+                                              or NotSupportedException
+                                              or System.Security.SecurityException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 判断一个进程是否是本次可替换的分身端。
+    ///
+    /// 纯函数，不枚举进程、不访问文件。只有同时满足以下不变量才返回 true：
+    /// 目标会话与进程会话都为正数且相同；期望路径和实际镜像路径都是规范化后的
+    /// 完整路径；两者按 Windows 大小写不敏感语义完全相等。任何空/无效路径都拒绝。
+    /// </summary>
+    internal static bool IsMatchingAgentProcess(
+        string? expectedAgentPath,
+        uint childSessionId,
+        int? processSessionId,
+        string? processImagePath)
+    {
+        if (childSessionId == 0 || processSessionId is null || processSessionId <= 0)
+        {
+            return false;
+        }
+
+        if ((uint)processSessionId.Value != childSessionId)
+        {
+            return false;
+        }
+
+        return TryNormalizeFullPath(expectedAgentPath, out var expectedPath)
+               && TryNormalizeFullPath(processImagePath, out var actualPath)
+               && string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryNormalizeFullPath(string? path, out string normalizedPath)
+    {
+        normalizedPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!Path.IsPathFullyQualified(path))
+            {
+                return false;
+            }
+
+            normalizedPath = Path.GetFullPath(path);
+            return Path.IsPathFullyQualified(normalizedPath);
+        }
+        catch (Exception exception) when (exception is ArgumentException
+                                              or NotSupportedException
+                                              or PathTooLongException
+                                              or System.Security.SecurityException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 只看心跳文件判断分身端是否还在写心跳（不含启动宽限）。
     ///
     /// 读文件时会撞上代理正在写：两边都用 <see cref="FileShare.ReadWrite"/> 打开就不会互斥。
@@ -413,9 +706,17 @@ internal sealed class SessionAgentService : IDisposable
     /// <summary>
     /// 卸载分身端：删自启项、停轮询、删代理与日志。
     /// </summary>
-    public void Uninstall()
+    /// <param name="removeStartupEntry">
+    /// 启动项隔离期间为 false。此时 Run 值已由隔离日志关停，不能删除、改写
+    /// 或删除被它引用的代理文件，否则恢复日志时无法还原原来的自启状态。
+    /// </param>
+    public void Uninstall(bool removeStartupEntry = true)
     {
         StopPolling();
+        if (!removeStartupEntry)
+        {
+            return;
+        }
 
         try
         {
@@ -520,11 +821,23 @@ internal sealed class SessionAgentService : IDisposable
 
     private string BuildAgentArguments()
     {
-        return BuildAgentArguments(_hotkeyArgument, _controlPipeArgument);
+        var process = Process.GetCurrentProcess();
+        return BuildAgentArguments(
+            _hotkeyArgument,
+            _controlPipeArgument,
+            process.SessionId);
     }
 
-    internal static string BuildAgentArguments(string? hotkey, string? controlPipe)
+    internal static string BuildAgentArguments(
+        string? hotkey,
+        string? controlPipe,
+        int hostSessionId = 0)
     {
+        if (!string.IsNullOrWhiteSpace(controlPipe) && hostSessionId <= 0)
+        {
+            throw new ArgumentException("控制通道必须携带正整数宿主会话身份。", nameof(hostSessionId));
+        }
+
         var builder = new StringBuilder();
         if (string.IsNullOrWhiteSpace(hotkey))
         {
@@ -538,6 +851,7 @@ internal sealed class SessionAgentService : IDisposable
         if (!string.IsNullOrWhiteSpace(controlPipe))
         {
             builder.Append(" --control-pipe \"").Append(controlPipe).Append('"');
+            builder.Append(" --host-session ").Append(hostSessionId);
         }
 
         return builder.ToString();

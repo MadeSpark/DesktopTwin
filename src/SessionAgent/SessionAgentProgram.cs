@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -35,7 +35,6 @@ namespace DesktopTwinSessionAgent
     internal static class Program
     {
         private const string MutexName = @"Local\DesktopTwin.SessionAgent";
-        private const string DefaultHotkey = "Ctrl+Alt+U";
         private const int HotkeyId = 1;
         private const int WmHotkey = 0x0312;
         private const uint ModNoRepeat = 0x4000;
@@ -69,10 +68,18 @@ namespace DesktopTwinSessionAgent
             _heartbeatPath = Path.Combine(_dataDirectory, "session-agent-heartbeat.txt");
             _logPath = Path.Combine(_dataDirectory, "session-agent.log");
 
-            bool noHotkey = HasFlag(args, "--no-hotkey");
-            string hotkey = noHotkey ? null : ReadHotkeyArgument(args);
-            string controlPipe = ReadArgumentValue(args, "--control-pipe");
-            bool testMode = HasFlag(args, "--test");
+            SessionAgentArguments parsed = SessionAgentArguments.Parse(args);
+            if (!parsed.IsValid)
+            {
+                Log(parsed.ErrorMessage + "，拒绝启动。");
+                return 2;
+            }
+
+            bool noHotkey = parsed.NoHotkey;
+            string hotkey = noHotkey ? null : parsed.Hotkey;
+            string controlPipe = parsed.ControlPipe;
+            int hostSessionId = parsed.HostSessionId;
+            bool testMode = parsed.TestMode;
 
             Log("代理启动 pid=" + Process.GetCurrentProcess().Id + " 版本=" + typeof(Program).Assembly.GetName().Version);
 
@@ -155,9 +162,12 @@ namespace DesktopTwinSessionAgent
             {
                 try
                 {
-                    _controlServer = new SessionAgentControlServer(controlPipe, Log);
+                    _controlServer = new SessionAgentControlServer(
+                        controlPipe,
+                        hostSessionId,
+                        Log);
                     _controlServer.Start();
-                    Log("MCP 控制管道已启动: " + controlPipe);
+                    Log("MCP 控制管道已启动。");
                 }
                 catch (Exception ex)
                 {
@@ -460,45 +470,6 @@ namespace DesktopTwinSessionAgent
             }
         }
 
-        private static string ReadHotkeyArgument(string[] args)
-        {
-            for (int i = 0; i < args.Length - 1; i++)
-            {
-                if (string.Equals(args[i], "--hotkey", StringComparison.OrdinalIgnoreCase))
-                {
-                    return args[i + 1];
-                }
-            }
-
-            return DefaultHotkey;
-        }
-
-        private static string ReadArgumentValue(string[] args, string name)
-        {
-            for (int i = 0; i < args.Length - 1; i++)
-            {
-                if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return args[i + 1];
-                }
-            }
-
-            return null;
-        }
-
-        private static bool HasFlag(string[] args, string name)
-        {
-            foreach (string arg in args)
-            {
-                if (string.Equals(arg, name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
         /// <summary>
         /// 命名键表。必须与主程序 Services/GlobalHotkeyService.cs 里的 NamedKeys 一致：
         /// 两边对同一个组合串算出不同虚拟键时，界面上设的是 Ctrl+F5，分身里注册的却是 U。
@@ -645,6 +616,246 @@ namespace DesktopTwinSessionAgent
         private sealed class AgentContext : ApplicationContext
         {
         }
+    }
+
+    /// <summary>
+    /// 纯函数式的命令行解析：不触任何系统资源，只做词法与契约校验。
+    /// SessionAgent 由框架 csc 以 C# 5 编译，这里只能用 C# 5 语法与 System 类型。
+    /// </summary>
+    internal sealed class SessionAgentArguments
+    {
+        internal const string ControlPipeFlag = "--control-pipe";
+        internal const string HostSessionFlag = "--host-session";
+        internal const string DefaultHotkey = "Ctrl+Alt+U";
+
+        private static readonly string[] KnownFlags = new string[]
+        {
+            "--no-hotkey",
+            "--test"
+        };
+
+        private static readonly string[] KnownValueOptions = new string[]
+        {
+            "--hotkey",
+            ControlPipeFlag,
+            HostSessionFlag
+        };
+
+        internal bool IsValid;
+        internal string ErrorMessage;
+        internal bool NoHotkey;
+        internal string Hotkey;
+        internal string ControlPipe;
+        internal int HostSessionId;
+        internal bool TestMode;
+
+        public static SessionAgentArguments Parse(string[] args)
+        {
+            SessionAgentArguments result = new SessionAgentArguments();
+
+            // 词法预检：未知选项、重复选项、值选项缺值或吞掉下一个选项，一律拒绝。
+            string lexicalError;
+            if (!ValidateLexical(args, out lexicalError))
+            {
+                result.IsValid = false;
+                result.ErrorMessage = lexicalError;
+                return result;
+            }
+
+            result.NoHotkey = ContainsFlag(args, "--no-hotkey");
+            result.TestMode = ContainsFlag(args, "--test");
+            if (!result.NoHotkey)
+            {
+                string hotkeyText;
+                TryReadOptionValue(args, "--hotkey", out hotkeyText);
+                result.Hotkey = hotkeyText;
+                if (result.Hotkey == null)
+                {
+                    result.Hotkey = DefaultHotkey;
+                }
+            }
+
+            string controlPipeText;
+            bool hasControlPipe = TryReadOptionValue(args, ControlPipeFlag, out controlPipeText);
+            result.ControlPipe = controlPipeText;
+
+            string hostSessionText;
+            bool hasHostSession = TryReadOptionValue(args, HostSessionFlag, out hostSessionText);
+            int hostSessionId = 0;
+            bool parsedHostSession = hasHostSession && hostSessionText != null && Int32.TryParse(
+                hostSessionText,
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out hostSessionId);
+
+            // 契约一：--control-pipe 给了就必须带一个真实的值。
+            // 缺值（含末尾悬空）、空串、或把下一个 -- 选项当成值，都算坏参数。
+            if (hasControlPipe
+                && (controlPipeText == null
+                    || controlPipeText.Length == 0
+                    || IsOptionLike(controlPipeText)))
+            {
+                result.IsValid = false;
+                result.ErrorMessage = "控制通道 --control-pipe 缺少有效管道名";
+                return result;
+            }
+
+            // 契约二：显式给出 --host-session 时，必须是正整数。
+            // 即使没有 --control-pipe 也一样拒绝，防止解析器把别的选项吞成会话号。
+            if (hasHostSession && (!parsedHostSession || hostSessionId <= 0))
+            {
+                result.IsValid = false;
+                result.ErrorMessage = "控制通道必须提供显式正整数 --host-session";
+                return result;
+            }
+
+            // 契约三：非空管道名必须搭配正整数会话号。
+            if (hasControlPipe && (!parsedHostSession || hostSessionId <= 0))
+            {
+                result.IsValid = false;
+                result.ErrorMessage = "控制通道必须提供显式正整数 --host-session";
+                return result;
+            }
+
+            result.HostSessionId = parsedHostSession ? hostSessionId : 0;
+            result.IsValid = true;
+            result.ErrorMessage = null;
+            return result;
+        }
+
+        // 词法校验：每个 '-' 开头的 token 必须是已知选项；已知选项不得重复；
+        // 带值选项的值必须存在、非空、且不是另一个选项。
+        private static bool ValidateLexical(string[] args, out string error)
+        {
+            error = null;
+            for (int i = 0; i < args.Length; i++)
+            {
+                string token = args[i];
+                if (!IsOptionLike(token))
+                {
+                    continue;
+                }
+
+                bool knownFlag = ContainsName(KnownFlags, token);
+                bool knownValueOption = ContainsName(KnownValueOptions, token);
+                if (!knownFlag && !knownValueOption)
+                {
+                    error = "未知参数 " + token;
+                    return false;
+                }
+
+                if (CountOccurrences(args, token) > 1)
+                {
+                    error = "重复参数 " + token;
+                    return false;
+                }
+
+                if (knownValueOption)
+                {
+                    if (i + 1 >= args.Length)
+                    {
+                        error = token + " 缺少参数值";
+                        return false;
+                    }
+
+                    string value = args[i + 1];
+                    if (value.Length == 0 || IsOptionLike(value))
+                    {
+                        error = token + " 缺少有效参数值";
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private static bool ContainsName(string[] names, string token)
+        {
+            foreach (string name in names)
+            {
+                if (string.Equals(name, token, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static int CountOccurrences(string[] args, string token)
+        {
+            int count = 0;
+            foreach (string arg in args)
+            {
+                if (string.Equals(arg, token, StringComparison.OrdinalIgnoreCase))
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+
+        // 找到 name 时返回 true；若 name 是最后一个 token（悬空缺值），value 为 null。
+        private static bool TryReadOptionValue(string[] args, string name, out string value)
+        {
+            value = null;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length)
+                    {
+                        value = args[i + 1];
+                    }
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool ContainsFlag(string[] args, string name)
+        {
+            foreach (string arg in args)
+            {
+                if (string.Equals(arg, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsOptionLike(string text)
+        {
+            if (text == null || text.Length == 0)
+            {
+                return true;
+            }
+
+            foreach (string flag in KnownFlags)
+            {
+                if (string.Equals(text, flag, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            foreach (string option in KnownValueOptions)
+            {
+                if (string.Equals(text, option, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return text.Length > 1 && text[0] == '-';
+        }
+
     }
 
     /// <summary>

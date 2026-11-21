@@ -123,6 +123,9 @@ namespace DesktopTwinSessionAgent
         public static extern uint GetWindowThreadProcessId(IntPtr window, out int processId);
 
         [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr window, uint flags);
+
+        [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr window, out Rect rect);
 
         [DllImport("user32.dll")]

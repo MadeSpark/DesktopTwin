@@ -14,6 +14,7 @@ namespace DesktopTwin.Services;
 internal sealed class McpProtocolHandler
 {
     public const string LatestProtocolVersion = "2025-06-18";
+    internal const int MaxBatchItems = 16;
     private static readonly HashSet<string> SupportedProtocolVersions = new(StringComparer.Ordinal)
     {
         "2024-11-05",
@@ -34,7 +35,7 @@ internal sealed class McpProtocolHandler
     {
         if (message is JsonArray batch)
         {
-            if (batch.Count == 0)
+            if (batch.Count == 0 || batch.Count > MaxBatchItems)
             {
                 return Error(null, -32600, "Invalid Request");
             }
@@ -157,6 +158,13 @@ internal sealed class McpProtocolHandler
         }
 
         var arguments = argumentsNode as JsonObject ?? new JsonObject();
+        var tool = McpToolCatalog.Tools.First(item => item.Name == toolName);
+        var argumentError = ValidateArguments(tool.InputSchema, arguments);
+        if (argumentError is not null)
+        {
+            return ToolError("invalid_arguments", argumentError);
+        }
+
         var pipeName = _pipeNameProvider();
         if (string.IsNullOrWhiteSpace(pipeName))
         {
@@ -198,6 +206,122 @@ internal sealed class McpProtocolHandler
         return toolName == "desktop_screenshot"
             ? BuildScreenshotResult(agentResult.Result)
             : BuildJsonResult(agentResult.Result);
+    }
+
+    private static string? ValidateArguments(JsonObject schema, JsonObject arguments)
+    {
+        var allowsAdditional = !(schema["additionalProperties"] is JsonValue additional
+            && additional.TryGetValue<bool>(out var allowed)
+            && !allowed);
+        var properties = schema["properties"] as JsonObject;
+        if (properties is null)
+        {
+            return arguments.Count == 0 || allowsAdditional ? null : "工具不接受参数。";
+        }
+
+        if (schema["required"] is JsonArray required)
+        {
+            foreach (var requiredNode in required)
+            {
+                var name = ReadString(requiredNode);
+                if (String.IsNullOrEmpty(name) || !arguments.ContainsKey(name))
+                {
+                    return $"缺少必填参数：{name}。";
+                }
+            }
+        }
+
+        foreach (var argument in arguments)
+        {
+            if (!properties.TryGetPropertyValue(argument.Key, out var propertyNode))
+            {
+                if (allowsAdditional)
+                {
+                    continue;
+                }
+
+                return $"未知参数：{argument.Key}。";
+            }
+
+            if (propertyNode is not JsonObject propertySchema)
+            {
+                return $"参数 {argument.Key} 的 schema 无效。";
+            }
+
+            var error = ValidateValue(argument.Value, propertySchema, argument.Key);
+            if (error is not null)
+            {
+                return error;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ValidateValue(JsonNode? value, JsonObject schema, string path)
+    {
+        var expectedType = ReadString(schema["type"]);
+        if (String.IsNullOrEmpty(expectedType))
+        {
+            return null;
+        }
+
+        if (value is null || !MatchesType(value, expectedType))
+        {
+            return $"参数 {path} 必须是 {expectedType}。";
+        }
+
+        if (schema["enum"] is JsonArray allowedValues
+            && !allowedValues.Any(item => JsonNode.DeepEquals(item, value)))
+        {
+            return $"参数 {path} 的值不在允许范围内。";
+        }
+
+        if (value is JsonArray array && schema["items"] is JsonObject itemSchema)
+        {
+            for (var index = 0; index < array.Count; index++)
+            {
+                var error = ValidateValue(array[index], itemSchema, $"{path}[{index}]");
+                if (error is not null)
+                {
+                    return error;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool MatchesType(JsonNode value, string expectedType)
+    {
+        return expectedType switch
+        {
+            "object" => value is JsonObject,
+            "array" => value is JsonArray,
+            "string" => value is JsonValue && value.GetValueKind() == JsonValueKind.String,
+            "boolean" => value is JsonValue && value.GetValueKind() == JsonValueKind.True
+                || value is JsonValue && value.GetValueKind() == JsonValueKind.False,
+            "integer" => IsInteger(value),
+            "number" => value.GetValueKind() == JsonValueKind.Number,
+            _ => false
+        };
+    }
+
+    private static bool IsInteger(JsonNode value)
+    {
+        if (value.GetValueKind() != JsonValueKind.Number || value is not JsonValue jsonValue)
+        {
+            return false;
+        }
+
+        if (jsonValue.TryGetValue<long>(out _))
+        {
+            return true;
+        }
+
+        return jsonValue.TryGetValue<JsonElement>(out var element)
+            && element.ValueKind == JsonValueKind.Number
+            && element.TryGetInt64(out _);
     }
 
     private static JsonObject BuildScreenshotResult(JsonElement result)

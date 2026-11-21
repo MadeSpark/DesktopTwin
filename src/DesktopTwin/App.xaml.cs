@@ -44,6 +44,14 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // 独立恢复助手必须排在单实例检查之前：主进程退出时助手可能还没拿到互斥体，
+        // 它不是第二个交互实例，也绝不能创建窗口或抢激活事件。
+        if (StartupRecoveryCommand.TryHandle(e.Args, out var recoveryExitCode))
+        {
+            Shutdown(recoveryExitCode);
+            return;
+        }
+
         // 命令行入口要先处理：它只生成语言模板，不该走到单实例检查（否则已有实例在跑时
         // 会变成「把旧窗口叫到前台」，什么都不生成），也不该创建任何窗口。
         if (LocalizationCommandLine.TryHandle(e.Args))
@@ -140,7 +148,12 @@ public partial class App : Application
         // 而且再连一次还会在旧日志上继续叠加。
         try
         {
-            _startupRecoveryNotice = _startupSnooze.RecoverOnStartup();
+            var recovery = _startupSnooze.RecoverOnStartup();
+            _startupRecoveryNotice = recovery is null
+                ? null
+                : recovery.Success
+                    ? "上次退出时未能恢复开机启动项，已按日志自动恢复：" + recovery.Message
+                    : "上次关停的开机启动项未能全部恢复，请检查：" + recovery.Message;
         }
         catch (Exception exception)
         {

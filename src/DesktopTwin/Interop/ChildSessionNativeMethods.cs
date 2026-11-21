@@ -11,6 +11,13 @@ using Microsoft.Win32;
 
 namespace DesktopTwin.Interop;
 
+internal enum RdpInputWindowApplyResult
+{
+    Applied,
+    WindowMissing,
+    Failed
+}
+
 internal static class ChildSessionNativeMethods
 {
     private const int DefaultRdpPort = 3389;
@@ -193,9 +200,123 @@ internal static class ChildSessionNativeMethods
 
     internal static uint? TryGetChildSessionId()
     {
-        return WTSGetChildSessionId(out var sessionId) && sessionId != NoChildSessionId
-            ? sessionId
-            : null;
+        return TryQueryChildSessionId(out var sessionId) ? sessionId : null;
+    }
+
+    /// <summary>
+    /// 区分「确认没有子会话」和「查询本身失败」。前者返回 true 且 sessionId 为 null；
+    /// 后者返回 false。恢复、连接和守卫必须使用这个三态结果，不能把 WTS 查询故障
+    /// 当成会话已经消失。
+    /// </summary>
+    internal static bool TryQueryChildSessionId(out uint? sessionId)
+    {
+        var succeeded = WTSGetChildSessionId(out var value);
+        var error = succeeded ? 0 : Marshal.GetLastPInvokeError();
+        return InterpretChildSessionQuery(succeeded, value, error, out sessionId);
+    }
+
+    /// <summary>
+    /// 解释一次 WTS Child Session 查询。只有查询成功，或明确返回
+    /// <c>ERROR_NOT_FOUND</c>，才能证明「没有子会话」；其他错误一律为未知。
+    /// </summary>
+    internal static bool InterpretChildSessionQuery(
+        bool succeeded,
+        uint value,
+        int win32Error,
+        out uint? sessionId)
+    {
+        sessionId = null;
+        if (succeeded)
+        {
+            // 官方契约：没有子会话时返回 (ULONG)-1。会话 0 不是可用的交互
+            // 子会话；若 API 异常地成功返回 0，只能视为未知，绝不能让
+            // 守卫把 Session 0 当成目标会话。
+            if (value == NoChildSessionId)
+            {
+                return true;
+            }
+
+            if (value == 0)
+            {
+                return false;
+            }
+
+            sessionId = value;
+            return true;
+        }
+
+        // 没有子会话是本机正常状态，WTS 用 ERROR_NOT_FOUND 表示。
+        return win32Error == ErrorNotFound;
+    }
+
+    /// <summary>
+    /// 查询当前子会话；WTS 查询异常时抛出，而不是伪装成「没有会话」。
+    /// </summary>
+    internal static uint? GetChildSessionIdStrict()
+    {
+        if (WTSGetChildSessionId(out var sessionId))
+        {
+            if (sessionId == NoChildSessionId)
+            {
+                return null;
+            }
+
+            if (sessionId == 0)
+            {
+                throw new Win32Exception(
+                    0,
+                    "WTSGetChildSessionId 成功返回会话 0；该值不是可用的交互子会话，已失败关闭。");
+            }
+
+            return sessionId;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error == ErrorNotFound)
+        {
+            return null;
+        }
+
+        throw new Win32Exception(
+            error,
+            $"无法取得 RDP Child Session ID（Win32 错误 {error}）");
+    }
+
+    /// <summary>
+    /// 等待指定会话真正消失。注销启动项隔离必须等 RDP 会话结束后再放开，
+    /// 否则「会话断开/注销」触发的计划任务仍可能在日志恢复后启动。
+    /// </summary>
+    internal static bool WaitForSessionExit(uint sessionId, TimeSpan timeout)
+    {
+        var deadline = Environment.TickCount64 + Math.Max(0, (long)timeout.TotalMilliseconds);
+        var missingScans = 0;
+        while (true)
+        {
+            if (!TryGetSessionState(sessionId, out var state))
+            {
+                // WTS 查询失败不能证明会话已消失。中断计数，等待查询恢复或超时。
+                missingScans = 0;
+            }
+            else if (state < 0)
+            {
+                // 必须连续三次“查询成功且不存在”才认定会话已消失。
+                if (++missingScans >= 3)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                missingScans = 0;
+            }
+
+            if (Environment.TickCount64 >= deadline)
+            {
+                return false;
+            }
+
+            System.Threading.Thread.Sleep(250);
+        }
     }
 
     /// <summary>
@@ -206,10 +327,24 @@ internal static class ChildSessionNativeMethods
     /// </summary>
     internal static IReadOnlyList<SessionInfo> EnumerateSessions()
     {
-        if (!WTSEnumerateSessionsW(CurrentServerHandle, 0, 1, out var buffer, out var count)
-            || buffer == IntPtr.Zero)
+        return TryEnumerateSessions(out var sessions) ? sessions : [];
+    }
+
+    /// <summary>
+    /// 三态枚举本机会话。返回 false 表示 WTS 查询失败，调用方不得把空结果
+    /// 当成「本机没有任何会话」。
+    /// </summary>
+    private static bool TryEnumerateSessions(out IReadOnlyList<SessionInfo> result)
+    {
+        result = Array.Empty<SessionInfo>();
+        if (!WTSEnumerateSessionsW(CurrentServerHandle, 0, 1, out var buffer, out var count))
         {
-            return [];
+            return false;
+        }
+
+        if (buffer == IntPtr.Zero)
+        {
+            return count == 0;
         }
 
         var sessions = new List<SessionInfo>(count);
@@ -241,7 +376,8 @@ internal static class ChildSessionNativeMethods
             WTSFreeMemory(buffer);
         }
 
-        return sessions;
+        result = sessions;
+        return true;
     }
 
     /// <summary>
@@ -268,15 +404,31 @@ internal static class ChildSessionNativeMethods
     /// </summary>
     internal static int GetSessionState(uint sessionId)
     {
-        foreach (var session in EnumerateSessions())
+        return TryGetSessionState(sessionId, out var state) ? state : -1;
+    }
+
+    /// <summary>
+    /// 三态查询会话状态：返回 false 表示 WTS 查询失败，true 且状态为 -1 表示
+    /// 已确认会话不存在。
+    /// </summary>
+    internal static bool TryGetSessionState(uint sessionId, out int state)
+    {
+        state = -1;
+        if (!TryEnumerateSessions(out var sessions))
+        {
+            return false;
+        }
+
+        foreach (var session in sessions)
         {
             if (session.SessionId == sessionId)
             {
-                return session.State;
+                state = session.State;
+                return true;
             }
         }
 
-        return -1;
+        return true;
     }
 
     /// <summary>
@@ -294,6 +446,79 @@ internal static class ChildSessionNativeMethods
     /// 会话状态码是否为「已连接（Active）」，即桌面上真的有人。
     /// </summary>
     internal static bool IsSessionActive(uint sessionId) => GetSessionState(sessionId) == 0;
+
+    /// <summary>
+    /// 读子会话本次登录的时间。WTS 可能会复用同一个会话号；登录时间是区分
+    /// 「旧会话消失后又以同号出现」的稳定身份，取不到时返回 null。
+    ///
+    /// WTS_INFO_CLASS.WTSLogonTime（18）在受支持的 Windows 上固定返回失败并
+    /// 设置 ERROR_NOT_SUPPORTED。必须查询 WTSSessionInfoEx（25），从
+    /// WTSINFOEX_LEVEL1_W 的 LogonTime 字段读取 64 位 FILETIME。
+    /// </summary>
+    internal static DateTime? TryGetSessionLogonTime(uint sessionId)
+    {
+        const int sessionInfoExClass = 25;
+        const int logonTimeEndOffset = 176; // 8 字节头 + 结构体偏移 160 + 8 字节值
+
+        if (!WTSQuerySessionInformationW(
+                CurrentServerHandle,
+                sessionId,
+                sessionInfoExClass,
+                out var buffer,
+                out var bytesReturned)
+            || buffer == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (bytesReturned < logonTimeEndOffset)
+            {
+                return null;
+            }
+
+            var levelAndLogonTime = new byte[logonTimeEndOffset];
+            Marshal.Copy(buffer, levelAndLogonTime, 0, levelAndLogonTime.Length);
+            return ParseSessionLogonTime(levelAndLogonTime);
+        }
+        finally
+        {
+            WTSFreeMemory(buffer);
+        }
+    }
+
+    /// <summary>
+    /// 从 WTSINFOEXW 的原始字节解析登录时间。单独拆出来便于用固定布局测试，
+    /// 避免测试依赖当前会话是否真的有人登录。
+    /// </summary>
+    internal static DateTime? ParseSessionLogonTime(ReadOnlySpan<byte> sessionInfo)
+    {
+        const int logonTimeOffset = 168;
+
+        if (sessionInfo.Length < logonTimeOffset + sizeof(long)
+            || System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(
+                sessionInfo.Slice(0, sizeof(uint))) != 1)
+        {
+            return null;
+        }
+
+        var fileTime = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
+            sessionInfo.Slice(logonTimeOffset, sizeof(long)));
+        if (fileTime <= 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return DateTime.FromFileTimeUtc(fileTime);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// 读会话的登录用户名。取不到时返回空串。
@@ -411,25 +636,40 @@ internal static class ChildSessionNativeMethods
     }
 
     /// <summary>
-    /// 禁用或恢复 RDP 的输入窗口。禁用后本机鼠标与键盘都不会进入桌面分身，
-    /// 画面渲染不受影响。输入窗口尚未创建时不做任何处理。
+    /// 禁用或恢复 RDP 的输入窗口，并在 IsWindow 仍有效的前提下读回真实状态。
+    /// EnableWindow 的返回值表示“此前是否已禁用”，不能用来判断本次是否成功，
+    /// 因此调用方必须依据返回值决定是否继续连接。
     /// </summary>
-    internal static void SetRdpInputWindowEnabled(IntPtr rdpHostWindow, bool enabled)
+    internal static RdpInputWindowApplyResult SetRdpInputWindowEnabled(
+        IntPtr rdpHostWindow,
+        bool enabled)
     {
         var inputWindow = FindRdpInputWindow(rdpHostWindow, out var fromCache);
         if (inputWindow == IntPtr.Zero)
         {
             AppLog.Warn(
                 $"SetRdpInputWindowEnabled: enabled={enabled}，未找到 Input Capture Window（host=0x{rdpHostWindow:X}）。");
-            return;
+            return RdpInputWindowApplyResult.WindowMissing;
         }
 
         var beforeEnabled = IsWindowEnabled(inputWindow);
         _ = EnableWindow(inputWindow, enabled);
-        var afterEnabled = IsWindowEnabled(inputWindow);
+        var windowStillExists = IsWindow(inputWindow);
+        var afterEnabled = windowStillExists && IsWindowEnabled(inputWindow);
         AppLog.Info(
             $"SetRdpInputWindowEnabled: enabled={enabled}，inputWindow=0x{inputWindow:X}，"
-            + $"来源={(fromCache ? "缓存" : "枚举")}，实际状态 before={beforeEnabled} after={afterEnabled}。");
+            + $"来源={(fromCache ? "缓存" : "枚举")}，实际状态 before={beforeEnabled} "
+            + $"after={afterEnabled} exists={windowStillExists}。");
+
+        if (!windowStillExists)
+        {
+            RdpInputWindows.TryRemove(rdpHostWindow, out _);
+            return RdpInputWindowApplyResult.Failed;
+        }
+
+        return afterEnabled == enabled
+            ? RdpInputWindowApplyResult.Applied
+            : RdpInputWindowApplyResult.Failed;
     }
 
     internal static void ClearRdpInputWindowCache(IntPtr rdpHostWindow)

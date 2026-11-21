@@ -1,7 +1,9 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -22,11 +24,15 @@ namespace DesktopTwin.Services;
 internal sealed class McpLoopbackServer : IDisposable
 {
     private const int MaxHeaderBytes = 32 * 1024;
+    private const int MaxTrailerBytes = 32 * 1024;
     private const int MaxRequestBytes = 8 * 1024 * 1024;
     private const int MaxRequestBodyReadTimeoutSeconds = 30;
     private const int RequestLifetimeSeconds = 60;
+    private const int ShutdownWaitSeconds = 2;
 
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _connectionSlots = new(16, 16);
+    private readonly HashSet<Task> _activeHandlers = new();
     private readonly string _accessToken;
     private readonly string _expectedPath;
     private readonly Func<string?> _pipeNameProvider;
@@ -66,9 +72,9 @@ internal sealed class McpLoopbackServer : IDisposable
 
     public void Start()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
         lock (_gate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_listener is not null)
             {
                 return;
@@ -87,13 +93,20 @@ internal sealed class McpLoopbackServer : IDisposable
                 LastError = fallbackMessage;
             }
 
-            _cancellation = new CancellationTokenSource();
-            _acceptLoop = Task.Run(() => AcceptLoopAsync(_cancellation.Token));
+            var cancellation = new CancellationTokenSource();
+            _cancellation = cancellation;
+            var listener = _listener
+                ?? throw new InvalidOperationException("MCP 监听器未成功创建。");
+            _acceptLoop = Task.Run(() => AcceptLoopAsync(listener, cancellation.Token));
         }
     }
 
     public void Dispose()
     {
+        CancellationTokenSource? cancellation;
+        TcpListener? listener;
+        Task? acceptLoop;
+        Task[] handlers;
         lock (_gate)
         {
             if (_disposed)
@@ -102,25 +115,51 @@ internal sealed class McpLoopbackServer : IDisposable
             }
 
             _disposed = true;
-            _cancellation?.Cancel();
-            _listener?.Stop();
+            cancellation = _cancellation;
+            listener = _listener;
             _listener = null;
-            var loop = _acceptLoop;
+            acceptLoop = _acceptLoop;
             _acceptLoop = null;
+            handlers = new Task[_activeHandlers.Count];
+            _activeHandlers.CopyTo(handlers);
+        }
+
+        cancellation?.Cancel();
+        listener?.Stop();
+        WaitForActiveRequests(acceptLoop, handlers);
+
+        lock (_gate)
+        {
             _cancellation?.Dispose();
             _cancellation = null;
+            _activeHandlers.Clear();
+        }
+    }
 
-            if (loop is not null)
+    private static void WaitForActiveRequests(Task? acceptLoop, Task[] handlers)
+    {
+        var tasks = new List<Task>(handlers.Length + (acceptLoop is null ? 0 : 1));
+        if (acceptLoop is not null)
+        {
+            tasks.Add(acceptLoop);
+        }
+
+        tasks.AddRange(handlers);
+        if (tasks.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!Task.WhenAll(tasks).Wait(TimeSpan.FromSeconds(ShutdownWaitSeconds)))
             {
-                try
-                {
-                    loop.Wait(TimeSpan.FromSeconds(2));
-                }
-                catch (AggregateException)
-                {
-                    // 停止监听时 Accept 会以 SocketException/操作取消结束，属正常。
-                }
+                AppLog.Warn("MCP 控制服务关闭时仍有请求处理超时。");
             }
+        }
+        catch (AggregateException)
+        {
+            // 停止监听时 Accept 会以 SocketException/操作取消结束，属正常。
         }
     }
 
@@ -133,14 +172,14 @@ internal sealed class McpLoopbackServer : IDisposable
         AppLog.Info($"MCP 控制服务已监听 http://127.0.0.1:{Port}");
     }
 
-    private async Task AcceptLoopAsync(CancellationToken cancellationToken)
+    private async Task AcceptLoopAsync(TcpListener listener, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             TcpClient client;
             try
             {
-                client = await _listener!.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+                client = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -161,41 +200,96 @@ internal sealed class McpLoopbackServer : IDisposable
                 continue;
             }
 
-            _ = HandleClientSafelyAsync(client, cancellationToken);
+            if (!_connectionSlots.Wait(0))
+            {
+                // 认证前的连接也有上限，避免本机进程用连接洪泛耗尽线程和内存。
+                client.Dispose();
+                continue;
+            }
+
+            Task? handler = null;
+            lock (_gate)
+            {
+                if (!_disposed)
+                {
+                    handler = HandleClientSafelyAsync(client, cancellationToken);
+                    _activeHandlers.Add(handler);
+                    _ = handler.ContinueWith(
+                        completed =>
+                        {
+                            _ = completed.Exception;
+                            lock (_gate)
+                            {
+                                _activeHandlers.Remove(completed);
+                            }
+                        },
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+            }
+
+            if (handler is null)
+            {
+                client.Dispose();
+                _connectionSlots.Release();
+                continue;
+            }
+
+            _ = handler;
         }
     }
 
     private async Task HandleClientSafelyAsync(TcpClient client, CancellationToken serverCancellation)
     {
-        using (client)
+        try
         {
-            try
+            using (client)
             {
-                client.NoDelay = true;
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(serverCancellation);
-                timeout.CancelAfter(TimeSpan.FromSeconds(RequestLifetimeSeconds));
-                await HandleClientAsync(client, timeout.Token).ConfigureAwait(false);
+                try
+                {
+                    client.NoDelay = true;
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(serverCancellation);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(RequestLifetimeSeconds));
+                    await HandleClientAsync(client, timeout.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!serverCancellation.IsCancellationRequested)
+                {
+                    await TryWriteErrorAsync(client.GetStream(), 408, "Request Timeout").ConfigureAwait(false);
+                }
+                catch (RequestTooLargeException)
+                {
+                    await TryWriteErrorAsync(client.GetStream(), 413, "Request body too large.").ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is MalformedChunkedRequestException
+                                                      or MalformedRequestHeadException)
+                {
+                    await TryWriteErrorAsync(client.GetStream(), 400, "Bad Request.").ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is IOException
+                                                      or SocketException
+                                                      or ObjectDisposedException
+                                                      or JsonException)
+                {
+                    // 客户端提前断开很常见，不把连接异常升级成服务级故障。
+                    AppLog.Info($"MCP 客户端连接结束：{exception.Message}");
+                }
+                catch (Exception exception)
+                {
+                    AppLog.Warn("MCP 请求处理失败。", exception);
+                }
+                finally
+                {
+                    // 响应已经写出后先半关闭发送方向，并把客户端已发送的剩余数据读空。
+                    // 否则未读请求体会让 Windows 在 Dispose 时发送 RST，客户端可能完全看不到
+                    // 401/404/415 等本应返回的 HTTP 错误。
+                    await TryDrainBeforeCloseAsync(client).ConfigureAwait(false);
+                }
             }
-            catch (OperationCanceledException) when (!serverCancellation.IsCancellationRequested)
-            {
-                await TryWriteErrorAsync(client.GetStream(), 408, "Request Timeout").ConfigureAwait(false);
-            }
-            catch (RequestTooLargeException)
-            {
-                await TryWriteErrorAsync(client.GetStream(), 413, "Request body too large.").ConfigureAwait(false);
-            }
-            catch (Exception exception) when (exception is IOException
-                                                  or SocketException
-                                                  or ObjectDisposedException
-                                                  or JsonException)
-            {
-                // 客户端提前断开很常见，不把连接异常升级成服务级故障。
-                AppLog.Info($"MCP 客户端连接结束：{exception.Message}");
-            }
-            catch (Exception exception)
-            {
-                AppLog.Warn("MCP 请求处理失败。", exception);
-            }
+        }
+        finally
+        {
+            _connectionSlots.Release();
         }
     }
 
@@ -204,32 +298,33 @@ internal sealed class McpLoopbackServer : IDisposable
         var stream = client.GetStream();
         using var readTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         readTimeout.CancelAfter(TimeSpan.FromSeconds(MaxRequestBodyReadTimeoutSeconds));
-        var request = await ReadRequestAsync(stream, readTimeout.Token).ConfigureAwait(false);
-        if (request is null)
+        var head = await ReadRequestHeadAsync(stream, readTimeout.Token).ConfigureAwait(false);
+        if (head is null)
         {
             await WriteResponseAsync(stream, 431, null, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (!IsExpectedHost(request.Value.Headers, out var hostError))
+        var requestHead = head.Value;
+        if (!IsExpectedHost(requestHead.Headers, out var hostError))
         {
             await WriteResponseAsync(stream, 403, ErrorBody(hostError), cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (!IsExpectedPath(request.Value.Target))
+        if (!IsExpectedPath(requestHead.Target))
         {
             await WriteResponseAsync(stream, 404, ErrorBody("Not Found"), cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (!IsAllowedOrigin(request.Value.Headers))
+        if (!IsAllowedOrigin(requestHead.Headers))
         {
             await WriteResponseAsync(stream, 403, ErrorBody("Origin is not allowed."), cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (!IsAuthorized(request.Value.Headers))
+        if (!IsAuthorized(requestHead.Headers))
         {
             await WriteResponseAsync(
                 stream,
@@ -240,7 +335,7 @@ internal sealed class McpLoopbackServer : IDisposable
             return;
         }
 
-        if (!string.Equals(request.Value.Method, "POST", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(requestHead.Method, "POST", StringComparison.OrdinalIgnoreCase))
         {
             await WriteResponseAsync(
                 stream,
@@ -251,7 +346,7 @@ internal sealed class McpLoopbackServer : IDisposable
             return;
         }
 
-        if (!IsJsonContentType(request.Value.Headers))
+        if (!IsJsonContentType(requestHead.Headers))
         {
             await WriteResponseAsync(
                 stream,
@@ -261,16 +356,12 @@ internal sealed class McpLoopbackServer : IDisposable
             return;
         }
 
-        if (request.Value.Body.Length > MaxRequestBytes)
-        {
-            await WriteResponseAsync(stream, 413, ErrorBody("Request body too large."), cancellationToken).ConfigureAwait(false);
-            return;
-        }
+        var body = await ReadRequestBodyAsync(stream, requestHead, readTimeout.Token).ConfigureAwait(false);
 
         JsonNode? message;
         try
         {
-            message = JsonNode.Parse(request.Value.Body);
+            message = JsonNode.Parse(body);
         }
         catch (JsonException)
         {
@@ -387,11 +478,19 @@ internal sealed class McpLoopbackServer : IDisposable
 
     private static bool IsJsonContentType(Dictionary<string, string> headers)
     {
-        return headers.TryGetValue("content-type", out var contentType)
-            && contentType.TrimStart().StartsWith("application/json", StringComparison.OrdinalIgnoreCase);
+        if (!headers.TryGetValue("content-type", out var contentType))
+        {
+            return false;
+        }
+
+        // Content-Type 的媒体类型必须完整匹配，不能让 application/jsonfoo
+        // 借前缀通过校验。合法参数（如 charset）由第一个分号分隔。
+        var separator = contentType.IndexOf(';');
+        var mediaType = (separator >= 0 ? contentType[..separator] : contentType).Trim();
+        return string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static async Task<HttpRequest?> ReadRequestAsync(
+    private static async Task<HttpRequestHead?> ReadRequestHeadAsync(
         NetworkStream stream,
         CancellationToken cancellationToken)
     {
@@ -400,9 +499,17 @@ internal sealed class McpLoopbackServer : IDisposable
         var headerEnd = -1;
         try
         {
-            while (headerBuffer.Length < MaxHeaderBytes)
+            while (true)
             {
-                var read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                var remaining = MaxHeaderBytes - (int)headerBuffer.Length;
+                if (remaining <= 0)
+                {
+                    return null;
+                }
+
+                var read = await stream.ReadAsync(
+                    buffer.AsMemory(0, Math.Min(buffer.Length, remaining)),
+                    cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                 {
                     return null;
@@ -411,8 +518,9 @@ internal sealed class McpLoopbackServer : IDisposable
                 var previousLength = (int)headerBuffer.Length;
                 headerBuffer.Write(buffer, 0, read);
                 var bytes = headerBuffer.GetBuffer();
+                var currentLength = (int)headerBuffer.Length;
                 var searchStart = Math.Max(0, previousLength - 3);
-                for (var i = searchStart; i <= headerBuffer.Length - 4; i++)
+                for (var i = searchStart; i <= currentLength - 4; i++)
                 {
                     if (bytes[i] == '\r' && bytes[i + 1] == '\n'
                         && bytes[i + 2] == '\r' && bytes[i + 3] == '\n')
@@ -427,94 +535,224 @@ internal sealed class McpLoopbackServer : IDisposable
                     break;
                 }
             }
-
-            if (headerEnd < 0)
-            {
-                return null;
-            }
-
-            var allBytes = headerBuffer.ToArray();
-            var headerText = Encoding.Latin1.GetString(allBytes, 0, headerEnd);
-            var lines = headerText.Split("\r\n", StringSplitOptions.None);
-            if (lines.Length == 0)
-            {
-                return null;
-            }
-
-            var requestLine = lines[0].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (requestLine.Length < 2)
-            {
-                return null;
-            }
-
-            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            for (var i = 1; i < lines.Length; i++)
-            {
-                var colon = lines[i].IndexOf(':');
-                if (colon <= 0)
-                {
-                    continue;
-                }
-
-                headers[lines[i][..colon].Trim()] = lines[i][(colon + 1)..].Trim();
-            }
-
-            var host = headers.TryGetValue("host", out var hostValue) ? hostValue : string.Empty;
-            var target = requestLine[1];
-            if (Uri.TryCreate(target, UriKind.Absolute, out var absoluteUri))
-            {
-                target = absoluteUri.PathAndQuery;
-            }
-
-            if (headers.TryGetValue("expect", out var expect)
-                && expect.Contains("100-continue", StringComparison.OrdinalIgnoreCase))
-            {
-                var continueBytes = Encoding.ASCII.GetBytes("HTTP/1.1 100 Continue\r\n\r\n");
-                await stream.WriteAsync(continueBytes, cancellationToken).ConfigureAwait(false);
-                await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            var bodyPrefixLength = allBytes.Length - headerEnd - 4;
-            byte[] body;
-            if (headers.TryGetValue("transfer-encoding", out var transferEncoding)
-                && transferEncoding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
-            {
-                using var bodyStream = new MemoryStream();
-                var reader = new PrefixedStreamReader(stream, allBytes.AsMemory(headerEnd + 4, bodyPrefixLength));
-                await ReadChunkedBodyAsync(reader, bodyStream, cancellationToken).ConfigureAwait(false);
-                body = bodyStream.ToArray();
-            }
-            else
-            {
-                if (!headers.TryGetValue("content-length", out var contentLengthText)
-                    || !int.TryParse(contentLengthText, out var contentLength)
-                    || contentLength < 0)
-                {
-                    return null;
-                }
-
-                if (contentLength > MaxRequestBytes)
-                {
-                    // 不读取超限请求体，直接让连接层返回 413。
-                    throw new RequestTooLargeException();
-                }
-
-                body = new byte[contentLength];
-                var copied = Math.Min(bodyPrefixLength, contentLength);
-                if (copied > 0)
-                {
-                    Array.Copy(allBytes, headerEnd + 4, body, 0, copied);
-                }
-
-                await ReadExactAsync(stream, body.AsMemory(copied), cancellationToken).ConfigureAwait(false);
-            }
-
-            return new HttpRequest(requestLine[0], target, host, headers, body);
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
         }
+
+        if (headerEnd < 0)
+        {
+            return null;
+        }
+
+        var allBytes = headerBuffer.ToArray();
+        var headerText = Encoding.Latin1.GetString(allBytes, 0, headerEnd);
+        var lines = headerText.Split("\r\n", StringSplitOptions.None);
+        if (lines.Length == 0)
+        {
+            throw new MalformedRequestHeadException("请求行缺失。");
+        }
+
+        // 请求行必须是严格的 "方法 SP 目标 SP HTTP/1.1"。不能用
+        // RemoveEmptyEntries，否则双空格、尾随字段会被静默接受，
+        // 给不同前端/代理留下请求走私的解释差异。
+        var requestLine = lines[0];
+        var firstSpace = requestLine.IndexOf(' ');
+        var secondSpace = firstSpace >= 0 ? requestLine.IndexOf(' ', firstSpace + 1) : -1;
+        if (firstSpace <= 0
+            || secondSpace <= firstSpace + 1
+            || requestLine.IndexOf(' ', secondSpace + 1) >= 0)
+        {
+            throw new MalformedRequestHeadException("请求行字段数无效。");
+        }
+
+        var method = requestLine[..firstSpace];
+        var target = requestLine[(firstSpace + 1)..secondSpace];
+        var version = requestLine[(secondSpace + 1)..];
+        if (!IsHttpToken(method)
+            || !string.Equals(version, "HTTP/1.1", StringComparison.Ordinal)
+            || target.Length == 0
+            || target.Any(static character => char.IsControl(character) || character == '#'))
+        {
+            throw new MalformedRequestHeadException("请求行无效。");
+        }
+
+        if (Uri.TryCreate(target, UriKind.Absolute, out var absoluteUri))
+        {
+            target = absoluteUri.PathAndQuery;
+        }
+
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 1; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            if (line.Length == 0 || line[0] is ' ' or '\t')
+            {
+                // 空头行和 obs-fold 都可能被不同中间件解释成另一组头，
+                // 直接拒绝，不做“尽量容错”。
+                throw new MalformedRequestHeadException("请求头包含空行或折行。");
+            }
+
+            var colon = line.IndexOf(':');
+            if (colon <= 0)
+            {
+                throw new MalformedRequestHeadException("请求头缺少字段名或冒号。");
+            }
+
+            var name = line[..colon];
+            if (!IsHttpToken(name))
+            {
+                throw new MalformedRequestHeadException("请求头字段名无效。");
+            }
+
+            var value = line[(colon + 1)..].Trim(' ', '\t');
+            if (value.Any(static character =>
+                    character == '\0'
+                    || (character < ' ' && character != '\t')
+                    || character == '\u007f'))
+            {
+                throw new MalformedRequestHeadException("请求头值包含控制字符。");
+            }
+
+            if (!headers.TryAdd(name, value))
+            {
+                // 重复的 Host/Content-Length/Authorization 等字段可能让不同层
+                // 作出不同选择，统一拒绝而不是静默覆盖。
+                throw new MalformedRequestHeadException("请求头字段重复。");
+            }
+        }
+
+        var host = headers.TryGetValue("host", out var hostValue) ? hostValue : string.Empty;
+        if (headers.TryGetValue("expect", out var expectation)
+            && !string.Equals(
+                expectation.Trim(' ', '\t'),
+                "100-continue",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            // 不支持的 Expect 不能悄悄忽略后再等一个客户端永远不会发送的
+            // 请求体；这里直接按坏请求拒绝。
+            throw new MalformedRequestHeadException("Expect 不受支持。");
+        }
+
+        var bodyPrefixLength = allBytes.Length - headerEnd - 4;
+        var bodyPrefix = new byte[bodyPrefixLength];
+        if (bodyPrefixLength > 0)
+        {
+            Array.Copy(allBytes, headerEnd + 4, bodyPrefix, 0, bodyPrefixLength);
+        }
+
+        var chunked = false;
+        if (headers.TryGetValue("transfer-encoding", out var transferEncoding))
+        {
+            // 目前只支持单一的 chunked。gzip、逗号列表和 "xchunked"
+            // 都不能借子串匹配混入分块路径。
+            if (!string.Equals(transferEncoding.Trim(' ', '\t'), "chunked", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new MalformedRequestHeadException("Transfer-Encoding 不受支持。");
+            }
+
+            chunked = true;
+        }
+
+        var contentLength = 0;
+        if (headers.TryGetValue("content-length", out var contentLengthText))
+        {
+            if (chunked)
+            {
+                throw new MalformedRequestHeadException("Content-Length 不能与 Transfer-Encoding 同时出现。");
+            }
+
+            if (contentLengthText.Length == 0
+                || contentLengthText.Any(static character => character is < '0' or > '9')
+                || !int.TryParse(
+                    contentLengthText,
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out contentLength))
+            {
+                throw new MalformedRequestHeadException("Content-Length 无效。");
+            }
+        }
+        else if (!chunked)
+        {
+            throw new MalformedRequestHeadException("缺少 Content-Length 或 Transfer-Encoding。");
+        }
+
+        if (!chunked && contentLength > MaxRequestBytes)
+        {
+            // 认证前只读取请求头；超限请求体不会进入内存。
+            throw new RequestTooLargeException();
+        }
+
+        return new HttpRequestHead(
+            method,
+            target,
+            host,
+            headers,
+            contentLength,
+            chunked,
+            bodyPrefix);
+    }
+
+    /// <summary>
+    /// 判断字符串是否是 RFC 9110 的 HTTP token。字段名和方法只允许 token
+    /// 字符，不能把空白或分隔符带进后续解析。
+    /// </summary>
+    private static bool IsHttpToken(string value)
+    {
+        if (value.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (var character in value)
+        {
+            if (character is >= 'a' and <= 'z'
+                or >= 'A' and <= 'Z'
+                or >= '0' and <= '9'
+                || character is '!' or '#' or '$' or '%' or '&' or '\''
+                or '*' or '+' or '-' or '.' or '^' or '_' or '`' or '|' or '~')
+            {
+                continue;
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private static async Task<byte[]> ReadRequestBodyAsync(
+        NetworkStream stream,
+        HttpRequestHead head,
+        CancellationToken cancellationToken)
+    {
+        if (head.Headers.TryGetValue("expect", out var expect)
+            && string.Equals(expect.Trim(' ', '\t'), "100-continue", StringComparison.OrdinalIgnoreCase))
+        {
+            var continueBytes = Encoding.ASCII.GetBytes("HTTP/1.1 100 Continue\r\n\r\n");
+            await stream.WriteAsync(continueBytes, cancellationToken).ConfigureAwait(false);
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (head.Chunked)
+        {
+            using var bodyStream = new MemoryStream();
+            var reader = new PrefixedStreamReader(stream, head.BodyPrefix);
+            await ReadChunkedBodyAsync(reader, bodyStream, cancellationToken).ConfigureAwait(false);
+            return bodyStream.ToArray();
+        }
+
+        var body = new byte[head.ContentLength];
+        var copied = Math.Min(head.BodyPrefix.Length, head.ContentLength);
+        if (copied > 0)
+        {
+            Array.Copy(head.BodyPrefix, body, copied);
+        }
+
+        await ReadExactAsync(stream, body.AsMemory(copied), cancellationToken).ConfigureAwait(false);
+        return body;
     }
 
     private static async Task ReadChunkedBodyAsync(
@@ -527,7 +765,7 @@ internal sealed class McpLoopbackServer : IDisposable
             var sizeLine = await reader.ReadLineAsync(8192, cancellationToken).ConfigureAwait(false);
             if (sizeLine is null)
             {
-                throw new IOException("分块请求体提前结束。");
+                throw new MalformedChunkedRequestException("分块请求体提前结束。");
             }
 
             var separator = sizeLine.IndexOf(';');
@@ -535,22 +773,37 @@ internal sealed class McpLoopbackServer : IDisposable
             if (!int.TryParse(sizeText.Trim(), System.Globalization.NumberStyles.HexNumber, null, out var size)
                 || size < 0)
             {
-                throw new IOException("分块请求体长度无效。");
+                throw new MalformedChunkedRequestException("分块请求体长度无效。");
             }
 
             if (size == 0)
             {
-                string? trailer;
-                do
+                var trailerBytes = 0;
+                while (true)
                 {
-                    trailer = await reader.ReadLineAsync(8192, cancellationToken).ConfigureAwait(false);
-                }
-                while (!string.IsNullOrEmpty(trailer));
+                    var trailer = await reader.ReadLineAsync(8192, cancellationToken).ConfigureAwait(false);
+                    if (trailer is null)
+                    {
+                        throw new MalformedChunkedRequestException("分块请求体 trailer 未完整结束。");
+                    }
 
-                return;
+                    if (trailer.Length == 0)
+                    {
+                        return;
+                    }
+
+                    // 单行有 8 KiB 上限，但若不累计，客户端仍可用大量短 trailer
+                    // 把连接拖到请求超时。trailer 与请求头一样按硬上限拒绝。
+                    if (trailer.Length + 2 > MaxTrailerBytes - trailerBytes)
+                    {
+                        throw new MalformedChunkedRequestException("分块请求体 trailer 超过上限。");
+                    }
+
+                    trailerBytes += trailer.Length + 2;
+                }
             }
 
-            if (destination.Length + size > MaxRequestBytes)
+            if (size > MaxRequestBytes - destination.Length)
             {
                 throw new RequestTooLargeException();
             }
@@ -562,7 +815,7 @@ internal sealed class McpLoopbackServer : IDisposable
             await reader.ReadExactlyAsync(crlf, cancellationToken).ConfigureAwait(false);
             if (crlf[0] != '\r' || crlf[1] != '\n')
             {
-                throw new IOException("分块请求体缺少分隔符。");
+                throw new MalformedChunkedRequestException("分块请求体缺少分隔符。");
             }
         }
 
@@ -654,6 +907,40 @@ internal sealed class McpLoopbackServer : IDisposable
         }
     }
 
+    private static async Task TryDrainBeforeCloseAsync(TcpClient client)
+    {
+        try
+        {
+            if (!client.Connected)
+            {
+                return;
+            }
+
+            client.Client.Shutdown(SocketShutdown.Send);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+            var buffer = ArrayPool<byte>.Shared.Rent(8192);
+            try
+            {
+                var stream = client.GetStream();
+                while (await stream.ReadAsync(buffer.AsMemory(), timeout.Token).ConfigureAwait(false) > 0)
+                {
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+        catch (Exception exception) when (exception is IOException
+                                              or SocketException
+                                              or ObjectDisposedException
+                                              or OperationCanceledException
+                                              or InvalidOperationException)
+        {
+            // 对端未按 Connection: close 收尾时，超时后直接关闭即可。
+        }
+    }
+
     private static byte[] ErrorBody(string message) =>
         Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { error = message }));
 
@@ -661,12 +948,30 @@ internal sealed class McpLoopbackServer : IDisposable
     {
     }
 
-    private readonly record struct HttpRequest(
+    private sealed class MalformedRequestHeadException : IOException
+    {
+        public MalformedRequestHeadException(string message)
+            : base(message)
+        {
+        }
+    }
+
+    private sealed class MalformedChunkedRequestException : IOException
+    {
+        public MalformedChunkedRequestException(string message)
+            : base(message)
+        {
+        }
+    }
+
+    private readonly record struct HttpRequestHead(
         string Method,
         string Target,
         string Host,
         Dictionary<string, string> Headers,
-        byte[] Body);
+        int ContentLength,
+        bool Chunked,
+        byte[] BodyPrefix);
 
     /// <summary>
     /// 让分块解码器先消费“已跟随请求头读进内存”的字节，再继续读网络流。
@@ -692,20 +997,29 @@ internal sealed class McpLoopbackServer : IDisposable
                 var read = await ReadAsync(one, cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                 {
-                    return line.Length == 0 ? null : Encoding.ASCII.GetString(line.ToArray());
+                    if (line.Length == 0)
+                    {
+                        return null;
+                    }
+
+                    throw new MalformedChunkedRequestException("分块请求行未以 CRLF 结束。");
                 }
 
                 if (one[0] == '\n')
                 {
                     var bytes = line.ToArray();
-                    var length = bytes.Length > 0 && bytes[^1] == '\r' ? bytes.Length - 1 : bytes.Length;
-                    return Encoding.ASCII.GetString(bytes, 0, length);
+                    if (bytes.Length == 0 || bytes[^1] != '\r')
+                    {
+                        throw new MalformedChunkedRequestException("分块请求行未以 CRLF 结束。");
+                    }
+
+                    return Encoding.ASCII.GetString(bytes, 0, bytes.Length - 1);
                 }
 
                 line.WriteByte(one[0]);
             }
 
-            throw new IOException("请求头行过长。");
+            throw new MalformedChunkedRequestException("分块请求行过长。");
         }
 
         public async Task ReadExactlyAsync(Memory<byte> destination, CancellationToken cancellationToken)

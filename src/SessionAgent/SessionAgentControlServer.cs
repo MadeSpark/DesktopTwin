@@ -9,9 +9,11 @@ using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
 
@@ -27,18 +29,31 @@ namespace DesktopTwinSessionAgent
     {
         private const int MaxRequestBytes = 8 * 1024 * 1024;
         private const int MaxResponseBytes = 64 * 1024 * 1024;
+        private const int ChallengeBytes = 32;
+        private const int HandshakeTimeoutMilliseconds = 15000;
+        private const int FrameTimeoutMilliseconds = 15000;
         private readonly string _pipeName;
+        private readonly int _hostSessionId;
         private readonly Action<string> _log;
         private Thread _thread;
 
-        public SessionAgentControlServer(string pipeName, Action<string> log)
+        public SessionAgentControlServer(
+            string pipeName,
+            int hostSessionId,
+            Action<string> log)
         {
             if (String.IsNullOrWhiteSpace(pipeName) || pipeName.Length > 200)
             {
                 throw new ArgumentException("控制管道名称无效。", "pipeName");
             }
 
+            if (hostSessionId <= 0)
+            {
+                throw new ArgumentException("控制通道宿主会话必须是正整数。", "hostSessionId");
+            }
+
             _pipeName = pipeName;
+            _hostSessionId = hostSessionId;
             _log = log;
         }
 
@@ -103,6 +118,11 @@ namespace DesktopTwinSessionAgent
 
         private void HandleConnection(NamedPipeServerStream pipe)
         {
+            if (!IsAuthorizedClient(pipe))
+            {
+                return;
+            }
+
             var requestBytes = ReadFrame(pipe, MaxRequestBytes);
             if (requestBytes == null || requestBytes.Length == 0)
             {
@@ -164,9 +184,81 @@ namespace DesktopTwinSessionAgent
             };
         }
 
+        private bool IsAuthorizedClient(NamedPipeServerStream pipe)
+        {
+            uint clientSessionId;
+            if (!GetNamedPipeClientSessionId(pipe.SafePipeHandle, out clientSessionId))
+            {
+                Log("拒绝控制管道连接：无法读取客户端会话身份。");
+                return false;
+            }
+
+            if (clientSessionId != (uint)_hostSessionId)
+            {
+                Log("拒绝控制管道连接：客户端 Session=" + clientSessionId
+                    + "，期望 " + _hostSessionId + "。");
+                return false;
+            }
+
+            var challenge = new byte[ChallengeBytes];
+            using (var random = RandomNumberGenerator.Create())
+            {
+                random.GetBytes(challenge);
+            }
+
+            var deadline = GetDeadline(HandshakeTimeoutMilliseconds);
+            WriteFrame(pipe, challenge, deadline);
+            var response = ReadFrame(pipe, ChallengeBytes, deadline);
+            if (response == null || response.Length != ChallengeBytes)
+            {
+                Log("拒绝控制管道连接：挑战响应缺失或长度无效。");
+                return false;
+            }
+
+            byte[] expected;
+            using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_pipeName)))
+            {
+                expected = hmac.ComputeHash(challenge);
+            }
+
+            if (!FixedTimeEquals(response, expected))
+            {
+                Log("拒绝控制管道连接：挑战响应不匹配。");
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool FixedTimeEquals(byte[] left, byte[] right)
+        {
+            if (left == null || right == null || left.Length != right.Length)
+            {
+                return false;
+            }
+
+            var difference = 0;
+            for (var i = 0; i < left.Length; i++)
+            {
+                difference |= left[i] ^ right[i];
+            }
+
+            return difference == 0;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetNamedPipeClientSessionId(
+            Microsoft.Win32.SafeHandles.SafePipeHandle pipe,
+            out uint clientSessionId);
+
         private static byte[] ReadFrame(Stream pipe, int maxBytes)
         {
-            var lengthBytes = ReadExact(pipe, 4);
+            return ReadFrame(pipe, maxBytes, GetDeadline(FrameTimeoutMilliseconds));
+        }
+
+        private static byte[] ReadFrame(Stream pipe, int maxBytes, long deadline)
+        {
+            var lengthBytes = ReadExact(pipe, 4, deadline);
             if (lengthBytes == null)
             {
                 return null;
@@ -178,16 +270,18 @@ namespace DesktopTwinSessionAgent
                 throw new IOException("控制请求长度无效。");
             }
 
-            return ReadExact(pipe, length);
+            return ReadExact(pipe, length, deadline);
         }
 
-        private static byte[] ReadExact(Stream stream, int count)
+        private static byte[] ReadExact(Stream stream, int count, long deadline)
         {
             var buffer = new byte[count];
             var offset = 0;
             while (offset < count)
             {
-                var read = stream.Read(buffer, offset, count - offset);
+                var readTask = stream.ReadAsync(buffer, offset, count - offset);
+                WaitForIo(readTask, deadline, "控制管道读取");
+                var read = readTask.Result;
                 if (read == 0)
                 {
                     return null;
@@ -197,6 +291,38 @@ namespace DesktopTwinSessionAgent
             }
 
             return buffer;
+        }
+
+        private static long GetDeadline(int timeoutMilliseconds)
+        {
+            return Stopwatch.GetTimestamp()
+                + (long)(timeoutMilliseconds * (double)Stopwatch.Frequency / 1000.0);
+        }
+
+        private static void WaitForIo(Task task, long deadline, string action)
+        {
+            var remainingTicks = deadline - Stopwatch.GetTimestamp();
+            var remainingMilliseconds = remainingTicks <= 0
+                ? 0
+                : (int)Math.Min(
+                    Int32.MaxValue,
+                    Math.Ceiling(remainingTicks * 1000.0 / Stopwatch.Frequency));
+            try
+            {
+                if (!task.Wait(remainingMilliseconds))
+                {
+                    task.ContinueWith(
+                        completed => { var ignored = completed.Exception; },
+                        TaskContinuationOptions.OnlyOnFaulted);
+                    throw new IOException(action + "超时。");
+                }
+            }
+            catch (AggregateException exception)
+            {
+                throw new IOException(
+                    action + "失败: " + exception.GetBaseException().Message,
+                    exception.GetBaseException());
+            }
         }
 
         private static void WriteError(
@@ -224,16 +350,37 @@ namespace DesktopTwinSessionAgent
 
         private static void WriteFrame(Stream pipe, string json)
         {
-            var payload = Encoding.UTF8.GetBytes(json);
+            WriteFrame(pipe, Encoding.UTF8.GetBytes(json));
+        }
+
+        private static void WriteFrame(Stream pipe, byte[] payload)
+        {
+            WriteFrame(pipe, payload, GetDeadline(FrameTimeoutMilliseconds));
+        }
+
+        private static void WriteFrame(Stream pipe, byte[] payload, long deadline)
+        {
             if (payload.Length > MaxResponseBytes)
             {
                 throw new IOException("控制响应超过 64 MiB 上限。");
             }
 
-            var length = BitConverter.GetBytes(payload.Length);
-            pipe.Write(length, 0, length.Length);
-            pipe.Write(payload, 0, payload.Length);
-            pipe.Flush();
+            WriteExact(pipe, BitConverter.GetBytes(payload.Length), deadline);
+            WriteExact(pipe, payload, deadline);
+            var flushTask = pipe.FlushAsync();
+            WaitForIo(flushTask, deadline, "控制管道刷新");
+        }
+
+        private static void WriteExact(Stream stream, byte[] payload, long deadline)
+        {
+            var offset = 0;
+            while (offset < payload.Length)
+            {
+                var count = payload.Length - offset;
+                var writeTask = stream.WriteAsync(payload, offset, count);
+                WaitForIo(writeTask, deadline, "控制管道写入");
+                offset += count;
+            }
         }
 
         private object Execute(string operation, Dictionary<string, object> args)
@@ -351,6 +498,7 @@ namespace DesktopTwinSessionAgent
     /// </summary>
     internal static class DesktopOperations
     {
+        private const int MaxClipboardTextCharacters = 1000000;
         private static readonly int InputSize = Marshal.SizeOf(typeof(DesktopNative.Input));
         private static readonly Dictionary<string, int> NamedKeys = BuildNamedKeys();
         private static readonly HashSet<int> ExtendedKeys = BuildExtendedKeys();
@@ -897,12 +1045,21 @@ namespace DesktopTwinSessionAgent
             {
                 FileName = target,
                 Arguments = GetString(args, "arguments", false) ?? String.Empty,
-                UseShellExecute = true
+                // 不经 Explorer/DDE，确保新进程直接创建在分身会话中。
+                UseShellExecute = false
             };
             var workingDirectory = GetString(args, "workingDirectory", false);
             if (!String.IsNullOrWhiteSpace(workingDirectory))
             {
                 startInfo.WorkingDirectory = workingDirectory;
+            }
+            else if (Path.IsPathRooted(target))
+            {
+                var targetDirectory = Path.GetDirectoryName(target);
+                if (!String.IsNullOrWhiteSpace(targetDirectory))
+                {
+                    startInfo.WorkingDirectory = targetDirectory;
+                }
             }
 
             try
@@ -978,6 +1135,13 @@ namespace DesktopTwinSessionAgent
             return RetryClipboard(delegate
             {
                 var text = Clipboard.ContainsText() ? Clipboard.GetText() : String.Empty;
+                if (text.Length > MaxClipboardTextCharacters)
+                {
+                    throw new AgentOperationException(
+                        "clipboard_too_large",
+                        "剪贴板文本超过 " + MaxClipboardTextCharacters + " 字符上限，拒绝读取。");
+                }
+
                 return new Dictionary<string, object> { { "text", text } };
             });
         }
@@ -985,9 +1149,11 @@ namespace DesktopTwinSessionAgent
         public static object ClipboardWrite(Dictionary<string, object> args)
         {
             var text = GetString(args, "text", true);
-            if (text.Length > 1000000)
+            if (text.Length > MaxClipboardTextCharacters)
             {
-                throw new AgentOperationException("invalid_arguments", "剪贴板文本超过 1000000 字符上限。");
+                throw new AgentOperationException(
+                    "invalid_arguments",
+                    "剪贴板文本超过 " + MaxClipboardTextCharacters + " 字符上限。");
             }
 
             return RetryClipboard(delegate
@@ -1165,6 +1331,36 @@ namespace DesktopTwinSessionAgent
             if (!DesktopNative.IsWindow(window))
             {
                 throw new AgentOperationException("invalid_window", "窗口不存在或已经关闭。");
+            }
+
+            int processId;
+            if (DesktopNative.GetWindowThreadProcessId(window, out processId) == 0 || processId <= 0)
+            {
+                throw new AgentOperationException("invalid_window", "窗口不属于可控制的桌面进程。");
+            }
+
+            try
+            {
+                using (var process = Process.GetProcessById(processId))
+                {
+                    if (process.SessionId != Process.GetCurrentProcess().SessionId)
+                    {
+                        throw new AgentOperationException("invalid_window", "窗口不属于当前分身会话。");
+                    }
+                }
+            }
+            catch (ArgumentException)
+            {
+                throw new AgentOperationException("invalid_window", "窗口所属进程已经退出。");
+            }
+            catch (InvalidOperationException)
+            {
+                throw new AgentOperationException("invalid_window", "无法确认窗口所属进程。");
+            }
+
+            if (DesktopNative.GetAncestor(window, 2) != window)
+            {
+                throw new AgentOperationException("invalid_window", "只能操作顶层窗口。");
             }
 
             return window;

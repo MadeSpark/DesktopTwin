@@ -2,6 +2,8 @@ using System;
 using System.Buffers.Binary;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -60,7 +62,8 @@ internal sealed class SessionAgentControlClient : IMcpAgentBridge
 {
     private const int MaxRequestBytes = 8 * 1024 * 1024;
     private const int MaxResponseBytes = 64 * 1024 * 1024;
-    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(3);
+    private const int ChallengeBytes = 32;
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(5);
 
     /// <inheritdoc />
     public async Task<McpAgentResult> ExecuteAsync(
@@ -96,6 +99,7 @@ internal sealed class SessionAgentControlClient : IMcpAgentBridge
             using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             connectTimeout.CancelAfter(ConnectTimeout);
             await pipe.ConnectAsync(connectTimeout.Token).ConfigureAwait(false);
+            await AuthenticateAsync(pipe, pipeName, connectTimeout.Token).ConfigureAwait(false);
 
             var frame = new byte[4 + payload.Length];
             BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length);
@@ -154,6 +158,35 @@ internal sealed class SessionAgentControlClient : IMcpAgentBridge
                 "agent_unavailable",
                 "无法连接分身代理。请确认分身已登录并保持运行。");
         }
+    }
+
+    private static async Task AuthenticateAsync(
+        Stream pipe,
+        string pipeName,
+        CancellationToken cancellationToken)
+    {
+        var lengthBuffer = new byte[4];
+        await ReadExactAsync(pipe, lengthBuffer, cancellationToken).ConfigureAwait(false);
+        var challengeLength = BinaryPrimitives.ReadInt32LittleEndian(lengthBuffer);
+        if (challengeLength != ChallengeBytes)
+        {
+            throw new IOException("分身代理返回了无效的认证挑战。");
+        }
+
+        var challenge = new byte[ChallengeBytes];
+        await ReadExactAsync(pipe, challenge, cancellationToken).ConfigureAwait(false);
+
+        byte[] response;
+        using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(pipeName)))
+        {
+            response = hmac.ComputeHash(challenge);
+        }
+
+        var frame = new byte[4 + response.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(frame, response.Length);
+        response.CopyTo(frame.AsSpan(4));
+        await pipe.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+        await pipe.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task ReadExactAsync(

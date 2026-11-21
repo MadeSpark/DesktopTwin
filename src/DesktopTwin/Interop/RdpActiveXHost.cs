@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -90,7 +90,8 @@ internal sealed class RdpActiveXHost : AxHost
     }
 
     internal void ConnectToChildSession(DrawingSize desktopSize)
-    {        if (ConnectedState != 0)
+    {
+        if (ConnectedState != 0)
         {
             return;
         }
@@ -111,25 +112,26 @@ internal sealed class RdpActiveXHost : AxHost
 
         var securedSettings = GetComProperty(client, "SecuredSettings2")
             ?? throw new COMException(Locale.Get("Rdp.Error.SecuredSettings"));
+        // 观看模式必须把键盘钩子留在远程会话内。SendSystemShortcutsToRemote
+        // 只影响控制模式；用户以前存下的 true 不能在观看/MCP 模式下恢复本机钩子。
+        var hookMode = GetSafeKeyboardHookMode(
+            _sendSystemShortcutsToRemote,
+            _inputBlocked);
         RunComStep(Locale.Get("Rdp.Step.ShortcutTarget"), () =>
         {
-            var hookMode = _sendSystemShortcutsToRemote ? 1 : 0;
             SetComProperty(securedSettings, "KeyboardHookMode", hookMode);
 
-            // 读回来确认：这个属性决定 RDP 是否装键盘钩子。
-            // 装了就表示组合键会被转发进远程会话，本地全局热键随之失效——
-            // 用户报「在分身里按热键没反应」时，这一行是第一个要看的地方。
-            try
+            // 这个属性既决定 RDP 是否安装本机键盘钩子，也决定组合键是否转发到
+            // 远程会话。观看模式下读不回来或值不一致时不能继续连接，否则本地
+            // 热键可能被远程会话截获。
+            var actual = GetComProperty(securedSettings, "KeyboardHookMode");
+            if (!MatchesKeyboardHookMode(actual, hookMode))
             {
-                var actual = GetComProperty(securedSettings, "KeyboardHookMode");
-                AppLog.Info($"KeyboardHookMode 已写入 {hookMode}，读回 {actual ?? "(空)"}。");
+                throw new COMException(
+                    $"KeyboardHookMode 读回 {actual ?? "(空)"}，期望 {hookMode}。");
             }
-            catch (Exception exception) when (exception is COMException
-                                                  or MissingMemberException
-                                                  or InvalidCastException)
-            {
-                AppLog.Warn("KeyboardHookMode 读回失败，无法确认是否生效。", exception);
-            }
+
+            AppLog.Info($"KeyboardHookMode 已写入 {hookMode}，读回 {actual}。");
         });
         RunComStep(Locale.Get("Rdp.Step.AudioRedirection"), () =>
             SetComProperty(
@@ -146,6 +148,18 @@ internal sealed class RdpActiveXHost : AxHost
                 ChildSessionNativeMethods.GetConfiguredRdpPort()));
         RunComStep(Locale.Get("Rdp.Step.CredSsp"), () =>
             SetComProperty(advancedSettings, "EnableCredSspSupport", true));
+        RunComStep(Locale.Get("Rdp.Step.ClipboardRedirect"), () =>
+        {
+            // RDP 剪贴板重定向默认开启。若不显式关闭，分身里的剪贴板读写会
+            // 经 RDP 通道桥接主桌面，违背“只操作分身”的隔离承诺。
+            SetComProperty(advancedSettings, "RedirectClipboard", false);
+            var actual = GetComProperty(advancedSettings, "RedirectClipboard");
+            if (!IsConfirmedFalse(actual))
+            {
+                throw new COMException(
+                    $"RDP 剪贴板重定向读回 {actual ?? "(空)"}，拒绝建立隔离。");
+            }
+        });
         RunComStep(Locale.Get("Rdp.Step.RemoteWindowsKey"), () =>
             SetComProperty(advancedSettings, "EnableWindowsKey", 1));
         // 每次连接重新确认设置，同时作废上一连接遗留的异步重排。
@@ -160,21 +174,30 @@ internal sealed class RdpActiveXHost : AxHost
             extendedSettings.set_Property("ConnectToChildSession", ref connectToChildSession);
         });
 
-        ApplyCredentials(client);
+        // 写入后、原生 Connect 前再读回一次。若控件在配置过程中改写了隔离属性，
+        // 这里必须终止连接；测试也以该入口证明失败时 Connect 不会被调用。
+        RunIsolationPreflightBeforeConnect(
+            hookMode,
+            () => GetComProperty(securedSettings, "KeyboardHookMode"),
+            () => GetComProperty(advancedSettings, "RedirectClipboard"),
+            () =>
+            {
+                ApplyCredentials(client);
 
-        _connectionAttemptInProgress = true;
-        _connectionFailureReported = false;
-        _lastConnectionDiagnostic = null;
-        _disconnectRequested = false;
-        try
-        {
-            RunComStep(Locale.Get("Rdp.Step.Connect"), () => InvokeComMethod(client, "Connect"));
-        }
-        catch
-        {
-            _connectionAttemptInProgress = false;
-            throw;
-        }
+                _connectionAttemptInProgress = true;
+                _connectionFailureReported = false;
+                _lastConnectionDiagnostic = null;
+                _disconnectRequested = false;
+                try
+                {
+                    RunComStep(Locale.Get("Rdp.Step.Connect"), () => InvokeComMethod(client, "Connect"));
+                }
+                catch
+                {
+                    _connectionAttemptInProgress = false;
+                    throw;
+                }
+            });
     }
 
     internal void SendShowDesktopShortcut()
@@ -254,25 +277,184 @@ internal sealed class RdpActiveXHost : AxHost
         _sendSystemShortcutsToRemote = enabled;
     }
 
+    /// <summary>
+    /// 计算本次连接必须写入的 RDP KeyboardHookMode。屏蔽本机输入期间
+    /// 无条件选择 0；控制模式才允许根据系统组合键设置安装本机钩子。
+    /// </summary>
+    internal static int GetSafeKeyboardHookMode(
+        bool sendSystemShortcutsToRemote,
+        bool inputBlocked)
+    {
+        return inputBlocked || !sendSystemShortcutsToRemote ? 0 : 1;
+    }
+
+    /// <summary>
+    /// 只接受确实读回且与期望一致的 KeyboardHookMode。COM 缺少该属性时
+    /// 可能返回 null，不能把它静默转换为 0 后误判为已建立隔离。
+    /// </summary>
+    internal static bool MatchesKeyboardHookMode(object? actual, int expected)
+    {
+        if (actual is null)
+        {
+            return false;
+        }
+
+        return actual switch
+        {
+            sbyte value => value == expected,
+            byte value => value == expected,
+            short value => value == expected,
+            ushort value => value == expected,
+            int value => value == expected,
+            uint value => value == expected,
+            long value => value == expected,
+            ulong value => value == (ulong)expected,
+            _ => false
+        };
+    }
+
+    /// <summary>
+    /// 在触发 RDP 原生 <c>Connect</c> 前重新读回两项隔离属性。
+    /// 任一读回缺失、类型异常或不匹配时都必须抛错且不得调用 <c>connect</c>。
+    /// </summary>
+    internal static void RunIsolationPreflightBeforeConnect(
+        int expectedKeyboardHookMode,
+        Func<object?> readKeyboardHookMode,
+        Func<object?> readClipboardRedirect,
+        Action connect)
+    {
+        ArgumentNullException.ThrowIfNull(readKeyboardHookMode);
+        ArgumentNullException.ThrowIfNull(readClipboardRedirect);
+        ArgumentNullException.ThrowIfNull(connect);
+
+        var hookMode = readKeyboardHookMode();
+        if (!MatchesKeyboardHookMode(hookMode, expectedKeyboardHookMode))
+        {
+            throw new COMException(
+                $"连接前 KeyboardHookMode 读回 {hookMode ?? "(空)"}，期望 {expectedKeyboardHookMode}。");
+        }
+
+        var clipboardRedirect = readClipboardRedirect();
+        if (!IsConfirmedFalse(clipboardRedirect))
+        {
+            throw new COMException(
+                $"连接前 RDP 剪贴板重定向读回 {clipboardRedirect ?? "(空)"}，拒绝建立隔离。");
+        }
+
+        connect();
+    }
+
+    /// <summary>
+    /// 只接受确实读回为 false 的布尔属性；属性缺失、类型异常或值为 true
+    /// 都必须阻止连接，不能把 null 转换成 false。
+    /// </summary>
+    internal static bool IsConfirmedFalse(object? actual)
+    {
+        if (actual is null)
+        {
+            return false;
+        }
+
+        return actual is bool value && !value;
+    }
+
     internal void SetAudioMuted(bool muted)
     {
         _audioMuted = muted;
     }
 
     /// <summary>
+    /// 立即把当前期望的 KeyboardHookMode 写入 RDP 控件并读回。
+    /// 失败返回 false；调用方必须把它当成隔离未建立，而不是只记录设置值。
+    /// </summary>
+    private bool TryApplyKeyboardHookMode(bool inputBlocked)
+    {
+        if (!IsHandleCreated)
+        {
+            return true;
+        }
+
+        var hookMode = GetSafeKeyboardHookMode(_sendSystemShortcutsToRemote, inputBlocked);
+        try
+        {
+            var client = GetRequiredOcx();
+            var securedSettings = GetComProperty(client, "SecuredSettings2")
+                                 ?? throw new COMException(
+                                     Locale.Get("Rdp.Error.SecuredSettings"));
+            SetComProperty(securedSettings, "KeyboardHookMode", hookMode);
+            var actual = GetComProperty(securedSettings, "KeyboardHookMode");
+            if (!MatchesKeyboardHookMode(actual, hookMode))
+            {
+                AppLog.Warn(
+                    $"KeyboardHookMode 读回 {actual ?? "(空)"}，期望 {hookMode}，拒绝建立输入隔离。");
+                return false;
+            }
+
+            AppLog.Info($"KeyboardHookMode 已即时写入 {hookMode}，读回 {actual}。");
+            return true;
+        }
+        catch (Exception exception) when (exception is COMException
+                                              or MissingMemberException
+                                              or InvalidCastException
+                                              or InvalidOperationException)
+        {
+            AppLog.Warn("KeyboardHookMode 即时应用失败，拒绝建立输入隔离。", exception);
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 屏蔽或恢复本机进入桌面分身的鼠标键盘输入。期望状态会被记住，
     /// 每次连接登录后由 ChildSessionService 重新施加。
     /// </summary>
-    internal void SetInputBlocked(bool blocked)
+    internal RdpInputWindowApplyResult SetInputBlocked(bool blocked)
     {
-        _inputBlocked = blocked;
-        if (!IsHandleCreated)
+        if (!TryApplyKeyboardHookMode(blocked))
         {
-            AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄未创建，仅记录期望状态。");
-            return;
+            // 未确认键盘钩子范围时只能维持更严格的阻断状态。
+            _inputBlocked = true;
+            return RdpInputWindowApplyResult.Failed;
         }
 
-        ChildSessionNativeMethods.SetRdpInputWindowEnabled(Handle, !blocked);
+        if (!IsHandleCreated)
+        {
+            _inputBlocked = blocked;
+            AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄未创建，仅记录期望状态。");
+            return blocked
+                ? RdpInputWindowApplyResult.WindowMissing
+                : RdpInputWindowApplyResult.Applied;
+        }
+
+        var result = ChildSessionNativeMethods.SetRdpInputWindowEnabled(Handle, !blocked);
+        if (result == RdpInputWindowApplyResult.WindowMissing)
+        {
+            // 未登录或新连接尚未创建输入窗口时没有可接收本机输入的 RDP 子窗口。
+            // 记录期望状态，登录完成后再强制施加并读回。
+            _inputBlocked = blocked;
+            AppLog.Info(
+                $"SetInputBlocked: blocked={blocked}，Input Capture Window 尚未创建，"
+                + $"仅记录期望状态（控件句柄 0x{Handle:X}）。");
+            return result;
+        }
+
+        if (result != RdpInputWindowApplyResult.Applied)
+        {
+            // 找到了窗口却无法读回目标状态时按最安全的解释处理：认为输入窗口仍被屏蔽。
+            // 若这次原本要解除屏蔽，刚才可能已把 KeyboardHookMode 写成 1；
+            // 因此必须立即把钩子模式压回 0，不能留下一个失败的半解除状态。
+            _inputBlocked = true;
+            if (!blocked && !TryApplyKeyboardHookMode(inputBlocked: true))
+            {
+                AppLog.Warn("解除输入屏蔽失败后，KeyboardHookMode 也未能回滚为 0。");
+            }
+
+            AppLog.Warn(
+                $"SetInputBlocked 未能验证目标状态：blocked={blocked}，result={result}，"
+                + $"控件句柄 0x{Handle:X}。");
+            return result;
+        }
+
+        _inputBlocked = blocked;
 
         // 解除阻止后把焦点交还给输入窗口：被禁用期间 Windows 已把焦点移走，
         // 仅重新启用输入窗口不会让 RDP 自动恢复输入转发，必须让它重新持有焦点，
@@ -288,7 +470,19 @@ internal sealed class RdpActiveXHost : AxHost
         {
             AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄 0x{Handle:X}。");
         }
+
+        return RdpInputWindowApplyResult.Applied;
     }
+
+    /// <summary>
+    /// 登录完成后重新施加已记录的输入屏蔽状态，并返回是否已通过原生窗口读回验证。
+    /// </summary>
+    internal bool TryReapplyInputBlockState()
+    {
+        return SetInputBlocked(_inputBlocked) == RdpInputWindowApplyResult.Applied;
+    }
+
+    internal bool InputBlocked => _inputBlocked;
 
     /// <summary>
     /// 清掉「正在断开」的排队状态。
@@ -445,28 +639,20 @@ internal sealed class RdpActiveXHost : AxHost
                 Locale.Format("Rdp.Error.CannotSend", displayName));
         }
 
-        // 组合键由调用方显式发起，发送期间短暂恢复输入窗口，发完立刻回到屏蔽状态。
+        // 观看模式下绝不为了组合键短暂打开 RDP 输入窗口。否则本机键鼠会在
+        // 发送窗口内重新挂到远程会话，MCP 并发注入时尤其无法证明输入隔离。
         if (_inputBlocked)
         {
-            ChildSessionNativeMethods.SetRdpInputWindowEnabled(Handle, true);
+            throw new InvalidOperationException(
+                Locale.Get("Rdp.Error.ShortcutBlockedByWatchMode"));
         }
 
-        try
+        if (!ChildSessionNativeMethods.TryFocusRdpInputWindow(Handle))
         {
-            if (!ChildSessionNativeMethods.TryFocusRdpInputWindow(Handle))
-            {
-                throw new InvalidOperationException(Locale.Get("Rdp.Error.CannotFocus"));
-            }
+            throw new InvalidOperationException(Locale.Get("Rdp.Error.CannotFocus"));
+        }
 
-            RunComStep($"向 Child Session 发送 {displayName}", () => SendKeyStrokes(strokes));
-        }
-        finally
-        {
-            if (_inputBlocked)
-            {
-                ChildSessionNativeMethods.SetRdpInputWindowEnabled(Handle, false);
-            }
-        }
+        RunComStep($"向 Child Session 发送 {displayName}", () => SendKeyStrokes(strokes));
     }
 
     private void SendKeyStrokes(KeyStroke[] strokes)
@@ -604,8 +790,10 @@ internal sealed class RdpActiveXHost : AxHost
 
         while (DateTime.UtcNow < deadline)
         {
-            var sessionId = ChildSessionNativeMethods.TryGetChildSessionId();
-            if (sessionId is null || !ChildSessionNativeMethods.IsSessionActive(sessionId.Value))
+            // WTS 查询失败不等于会话已经释放。查询故障时继续等待到超时，
+            // 绝不能把不确定性当成「可以立刻重连」。
+            if (ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId)
+                && (sessionId is null || !ChildSessionNativeMethods.IsSessionActive(sessionId.Value)))
             {
                 return;
             }

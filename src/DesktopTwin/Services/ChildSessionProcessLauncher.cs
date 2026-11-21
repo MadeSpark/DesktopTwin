@@ -25,13 +25,24 @@ public static class ChildSessionProcessLauncher
     private const string TaskNamePrefix = "DesktopTwin-SessionLaunch-";
 
     /// <summary>
-    /// 清扫时要认的任务名前缀。
-    ///
-    /// 除了本类创建的 <see cref="TaskNamePrefix"/>，分身端代理用的
-    /// <c>DesktopTwin-SessionAgent-</c> 也是同一种一次性任务——
-    /// 不清扫的话，程序异常退出会让它们一直躺在任务计划程序里。
+    /// 分身端代理使用的临时计划任务前缀。
     /// </summary>
-    private const string CommonTaskNamePrefix = "DesktopTwin-";
+    private const string SessionAgentTaskNamePrefix = "DesktopTwin-SessionAgent-";
+
+    /// <summary>
+    /// 本程序注册临时任务时写入的作者。创建和清扫都必须使用这一份常量。
+    /// </summary>
+    internal const string TaskAuthor = "DesktopTwin";
+
+    /// <summary>
+    /// 本程序注册临时任务时写入的描述前缀。创建和清扫都必须使用这一份常量。
+    /// </summary>
+    internal const string TaskDescriptionPrefix = "临时启动 ";
+
+    /// <summary>
+    /// 临时任务描述中文件名与会话号之间的分隔符。
+    /// </summary>
+    internal const string TaskDescriptionSessionSeparator = " 到分身会话 ";
 
     /// <summary>
     /// 临时任务的延迟清理时间：要留够「任务真正拉起进程」的余量。
@@ -137,6 +148,21 @@ public static class ChildSessionProcessLauncher
     }
 
     /// <summary>
+    /// 可注入的任务计划程序根目录视图。
+    ///
+    /// 生产实现只负责 COM 读写；所有“该不该删”的判定都在不接触 COM 的
+    /// <see cref="SweepOrphanTasks(IOrphanTaskFolder)"/> 里，测试可以安全地注入假实现。
+    /// </summary>
+    internal interface IOrphanTaskFolder
+    {
+        IReadOnlyList<string> GetTaskNames();
+
+        bool TryGetRegistrationInfo(string taskName, out string? author, out string? description);
+
+        void DeleteTask(string taskName);
+    }
+
+    /// <summary>
     /// 清扫上一次异常退出遗留的临时计划任务。
     ///
     /// 正常流程会在启动后立刻删除任务；如果进程在注册与删除之间被结束，任务就会留在系统里。
@@ -168,25 +194,12 @@ public static class ChildSessionProcessLauncher
             dynamic scheduler = schedulerObject;
             scheduler.Connect();
             rootFolderObject = scheduler.GetFolder("\\");
-            dynamic rootFolder = rootFolderObject;
-
-            foreach (var taskName in EnumerateTaskNames(rootFolder))
+            if (rootFolderObject is null)
             {
-                if (!taskName.StartsWith(CommonTaskNamePrefix, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    rootFolder.DeleteTask(taskName, 0);
-                    AppLog.Info($"已清理残留的临时计划任务 {taskName}");
-                }
-                catch (COMException exception)
-                {
-                    AppLog.Warn($"清理残留计划任务 {taskName} 失败。", exception);
-                }
+                return;
             }
+
+            SweepOrphanTasks(new ComOrphanTaskFolder(rootFolderObject));
         }
         catch (InvalidOperationException exception)
         {
@@ -194,16 +207,215 @@ public static class ChildSessionProcessLauncher
             // 但要留下记录：真正启动程序时同一个守卫会再次拦下。
             AppLog.Warn("跳过残留计划任务清扫：COM 注册未通过校验。", exception);
         }
-        catch (Exception exception) when (exception is COMException
-                                              or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException
-                                              or InvalidCastException)
+        catch (Exception exception)
         {
+            // 清扫是启动时的尽力而为操作：COM 不可用、权限被拒或任务已被并发删除，
+            // 都不能让进程崩掉，更不能在不确定来源时删除任务。
             AppLog.Warn("清扫残留计划任务失败，忽略。", exception);
         }
         finally
         {
             ReleaseComObject(rootFolderObject);
             ReleaseComObject(schedulerObject);
+        }
+    }
+
+    /// <summary>
+    /// 不接触真实任务计划程序的清扫核心。任何读取或删除失败都只跳过当前候选。
+    /// </summary>
+    internal static void SweepOrphanTasks(IOrphanTaskFolder folder)
+    {
+        ArgumentNullException.ThrowIfNull(folder);
+
+        string[] taskNames;
+        try
+        {
+            taskNames = [.. folder.GetTaskNames()];
+        }
+        catch (Exception exception)
+        {
+            AppLog.Warn("枚举残留计划任务失败，跳过清扫。", exception);
+            return;
+        }
+
+        foreach (var taskName in taskNames)
+        {
+            if (!IsManagedTemporaryTaskName(taskName))
+            {
+                continue;
+            }
+
+            bool metadataRead;
+            string? author;
+            string? description;
+            try
+            {
+                metadataRead = folder.TryGetRegistrationInfo(taskName, out author, out description);
+            }
+            catch (Exception exception)
+            {
+                AppLog.Warn($"读取临时计划任务 {taskName} 的注册信息失败，跳过清扫。", exception);
+                continue;
+            }
+
+            if (!metadataRead)
+            {
+                AppLog.Warn($"临时计划任务 {taskName} 的注册信息不可读取，跳过清扫。");
+                continue;
+            }
+
+            if (!HasExpectedTaskRegistrationInfo(author, description))
+            {
+                AppLog.Warn($"临时计划任务 {taskName} 的作者或描述不是 DesktopTwin 写入的，跳过清扫。");
+                continue;
+            }
+
+            try
+            {
+                folder.DeleteTask(taskName);
+                AppLog.Info($"已清理残留的临时计划任务 {taskName}");
+            }
+            catch (Exception exception)
+            {
+                AppLog.Warn($"清理残留计划任务 {taskName} 失败。", exception);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 只接受本程序创建的两类任务名，且后缀必须恰好是 32 位十六进制 GUID。
+    /// 名称大小写与 GUID 大小写均按 Windows 任务计划程序的实际语义处理：
+    /// 前缀必须精确，GUID 的 a-f 允许大小写。
+    /// </summary>
+    internal static bool IsManagedTemporaryTaskName(string? taskName)
+    {
+        if (taskName is null)
+        {
+            return false;
+        }
+
+        ReadOnlySpan<char> suffix;
+        if (taskName.StartsWith(TaskNamePrefix, StringComparison.Ordinal))
+        {
+            suffix = taskName.AsSpan(TaskNamePrefix.Length);
+        }
+        else if (taskName.StartsWith(SessionAgentTaskNamePrefix, StringComparison.Ordinal))
+        {
+            suffix = taskName.AsSpan(SessionAgentTaskNamePrefix.Length);
+        }
+        else
+        {
+            return false;
+        }
+
+        if (suffix.Length != 32)
+        {
+            return false;
+        }
+
+        foreach (var character in suffix)
+        {
+            if (!char.IsAsciiHexDigit(character))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 校验注册信息是否由本程序写入，且描述符合创建时使用的固定格式。
+    /// 空字段、未知作者或任意自定义描述一律返回 false。
+    /// </summary>
+    internal static bool HasExpectedTaskRegistrationInfo(string? author, string? description)
+    {
+        if (!string.Equals(author, TaskAuthor, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(description)
+            || !description.StartsWith(TaskDescriptionPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var separatorIndex = description.LastIndexOf(
+            TaskDescriptionSessionSeparator,
+            StringComparison.Ordinal);
+        if (separatorIndex <= TaskDescriptionPrefix.Length)
+        {
+            return false;
+        }
+
+        var sessionIdText = description.AsSpan(
+            separatorIndex + TaskDescriptionSessionSeparator.Length);
+        return uint.TryParse(
+            sessionIdText,
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out _);
+    }
+
+    /// <summary>
+    /// 生成创建任务时写入的固定描述，供创建与清扫共用同一格式。
+    /// </summary>
+    internal static string BuildTaskDescription(string executablePath, uint childSessionId)
+    {
+        return TaskDescriptionPrefix
+            + Path.GetFileName(executablePath)
+            + TaskDescriptionSessionSeparator
+            + childSessionId.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private sealed class ComOrphanTaskFolder : IOrphanTaskFolder
+    {
+        private readonly object _rootFolderObject;
+
+        public ComOrphanTaskFolder(object rootFolderObject)
+        {
+            _rootFolderObject = rootFolderObject;
+        }
+
+        public IReadOnlyList<string> GetTaskNames()
+        {
+            return EnumerateTaskNames(_rootFolderObject);
+        }
+
+        public bool TryGetRegistrationInfo(
+            string taskName,
+            out string? author,
+            out string? description)
+        {
+            object? taskObject = null;
+            try
+            {
+                dynamic rootFolder = _rootFolderObject;
+                taskObject = rootFolder.GetTask(taskName);
+                if (taskObject is null)
+                {
+                    author = null;
+                    description = null;
+                    return false;
+                }
+
+                dynamic task = taskObject;
+                dynamic registrationInfo = task.Definition.RegistrationInfo;
+                author = registrationInfo.Author as string;
+                description = registrationInfo.Description as string;
+                return true;
+            }
+            finally
+            {
+                ReleaseComObject(taskObject);
+            }
+        }
+
+        public void DeleteTask(string taskName)
+        {
+            dynamic rootFolder = _rootFolderObject;
+            rootFolder.DeleteTask(taskName, 0);
         }
     }
 
@@ -240,7 +452,7 @@ public static class ChildSessionProcessLauncher
                                               or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException
                                               or InvalidCastException)
         {
-            // 枚举失败时返回已经拿到的部分，调用方只关心名字前缀匹配。
+            // 枚举失败时返回已经拿到的部分；每个名字随后还要经过精确名称与元数据双重校验。
             return [.. names];
         }
         finally
@@ -492,9 +704,9 @@ public static class ChildSessionProcessLauncher
             taskDefinitionObject = scheduler.NewTask(0);
             dynamic taskDefinition = taskDefinitionObject;
 
-            taskDefinition.RegistrationInfo.Author = "DesktopTwin";
+            taskDefinition.RegistrationInfo.Author = TaskAuthor;
             taskDefinition.RegistrationInfo.Description =
-                $"临时启动 {Path.GetFileName(executablePath)} 到分身会话 {childSessionId}";
+                BuildTaskDescription(executablePath, childSessionId);
 
             taskDefinition.Settings.Enabled = true;
             taskDefinition.Settings.Hidden = true;
