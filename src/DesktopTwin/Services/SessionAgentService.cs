@@ -81,6 +81,18 @@ internal sealed class SessionAgentService : IDisposable
     /// </summary>
     private const int AgentExitTimeoutMilliseconds = 5_000;
 
+    /// <summary>
+    /// 分身端进程探测结果。Absent 只代表当前会话内没有匹配项；
+    /// Conflict 和 Unknown 都必须失败关闭，不能触发一次重复启动。
+    /// </summary>
+    internal enum AgentProcessPresence
+    {
+        Absent,
+        Matching,
+        Conflict,
+        Unknown
+    }
+
     private readonly string _dataDirectory;
 
     /// <summary>
@@ -290,11 +302,34 @@ internal sealed class SessionAgentService : IDisposable
                     AppLog.Info("未发现需要替换的旧分身端，准备下发一次启动任务。");
                 }
             }
-            else if (HasLiveAgentProcess())
+            else
             {
-                // 同参数代理已在运行，继续复用；只有 NeedsRestart 才进入替换流程。
-                AppLog.Info("分身端已在运行，跳过本次拉起。");
-                return false;
+                // 不能复用 HasLiveAgentProcess 的 3 秒缓存：缓存里的 true 可能来自
+                // 同会话中路径相同的旧进程，而缓存过期前进程可能已经被替换。这里重新
+                // 枚举一次，并且只有「会话 + 完整镜像路径」都匹配才算已在运行。
+                var presence = ProbeAgentProcess();
+                if (presence == AgentProcessPresence.Matching)
+                {
+                    // 同参数代理已在运行，继续复用；只有 NeedsRestart 才进入替换流程。
+                    AppLog.Info("分身端已在运行，跳过本次拉起。");
+                    return false;
+                }
+
+                if (presence == AgentProcessPresence.Conflict)
+                {
+                    AppLog.Warn(
+                        "当前子会话存在同名但镜像路径不匹配的进程；为避免误杀或重复启动，"
+                        + "本次不下发分身端启动任务。");
+                    return false;
+                }
+
+                if (presence == AgentProcessPresence.Unknown)
+                {
+                    AppLog.Warn(
+                        "无法确认当前子会话中是否存在目标分身端；为避免重复启动，"
+                        + "本次不下发启动任务。");
+                    return false;
+                }
             }
 
             var ok = ChildSessionProcessLauncher.RunInSession(
@@ -360,14 +395,16 @@ internal sealed class SessionAgentService : IDisposable
     }
 
     /// <summary>
-    /// 分身会话里是否已经有分身端进程。
-    ///
+    /// 分身会话里是否已经有精确匹配 <see cref="AgentPath"/> 的分身端进程。
+    /// </summary>
+    /// <remarks>
     /// 不能靠互斥体判断：代理用的是 <c>Local\</c> 命名空间，会话内可见，
     /// 主程序所在的父会话根本打不开它。改成 <c>Global\</c> 又会让多个分身会话互相打架。
     ///
-    /// 必须按会话过滤：控制台登录时自启项也会跑一次代理，那个进程会立刻退出，
-    /// 不过滤就会把它当成「分身端还活着」。
-    /// </summary>
+    /// 必须同时按会话、完整镜像路径过滤：控制台登录时自启项也会跑一次代理，
+    /// 那个进程会立刻退出；同会话里还可能有同名旧文件、手工复制的 exe。只看
+    /// 进程名会把它们当成「分身端还活着」，从而永远不下发真正的启动任务。
+    /// </remarks>
     public bool HasLiveAgentProcess()
     {
         var now = Environment.TickCount64;
@@ -377,41 +414,94 @@ internal sealed class SessionAgentService : IDisposable
         }
 
         _lastAgentProbeTicks = now;
-        _lastAgentProbeResult = ProbeAgentProcess();
+        _lastAgentProbeResult = ProbeAgentProcess() == AgentProcessPresence.Matching;
         return _lastAgentProbeResult;
     }
 
-    private bool ProbeAgentProcess()
+    private AgentProcessPresence ProbeAgentProcess()
     {
-        var sessionId = ChildSessionNativeMethods.TryGetChildSessionId();
+        if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
+        {
+            // WTS 查询失败与「确认没有子会话」必须区分：前者不能触发一次盲目启动。
+            return AgentProcessPresence.Unknown;
+        }
+
         if (sessionId is null)
         {
-            return false;
+            return AgentProcessPresence.Absent;
         }
 
         var processName = Path.GetFileNameWithoutExtension(AgentFileName);
-        foreach (var process in Process.GetProcessesByName(processName))
+        Process[] candidates;
+        try
         {
-            try
+            candidates = Process.GetProcessesByName(processName);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+                                              or System.ComponentModel.Win32Exception
+                                              or NotSupportedException
+                                              or System.Security.SecurityException)
+        {
+            AppLog.Warn("无法枚举分身端候选进程，无法确认在线状态。", exception);
+            return AgentProcessPresence.Unknown;
+        }
+
+        var identities = new List<(int? SessionId, string? ImagePath)>();
+        try
+        {
+            foreach (var process in candidates)
             {
-                if ((uint)process.SessionId == sessionId.Value)
+                int? processSessionId = null;
+                try
                 {
-                    return true;
+                    processSessionId = process.SessionId;
                 }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    // 身份不可读的候选必须标记为未知，不能静默当作「不存在」。
+                    identities.Add((null, null));
+                    continue;
+                }
+
+                if (processSessionId <= 0)
+                {
+                    identities.Add((processSessionId, null));
+                    continue;
+                }
+
+                if ((uint)processSessionId.Value != sessionId.Value)
+                {
+                    continue;
+                }
+
+                string? processPath = null;
+                try
+                {
+                    processPath = process.MainModule?.FileName;
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    // 目标会话内的候选身份不完整，分类器会返回 Unknown 并失败关闭。
+                }
+
+                identities.Add((processSessionId, processPath));
             }
-            catch (Exception exception) when (exception is InvalidOperationException
-                                                  or System.ComponentModel.Win32Exception
-                                                  or NotSupportedException)
-            {
-                // 进程刚好退出或无权读取：跳过，不是错误。
-            }
-            finally
+        }
+        finally
+        {
+            foreach (var process in candidates)
             {
                 process.Dispose();
             }
         }
 
-        return false;
+        return ClassifyAgentProcessPresence(AgentPath, sessionId.Value, identities);
     }
 
     /// <summary>
@@ -622,6 +712,61 @@ internal sealed class SessionAgentService : IDisposable
         return TryNormalizeFullPath(expectedAgentPath, out var expectedPath)
                && TryNormalizeFullPath(processImagePath, out var actualPath)
                && string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 对一次进程枚举做三态分类。其他会话的候选被忽略；当前会话里路径精确
+    /// 相等才算 Matching。存在同会话同名但路径不同的进程是 Conflict；任何
+    /// 无法读取会话或镜像路径的候选、以及无效的期望路径都是 Unknown。匹配
+    /// 优先于未知，未知优先于冲突——只要存在一份可信的精确匹配就可以安全复用。
+    /// </summary>
+    internal static AgentProcessPresence ClassifyAgentProcessPresence(
+        string? expectedAgentPath,
+        uint childSessionId,
+        IEnumerable<(int? SessionId, string? ImagePath)> candidates)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        if (childSessionId == 0
+            || !TryNormalizeFullPath(expectedAgentPath, out var expectedPath))
+        {
+            return AgentProcessPresence.Unknown;
+        }
+
+        var hasConflict = false;
+        var hasUnknown = false;
+        foreach (var candidate in candidates)
+        {
+            if (candidate.SessionId is null || candidate.SessionId <= 0)
+            {
+                hasUnknown = true;
+                continue;
+            }
+
+            if ((uint)candidate.SessionId.Value != childSessionId)
+            {
+                continue;
+            }
+
+            if (!TryNormalizeFullPath(candidate.ImagePath, out var actualPath))
+            {
+                hasUnknown = true;
+                continue;
+            }
+
+            if (string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return AgentProcessPresence.Matching;
+            }
+
+            hasConflict = true;
+        }
+
+        if (hasUnknown)
+        {
+            return AgentProcessPresence.Unknown;
+        }
+
+        return hasConflict ? AgentProcessPresence.Conflict : AgentProcessPresence.Absent;
     }
 
     private static bool TryNormalizeFullPath(string? path, out string normalizedPath)

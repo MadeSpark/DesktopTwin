@@ -123,4 +123,68 @@ public sealed class SessionAgentServiceTests
             processSessionId: 0,
             processImagePath: AgentPath));
     }
+
+    [Fact]
+    public void 进程分类只把目标会话中的精确路径视为在线()
+    {
+        var result = SessionAgentService.ClassifyAgentProcessPresence(
+            AgentPath,
+            ChildSessionId,
+            [
+                (8, AgentPath),
+                (7, AgentPath)
+            ]);
+
+        Assert.Equal(SessionAgentService.AgentProcessPresence.Matching, result);
+    }
+
+    [Fact]
+    public void 同会话同名但路径不同时分类为冲突而不是在线()
+    {
+        var result = SessionAgentService.ClassifyAgentProcessPresence(
+            AgentPath,
+            ChildSessionId,
+            [(7, AgentPath + ".old")]);
+
+        Assert.Equal(SessionAgentService.AgentProcessPresence.Conflict, result);
+    }
+
+    [Theory]
+    [InlineData(null, AgentPath)]
+    [InlineData(7, null)]
+    [InlineData(7, @"DesktopTwin.Agent.exe")]
+    public void 会话或路径不可读时分类为未知并失败关闭(int? sessionId, string? imagePath)
+    {
+        var result = SessionAgentService.ClassifyAgentProcessPresence(
+            AgentPath,
+            ChildSessionId,
+            [(sessionId, imagePath)]);
+
+        Assert.Equal(SessionAgentService.AgentProcessPresence.Unknown, result);
+    }
+
+    [Fact]
+    public void 只有其他会话的同名进程时分类为不存在()
+    {
+        var result = SessionAgentService.ClassifyAgentProcessPresence(
+            AgentPath,
+            ChildSessionId,
+            [(8, AgentPath)]);
+
+        Assert.Equal(SessionAgentService.AgentProcessPresence.Absent, result);
+    }
+
+    [Fact]
+    public void 同会话冲突项之外还有未知项时分类为未知()
+    {
+        var result = SessionAgentService.ClassifyAgentProcessPresence(
+            AgentPath,
+            ChildSessionId,
+            [
+                (7, AgentPath + ".old"),
+                (null, null)
+            ]);
+
+        Assert.Equal(SessionAgentService.AgentProcessPresence.Unknown, result);
+    }
 }

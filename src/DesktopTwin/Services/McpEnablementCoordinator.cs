@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace DesktopTwin.Services;
 
@@ -60,7 +61,8 @@ internal sealed class McpEnablementCoordinator
     /// <remarks>
     /// 顺序约束：先持久化 true 并把 UI 设为 true，再启动 MCP；启动或分身代理同步
     /// 返回 false/抛异常都视为失败。失败时必须停止 MCP、把 UI 和持久化值改回
-    /// false、再次尝试同步分身代理；回滚中的第二次同步抛异常只记录，不得逃出本方法。
+    /// false、再次尝试同步分身代理；回滚中的每一步互相隔离并独立重试一次，
+    /// 任何一步抛异常都不能跳过后面的关闭、持久化、状态刷新和通知。
     /// </remarks>
     internal bool Enable(string failureTitle, string syncFailureMessage)
     {
@@ -126,30 +128,108 @@ internal sealed class McpEnablementCoordinator
 
     private void Rollback(string title, string message, bool notifyUser)
     {
-        _operations.StopMcp();
-        _operations.SetUiEnabled(false);
-        _operations.PersistEnabled(false);
-        _operations.UpdateStatus();
+        var rollbackFailures = new List<string>();
+        Exception? firstRollbackException = null;
+
+        // 这些动作不能互相短路：StopMcp 失败时仍必须关闭 UI、持久化 false 并刷新状态；
+        // 每一关键步骤重试一次，覆盖短暂的 Win32/COM 竞争。即使两次都失败，也只记录
+        // 错误并继续执行剩余步骤，最后用唯一一条通知把未解决的回滚异常告知用户。
+        _ = TryRunRollbackStep(
+            "停止 MCP",
+            _operations.StopMcp,
+            rollbackFailures,
+            ref firstRollbackException);
+        _ = TryRunRollbackStep(
+            "关闭 MCP UI 开关",
+            () => _operations.SetUiEnabled(false),
+            rollbackFailures,
+            ref firstRollbackException);
+        _ = TryRunRollbackStep(
+            "持久化 MCP 关闭状态",
+            () => _operations.PersistEnabled(false),
+            rollbackFailures,
+            ref firstRollbackException);
+        _ = TryRunRollbackStep(
+            "刷新 MCP 状态",
+            _operations.UpdateStatus,
+            rollbackFailures,
+            ref firstRollbackException);
 
         try
         {
             if (!_operations.SyncSessionAgent())
             {
-                _operations.ReportRollbackSyncWarning(
+                ReportRollbackWarning(
                     "MCP 回滚后未能重新同步分身代理；MCP 仍保持关闭。",
                     null);
             }
         }
         catch (Exception exception)
         {
-            _operations.ReportRollbackSyncWarning(
+            ReportRollbackWarning(
                 "MCP 回滚后同步分身代理失败；MCP 仍保持关闭。",
                 exception);
         }
 
-        if (notifyUser)
+        if (!notifyUser)
         {
-            _operations.NotifyError(title, message, null);
+            return;
+        }
+
+        var notification = rollbackFailures.Count == 0
+            ? message
+            : message
+              + "\n\n回滚告警："
+              + string.Join("；", rollbackFailures)
+              + "。请立即检查 MCP 开关和端口状态。";
+        try
+        {
+            _operations.NotifyError(title, notification, firstRollbackException);
+        }
+        catch (Exception exception)
+        {
+            // 通知回调自身失败时不能反向吞掉原始启用失败；至少写一条回滚日志。
+            ReportRollbackWarning("MCP 回滚后显示错误通知失败。", exception);
+        }
+    }
+
+    private static bool TryRunRollbackStep(
+        string label,
+        Action action,
+        List<string> failures,
+        ref Exception? firstException)
+    {
+        Exception? lastException = null;
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                action();
+                return true;
+            }
+            catch (Exception exception)
+            {
+                lastException = exception;
+                firstException ??= exception;
+            }
+        }
+
+        failures.Add(
+            label
+            + "："
+            + (lastException?.GetBaseException().Message ?? "未知错误"));
+        return false;
+    }
+
+    private void ReportRollbackWarning(string message, Exception? exception)
+    {
+        try
+        {
+            _operations.ReportRollbackSyncWarning(message, exception);
+        }
+        catch
+        {
+            // 诊断回调失败不能破坏已经完成的安全回滚。
         }
     }
 

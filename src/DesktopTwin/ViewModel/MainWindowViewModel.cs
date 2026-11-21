@@ -1692,9 +1692,13 @@ public partial class MainWindowViewModel : ObservableObject
 
     private void StopMcpService()
     {
-        _mcpServer?.Dispose();
+        // 先摘掉引用并清状态，再执行可能抛异常的 Dispose：即使释放过程中有异常，
+        // 后续 UI/持久化回滚也不会继续看到“仍在监听”的旧对象。Dispose 自身已在
+        // 内部先停止监听器，再由协调器重试一次。
+        var server = _mcpServer;
         _mcpServer = null;
         IsMcpListening = false;
+        server?.Dispose();
     }
 
     /// <summary>

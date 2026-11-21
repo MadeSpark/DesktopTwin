@@ -133,6 +133,36 @@ public sealed class McpEnablementTests
     }
 
     [Fact]
+    public void 回滚中停止MCP持续抛出异常时仍完成其余关闭步骤()
+    {
+        var stopException = new InvalidOperationException("stop unavailable");
+        var harness = new Harness
+        {
+            StartMcpResult = true,
+            SyncResults = new Queue<bool>([false, true]),
+            StopMcpException = stopException
+        };
+
+        var exception = Record.Exception(() =>
+            harness.Coordinator.Enable(FailureTitle, SyncFailureMessage));
+
+        Assert.Null(exception);
+        Assert.False(harness.PersistedValue);
+        Assert.False(harness.UiValue);
+        Assert.Equal(2, harness.StopMcpCount);
+        Assert.Equal(2, harness.SyncCount);
+        Assert.Equal(
+            [
+                "persist:true", "ui:true", "start", "sync",
+                "stop", "stop", "ui:false", "persist:false", "status", "sync", "notify"
+            ],
+            harness.Operations);
+        Assert.Contains("停止 MCP：stop unavailable", harness.NotifiedMessage);
+        Assert.Contains("请立即检查 MCP 开关和端口状态", harness.NotifiedMessage);
+        Assert.Same(stopException, harness.NotifiedException);
+    }
+
+    [Fact]
     public void 启动MCP返回false时也必须回滚()
     {
         var harness = new Harness
@@ -187,6 +217,8 @@ public sealed class McpEnablementTests
 
         public Exception? SyncException { get; set; }
 
+        public Exception? StopMcpException { get; set; }
+
         public Queue<bool> SyncResults { get; set; } = new();
 
         public McpEnablementCoordinator Coordinator { get; }
@@ -201,9 +233,13 @@ public sealed class McpEnablementTests
 
         public int SyncCount { get; private set; }
 
+        public int StopMcpCount { get; private set; }
+
         public string? NotifiedTitle { get; private set; }
 
         public string? NotifiedMessage { get; private set; }
+
+        public Exception? NotifiedException { get; private set; }
 
         public Exception? RollbackSyncWarning { get; private set; }
 
@@ -242,7 +278,12 @@ public sealed class McpEnablementTests
                     stopMcp: () =>
                     {
                         RolledBack = true;
+                        StopMcpCount++;
                         Operations.Add("stop");
+                        if (StopMcpException is not null)
+                        {
+                            throw StopMcpException;
+                        }
                     },
                     setUiEnabled: value =>
                     {
@@ -254,6 +295,7 @@ public sealed class McpEnablementTests
                     {
                         NotifiedTitle = title;
                         NotifiedMessage = message;
+                        NotifiedException = exception;
                         Operations.Add("notify");
                     },
                     reportRollbackSyncWarning: (message, exception) =>

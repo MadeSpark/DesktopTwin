@@ -35,6 +35,45 @@ public sealed class RdpInputIsolationTests
     }
 
     [Fact]
+    public void 键盘钩子失败时仍调用原生输入窗口禁用()
+    {
+        var called = false;
+        var expectedHost = new IntPtr(0x1234);
+        var appliedEnabledValue = true;
+
+        var result = RdpActiveXHost.ContainKeyboardHookFailure(
+            expectedHost,
+            (hostWindow, enabled) =>
+            {
+                called = true;
+                Assert.Equal(expectedHost, hostWindow);
+                appliedEnabledValue = enabled;
+                return RdpInputWindowApplyResult.Applied;
+            });
+
+        Assert.True(called);
+        Assert.False(appliedEnabledValue);
+        Assert.Equal(RdpInputWindowApplyResult.Failed, result);
+    }
+
+    [Fact]
+    public void 键盘钩子失败且原生窗口缺失时不调用空句柄()
+    {
+        var called = false;
+
+        var result = RdpActiveXHost.ContainKeyboardHookFailure(
+            IntPtr.Zero,
+            (_, _) =>
+            {
+                called = true;
+                return RdpInputWindowApplyResult.Applied;
+            });
+
+        Assert.False(called);
+        Assert.Equal(RdpInputWindowApplyResult.Failed, result);
+    }
+
+    [Fact]
     public void 连接前键盘钩子不匹配时不得读取剪贴板或调用连接()
     {
         var clipboardRead = false;

@@ -358,6 +358,39 @@ internal sealed class RdpActiveXHost : AxHost
         return actual is bool value && !value;
     }
 
+    /// <summary>
+    /// 键盘钩子模式应用失败时仍要尝试禁用 RDP 的原生 Input Capture Window。
+    /// 钩子失败只说明远程键盘范围未确认，不能因此跳过本机输入窗口阻断；
+    /// 合并结果始终是 <see cref="RdpInputWindowApplyResult.Failed"/>，因为隔离
+    /// 前置条件已经失败，调用方不得据此继续连接。
+    /// </summary>
+    internal static RdpInputWindowApplyResult ContainKeyboardHookFailure(
+        IntPtr hostWindow,
+        Func<IntPtr, bool, RdpInputWindowApplyResult> applyInputWindowState)
+    {
+        ArgumentNullException.ThrowIfNull(applyInputWindowState);
+        if (hostWindow == IntPtr.Zero)
+        {
+            return RdpInputWindowApplyResult.Failed;
+        }
+
+        try
+        {
+            var result = applyInputWindowState(hostWindow, false);
+            AppLog.Warn(
+                "KeyboardHookMode 未能确认隔离，已同步尝试禁用 Input Capture Window："
+                + $"applyResult={result}，host=0x{hostWindow:X}。");
+        }
+        catch (Exception exception)
+        {
+            AppLog.Warn(
+                "KeyboardHookMode 未能确认隔离，且禁用 Input Capture Window 失败。",
+                exception);
+        }
+
+        return RdpInputWindowApplyResult.Failed;
+    }
+
     internal void SetAudioMuted(bool muted)
     {
         _audioMuted = muted;
@@ -411,8 +444,13 @@ internal sealed class RdpActiveXHost : AxHost
     {
         if (!TryApplyKeyboardHookMode(blocked))
         {
-            // 未确认键盘钩子范围时只能维持更严格的阻断状态。
+            // 未确认键盘钩子范围时只能维持更严格的阻断状态。这里不能提前返回：
+            // 键盘钩子失败并不代表原生 Input Capture Window 已经禁用，必须仍尝试
+            // 关掉窗口层输入，否则观看/MCP 模式可能继续把本机键鼠送进子会话。
             _inputBlocked = true;
+            _ = ContainKeyboardHookFailure(
+                Handle,
+                ChildSessionNativeMethods.SetRdpInputWindowEnabled);
             return RdpInputWindowApplyResult.Failed;
         }
 
