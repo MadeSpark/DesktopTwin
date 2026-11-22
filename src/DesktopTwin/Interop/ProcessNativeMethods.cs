@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace DesktopTwin.Interop;
 
@@ -168,8 +169,8 @@ internal static class ProcessNativeMethods
             }
 
             // MainModule 和 QueryFullProcessImageName 对同一文件可能分别返回短名、
-            // 卷 GUID 或带 . 的完整路径。枚举阶段已统一为 Path.GetFullPath，
-            // 终止阶段必须使用同一个比较边界，否则安全校验会变成永久误拒绝。
+            // 卷 GUID 或目录联接别名。枚举与终止阶段必须共用同一个最终路径边界，
+            // 否则安全校验会变成永久误拒绝，或在别名下误放行。
             if (!TryNormalizeImagePath(imagePath, out var normalizedImagePath)
                 || !TryNormalizeImagePath(expectedImagePath, out var normalizedExpectedImagePath)
                 || !string.Equals(
@@ -181,6 +182,9 @@ internal static class ProcessNativeMethods
                 return false;
             }
 
+            // 该 API 只能按 PID 查询，但此时句柄已固定进程对象，创建时间和最终
+            // 镜像路径也已与该对象核对；进程会话号在生命周期内不可变，因此这里
+            // 只作为纵深校验，不会把终止目标切换到另一个 PID。
             if (!ProcessIdToSessionId((uint)processId, out var sessionId))
             {
                 errorCode = Marshal.GetLastPInvokeError();
@@ -242,8 +246,10 @@ internal static class ProcessNativeMethods
     }
 
     /// <summary>
-    /// 把进程镜像路径归一为完整路径。只做确定性的词法归一，不访问文件系统；
-    /// SessionAgentService 的枚举与替换路径必须共用这一边界。
+    /// 把进程镜像路径归一为完整路径。文件可读取时通过文件句柄解析到最终
+    /// 路径，使 8.3 短名、卷 GUID、目录联接和符号链接别名得到同一结果；
+    /// 文件尚不存在或无权打开时退回确定性的词法完整路径。SessionAgentService
+    /// 的枚举、替换和启动项守卫必须共用这一边界。
     /// </summary>
     internal static bool TryNormalizeImagePath(string? path, out string normalizedPath)
     {
@@ -262,6 +268,16 @@ internal static class ProcessNativeMethods
             }
 
             normalizedPath = Path.GetFullPath(candidate);
+            if (!Path.IsPathFullyQualified(normalizedPath))
+            {
+                return false;
+            }
+
+            if (TryGetFinalImagePath(normalizedPath, out var finalPath))
+            {
+                normalizedPath = finalPath;
+            }
+
             return Path.IsPathFullyQualified(normalizedPath);
         }
         catch (Exception exception) when (exception is ArgumentException
@@ -271,6 +287,71 @@ internal static class ProcessNativeMethods
         {
             return false;
         }
+    }
+
+    private static bool TryGetFinalImagePath(string candidate, out string finalPath)
+    {
+        finalPath = string.Empty;
+        try
+        {
+            using var handle = File.OpenHandle(
+                candidate,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var capacity = 512;
+            while (capacity <= 32768)
+            {
+                var buffer = new StringBuilder(capacity);
+                var length = GetFinalPathNameByHandle(
+                    handle,
+                    buffer,
+                    (uint)buffer.Capacity,
+                    fileNameNormalized: 0);
+                if (length == 0)
+                {
+                    return false;
+                }
+
+                if (length < (uint)buffer.Capacity)
+                {
+                    var resolved = buffer.ToString(0, (int)length);
+                    finalPath = RemoveExtendedPathPrefix(resolved);
+                    return Path.IsPathFullyQualified(finalPath);
+                }
+
+                capacity = checked((int)length + 1);
+            }
+        }
+        catch (Exception exception) when (exception is IOException
+                                              or UnauthorizedAccessException
+                                              or ArgumentException
+                                              or NotSupportedException)
+        {
+            // 文件不存在或当前令牌无权读取内容时仍可比较词法路径；
+            // 调用方在无法证明路径相等时会失败关闭，绝不会放宽终止条件。
+        }
+
+        return false;
+    }
+
+    private static string RemoveExtendedPathPrefix(string path)
+    {
+        const string uncPrefix = @"\\?\UNC\";
+        if (path.StartsWith(uncPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return @"\\" + path.Substring(uncPrefix.Length);
+        }
+
+        // 只去掉本地盘符路径的 \\?\ 前缀；卷 GUID 和设备路径必须保留，
+        // 否则会变成相对路径而丢失可比较性。
+        return path.Length >= 7
+               && path.StartsWith(@"\\?\", StringComparison.Ordinal)
+               && char.IsAsciiLetter(path[4])
+               && path[5] == ':'
+               && path[6] == '\\'
+            ? path.Substring(4)
+            : path;
     }
 
     private static string? QueryImagePath(IntPtr handle)
@@ -329,6 +410,13 @@ internal static class ProcessNativeMethods
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        StringBuilder path,
+        uint pathLength,
+        uint fileNameNormalized);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]

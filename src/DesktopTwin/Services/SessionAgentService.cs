@@ -160,8 +160,9 @@ internal sealed class SessionAgentService : IDisposable
         AgentFileName);
 
     /// <summary>
-    /// 判断一个路径是否正是指向默认安装位置的分身端。只做完整路径比较，
-    /// 不接受仅文件名相同或位于相邻目录的程序。
+    /// 判断一个路径是否正是指向默认安装位置的分身端。可读取时按文件句柄解析
+    /// 最终路径，防止 8.3 短名、卷 GUID 或目录联接别名绕过排除；不接受仅
+    /// 文件名相同或位于相邻目录的程序。
     /// </summary>
     internal static bool IsDefaultAgentPath(string? candidate)
     {
@@ -173,10 +174,13 @@ internal sealed class SessionAgentService : IDisposable
         try
         {
             var expanded = Environment.ExpandEnvironmentVariables(candidate.Trim().Trim('"'));
-            return string.Equals(
-                Path.GetFullPath(expanded),
-                Path.GetFullPath(DefaultAgentPath),
-                StringComparison.OrdinalIgnoreCase);
+            return ProcessNativeMethods.TryNormalizeImagePath(
+                       Path.GetFullPath(expanded),
+                       out var candidatePath)
+                   && ProcessNativeMethods.TryNormalizeImagePath(
+                       Path.GetFullPath(DefaultAgentPath),
+                       out var defaultPath)
+                   && string.Equals(candidatePath, defaultPath, StringComparison.OrdinalIgnoreCase);
         }
         catch (Exception exception) when (exception is ArgumentException or NotSupportedException
                                               or PathTooLongException or System.Security.SecurityException)

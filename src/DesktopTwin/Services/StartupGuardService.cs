@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Security;
 using System.Threading;
 using System.Threading.Tasks;
+using DesktopTwin.Interop;
 
 namespace DesktopTwin.Services;
 
@@ -208,6 +209,11 @@ internal sealed class StartupGuardService : IDisposable
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             + Path.DirectorySeparatorChar;
         var currentExecutable = Environment.ProcessPath;
+        if (currentExecutable is not null
+            && ProcessNativeMethods.TryNormalizeImagePath(currentExecutable, out var canonicalCurrent))
+        {
+            currentExecutable = canonicalCurrent;
+        }
 
         foreach (var candidate in startupExecutables)
         {
@@ -221,6 +227,12 @@ internal sealed class StartupGuardService : IDisposable
             {
                 fullPath = Path.GetFullPath(
                     Environment.ExpandEnvironmentVariables(candidate.Trim().Trim('"')));
+                if (!ProcessNativeMethods.TryNormalizeImagePath(fullPath, out var canonicalPath))
+                {
+                    continue;
+                }
+
+                fullPath = canonicalPath;
             }
             catch (Exception exception) when (exception is ArgumentException or NotSupportedException
                                                   or PathTooLongException or SecurityException)
@@ -264,19 +276,10 @@ internal sealed class StartupGuardService : IDisposable
 
         if (!string.IsNullOrWhiteSpace(executablePath))
         {
-            string normalized;
-            try
-            {
-                normalized = Path.GetFullPath(executablePath);
-            }
-            catch (Exception exception) when (exception is ArgumentException or NotSupportedException
-                                                  or PathTooLongException or SecurityException)
-            {
-                return false;
-            }
-
-            // 路径能读出来时只认精确路径，防止把同名但不同目录的程序误杀。
-            return exactPaths.Contains(normalized);
+            // 路径能读出来时只认最终文件身份，防止短名、卷 GUID、目录联接
+            // 或同名不同目录的写法把控制端误判成启动项。
+            return ProcessNativeMethods.TryNormalizeImagePath(executablePath, out var normalized)
+                   && exactPaths.Contains(normalized);
         }
 
         // 读不到 MainModule 时无法证明完整路径。即使进程名相同也不能
@@ -428,15 +431,8 @@ internal sealed class StartupGuardService : IDisposable
             return false;
         }
 
-        try
-        {
-            return exactPaths.Contains(Path.GetFullPath(executablePath));
-        }
-        catch (Exception exception) when (exception is ArgumentException or NotSupportedException
-                                              or PathTooLongException or SecurityException)
-        {
-            return false;
-        }
+        return ProcessNativeMethods.TryNormalizeImagePath(executablePath, out var normalized)
+               && exactPaths.Contains(normalized);
     }
 
     private void Monitor()

@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
 using DesktopTwin.Interop;
 
 namespace DesktopTwin.Tests;
@@ -82,6 +84,48 @@ public sealed class ProcessNativeMethodsTests
     }
 
     [Fact]
+    public void 卷GUID别名归一为同一最终镜像路径()
+    {
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-path-" + Guid.NewGuid().ToString("N") + ".exe");
+        File.WriteAllBytes(path, new byte[] { 0x4D, 0x5A });
+        try
+        {
+            var mountBuffer = new StringBuilder(1024);
+            Assert.True(GetVolumePathName(path, mountBuffer, (uint)mountBuffer.Capacity));
+            var volumeBuffer = new StringBuilder(1024);
+            Assert.True(GetVolumeNameForVolumeMountPoint(
+                mountBuffer.ToString(),
+                volumeBuffer,
+                (uint)volumeBuffer.Capacity));
+
+            var root = Path.GetPathRoot(path);
+            Assert.False(string.IsNullOrEmpty(root));
+            var alias = Path.Combine(volumeBuffer.ToString(), path.Substring(root!.Length));
+
+            Assert.True(ProcessNativeMethods.TryNormalizeImagePath(path, out var direct));
+            Assert.True(ProcessNativeMethods.TryNormalizeImagePath(alias, out var canonicalAlias));
+            Assert.Equal(direct, canonicalAlias, ignoreCase: true);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void 不存在的完整路径退回词法归一()
+    {
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-missing-" + Guid.NewGuid().ToString("N") + ".exe");
+
+        Assert.True(ProcessNativeMethods.TryNormalizeImagePath(path, out var normalized));
+        Assert.Equal(Path.GetFullPath(path), normalized, ignoreCase: true);
+    }
+
+    [Fact]
     public void 会话号不一致时拒绝终止进程()
     {
         var identity = CaptureCurrentProcess();
@@ -111,8 +155,21 @@ public sealed class ProcessNativeMethodsTests
 
     private static ProcessIdentity CaptureProcess(Process process)
     {
-        var imagePath = process.MainModule?.FileName;
-        Assert.False(string.IsNullOrWhiteSpace(imagePath));
+        string? imagePath = null;
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            imagePath = process.MainModule?.FileName;
+            if (!string.IsNullOrWhiteSpace(imagePath) || process.HasExited)
+            {
+                break;
+            }
+
+            Thread.Sleep(25);
+        }
+
+        Assert.False(
+            string.IsNullOrWhiteSpace(imagePath),
+            $"无法读取测试进程的 MainModule；已退出={process.HasExited}，PID={process.Id}。");
 
         try
         {
@@ -136,4 +193,18 @@ public sealed class ProcessNativeMethodsTests
         uint SessionId,
         long CreationTimeUtc,
         string ImagePath);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumePathName(
+        string fileName,
+        StringBuilder volumePathName,
+        uint bufferLength);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumeNameForVolumeMountPoint(
+        string volumeMountPoint,
+        StringBuilder volumeName,
+        uint bufferLength);
 }
