@@ -30,8 +30,8 @@ public sealed class ExecutablePathValidationTests
     [Fact]
     public void 非exe被拒绝()
     {
-        var path = Path.ChangeExtension(typeof(ExecutablePathValidationTests).Assembly.Location, ".dll");
-        Assert.True(File.Exists(path), "测试自身程序集应当存在");
+        var path = typeof(SessionAgentService).Assembly.Location;
+        Assert.True(File.Exists(path), "被测程序集应当存在");
         Assert.Throws<ArgumentException>(() =>
             ChildSessionProcessLauncher.ValidateExecutablePath(path));
     }

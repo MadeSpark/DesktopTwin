@@ -432,6 +432,8 @@ internal static class Strings
         Pair("Agent.Started", "已在分身会话 {0} 里启动分身端。"),
         Pair("Agent.StartFailed", "在分身会话 {0} 里启动分身端失败，下次登录时由自启项兜底。"),
         Pair("Agent.EmbeddedMissing", "程序内没有找到内嵌的分身端（DesktopTwin.Agent.exe）。这是打包错误，请重新安装。"),
+        Pair("Agent.SyncFailed.Title", "无法准备分身控制代理"),
+        Pair("Agent.SyncFailed.Message", "为避免旧版代理或自启项残留，本次没有启动桌面分身。请查看日志并修复后重试。"),
 
         Pair("Dialog.SelectProgram.Title", "选择要在桌面分身中启动的程序"),
         Pair("Dialog.SelectProgram.Filter", "Windows 程序 (*.exe)|*.exe"),

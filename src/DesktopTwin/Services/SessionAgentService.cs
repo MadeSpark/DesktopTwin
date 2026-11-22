@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Threading;
@@ -106,6 +108,9 @@ internal sealed class SessionAgentService : IDisposable
     }
 
     private readonly string _dataDirectory;
+    private readonly string _agentDirectory;
+    private readonly bool _protectAgentDirectory;
+    private readonly bool _manageLegacyDefaultInstallation;
 
     /// <summary>
     /// 串行化「检查、替换、下发」整段流程，避免状态轮询在旧进程枚举或等待
@@ -131,13 +136,29 @@ internal sealed class SessionAgentService : IDisposable
     private bool _lastAgentProbeResult;
     private bool _disposed;
 
-    public SessionAgentService(Dispatcher dispatcher, string? dataDirectory = null)
+    public SessionAgentService(
+        Dispatcher dispatcher,
+        string? dataDirectory = null,
+        string? agentDirectory = null,
+        bool? protectAgentDirectory = null)
     {
         _dispatcher = dispatcher;
         _dataDirectory = dataDirectory
             ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "DesktopTwin");
+
+        // 生产环境把可执行代理放到仅管理员可写的 ProgramData 目录；请求/心跳仍留在
+        // 当前用户的 AppData，分身端按交互用户身份读写它们。测试传入 dataDirectory
+        // 时默认仍复用该目录，保持每个测试实例完全隔离。
+        _protectAgentDirectory = protectAgentDirectory
+            ?? (dataDirectory is null && agentDirectory is null);
+        _agentDirectory = agentDirectory
+            ?? (dataDirectory ?? DefaultAgentDirectory);
+
+        // 只有真正的生产布局才允许触碰旧版 AppData 代理。测试即使显式要求
+        // 加固目录，也绝不能清理当前用户实际使用的旧文件或 Run 值。
+        _manageLegacyDefaultInstallation = dataDirectory is null && agentDirectory is null;
     }
 
     /// <summary>
@@ -148,16 +169,100 @@ internal sealed class SessionAgentService : IDisposable
     /// <summary>
     /// 分身端 exe 的落地路径。
     /// </summary>
-    public string AgentPath => Path.Combine(_dataDirectory, AgentFileName);
+    public string AgentPath => Path.Combine(_agentDirectory, AgentFileName);
+
+    /// <summary>
+    /// 生产环境代理目录：<c>%ProgramData%\DesktopTwin\Agent</c>。该目录只允许
+    /// Administrators/SYSTEM 写入，普通用户仅有读取和执行权限，避免提升权限的主程序
+    /// 被诱导把用户可写路径上的文件当作代理执行。
+    /// </summary>
+    internal static string DefaultAgentDirectory => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "DesktopTwin",
+        "Agent");
 
     /// <summary>
     /// 默认安装位置下的分身端路径。启动项扫描与启动项守卫都必须精确排除它，
     /// 否则守卫会把显式拉起的控制通道当成用户启动程序终止。
     /// </summary>
-    internal static string DefaultAgentPath => Path.Combine(
+    internal static string DefaultAgentPath => Path.Combine(DefaultAgentDirectory, AgentFileName);
+
+    /// <summary>
+    /// 旧版本把代理释放到当前用户的 AppData。升级时必须迁移 Run 值并清理该
+    /// 文件，否则启动项会继续执行用户可写目录中的旧代理。
+    /// </summary>
+    internal static string LegacyAgentPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "DesktopTwin",
         AgentFileName);
+
+    /// <summary>
+    /// 判断一条启动命令是否精确指向旧版代理。旧版始终给路径加双引号，但这里
+    /// 也接受无参数的无引号路径；只做前缀匹配，避免把同名前缀的其它程序当成代理。
+    /// </summary>
+    internal static bool IsLegacyAgentCommand(string? commandLine, string legacyAgentPath)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine) || string.IsNullOrWhiteSpace(legacyAgentPath))
+        {
+            return false;
+        }
+
+        string normalizedLegacy;
+        try
+        {
+            normalizedLegacy = Path.GetFullPath(legacyAgentPath);
+        }
+        catch (Exception exception) when (exception is ArgumentException
+                                              or NotSupportedException
+                                              or PathTooLongException)
+        {
+            return false;
+        }
+
+        var expanded = Environment.ExpandEnvironmentVariables(commandLine).TrimStart();
+        var quoted = expanded.StartsWith('"');
+        var pathText = quoted ? expanded[1..] : expanded;
+        if (!pathText.StartsWith(normalizedLegacy, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var nextIndex = normalizedLegacy.Length;
+        if (quoted)
+        {
+            // 开头有双引号时，路径结束后必须有配对的结束引号；不能把
+            // ""...DesktopTwin.Agent.exe" 这种残缺命令误认成旧版启动项。
+            return nextIndex < pathText.Length
+                && pathText[nextIndex] == '"'
+                && (nextIndex + 1 == pathText.Length || char.IsWhiteSpace(pathText[nextIndex + 1]));
+        }
+
+        return nextIndex == pathText.Length || char.IsWhiteSpace(pathText[nextIndex]);
+    }
+
+    /// <summary>
+    /// Run 值的只读同步决策。隔离期间只允许改写已经存在的旧版代理命令，
+    /// 绝不新建值；只有最终命令精确指向新代理时才允许清理旧文件。
+    /// </summary>
+    internal readonly record struct RunSynchronizationPlan(
+        bool WriteRunValue,
+        bool DeleteLegacyAgentFile);
+
+    internal static RunSynchronizationPlan PlanRunSynchronization(
+        string? currentRun,
+        string commandLine,
+        bool updateStartupEntry,
+        bool isLegacyRun,
+        bool manageLegacyDefaultInstallation)
+    {
+        var write = (updateStartupEntry || isLegacyRun)
+            && !string.Equals(currentRun, commandLine, StringComparison.Ordinal);
+        var effectiveRun = write ? commandLine : currentRun;
+        return new RunSynchronizationPlan(
+            write,
+            manageLegacyDefaultInstallation
+                && string.Equals(effectiveRun, commandLine, StringComparison.Ordinal));
+    }
 
     /// <summary>
     /// 判断一个路径是否正是指向默认安装位置的分身端。可读取时按文件句柄解析
@@ -239,6 +344,7 @@ internal sealed class SessionAgentService : IDisposable
 
         try
         {
+            EnsureAgentDirectory();
             Directory.CreateDirectory(_dataDirectory);
             switch (WriteAgentIfChanged())
             {
@@ -262,25 +368,38 @@ internal sealed class SessionAgentService : IDisposable
             return false;
         }
 
-        if (updateStartupEntry)
+        try
         {
-            try
+            var currentRun = ReadRunKey();
+            var isLegacyRun = _manageLegacyDefaultInstallation
+                && IsLegacyAgentCommand(currentRun, LegacyAgentPath);
+            var commandLine = BuildCommandLine();
+            var runPlan = PlanRunSynchronization(
+                currentRun,
+                commandLine,
+                updateStartupEntry,
+                isLegacyRun,
+                _manageLegacyDefaultInstallation);
+
+            if (runPlan.WriteRunValue)
             {
-                var commandLine = BuildCommandLine();
-                if (!string.Equals(ReadRunKey(), commandLine, StringComparison.Ordinal))
-                {
-                    WriteRunKey(commandLine);
-                    NeedsRestart = true;
-                }
+                WriteRunKey(commandLine);
+                currentRun = commandLine;
+                NeedsRestart = true;
             }
-            catch (Exception exception) when (exception is UnauthorizedAccessException
-                                                  or System.Security.SecurityException
-                                                  or IOException)
+
+            if (runPlan.DeleteLegacyAgentFile)
             {
-                error = Locale.Format("Agent.Error.RunKeyFailed", exception.Message);
-                AppLog.Warn(error, exception);
-                return false;
+                TryDelete(LegacyAgentPath);
             }
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException
+                                              or System.Security.SecurityException
+                                              or IOException)
+        {
+            error = Locale.Format("Agent.Error.RunKeyFailed", exception.Message);
+            AppLog.Warn(error, exception);
+            return false;
         }
 
         StartPolling();
@@ -1105,6 +1224,11 @@ internal sealed class SessionAgentService : IDisposable
         }
 
         TryDelete(AgentPath);
+        if (_manageLegacyDefaultInstallation)
+        {
+            TryDelete(LegacyAgentPath);
+        }
+
         TryDelete(RequestPath);
         TryDelete(HeartbeatPath);
         TryDelete(Path.Combine(_dataDirectory, AgentLogFileName));
@@ -1302,6 +1426,266 @@ internal sealed class SessionAgentService : IDisposable
         FailedRolledBack
     }
 
+    private void EnsureAgentDirectory()
+    {
+        if (!_protectAgentDirectory)
+        {
+            Directory.CreateDirectory(_agentDirectory);
+            return;
+        }
+
+        // 生产目录是 %ProgramData%\DesktopTwin\Agent，父目录必须一并加固；
+        // 测试使用隔离目录时也只保护它的直接父级，绝不触碰 ProgramData。
+        var root = Directory.GetParent(_agentDirectory)?.FullName
+            ?? throw new IOException("代理目录不能是卷根目录，拒绝创建。");
+        EnsureProtectedDirectory(root);
+        EnsureProtectedDirectory(_agentDirectory);
+    }
+
+    /// <summary>
+    /// 以原子方式创建（或重新加固）管理员专用目录。普通用户只拿到读取/遍历
+    /// 权限，不能预置文件、替换目录联接，也不能在提升权限的释放过程中改写代理。
+    /// 已存在目录只在所有者可信时才重新设置 DACL；所有者不可信时直接失败关闭。
+    /// </summary>
+    private static void EnsureProtectedDirectory(string path)
+    {
+        var exists = Directory.Exists(path);
+        if (exists)
+        {
+            ValidateTrustedOwner(path, isDirectory: true);
+            ValidateNotReparsePoint(path, isDirectory: true);
+            new DirectoryInfo(path).SetAccessControl(BuildDirectorySecurity(setOwner: false));
+        }
+        else
+        {
+            // DirectoryInfo.Create(DirectorySecurity) 在创建时就带上 DACL，
+            // 不存在“先创建、后收紧”的可利用窗口。
+            new DirectoryInfo(path).Create(BuildDirectorySecurity(setOwner: true));
+        }
+
+        ValidateProtectedDirectory(path);
+    }
+
+    internal static DirectorySecurity BuildDirectorySecurity(bool setOwner)
+    {
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+            FileSystemRights.ReadAndExecute,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+
+        if (setOwner)
+        {
+            security.SetOwner(new SecurityIdentifier(
+                WellKnownSidType.BuiltinAdministratorsSid,
+                null));
+        }
+
+        return security;
+    }
+
+    internal static FileSecurity BuildFileSecurity(bool setOwner)
+    {
+        var security = new FileSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+            FileSystemRights.ReadAndExecute,
+            AccessControlType.Allow));
+
+        if (setOwner)
+        {
+            security.SetOwner(new SecurityIdentifier(
+                WellKnownSidType.BuiltinAdministratorsSid,
+                null));
+        }
+
+        return security;
+    }
+
+    private static void ProtectAgentFile(string path)
+    {
+        // 先确认不是重解析点，再把所有者改为 Administrators。文件所有者即使
+        // 没有显式写权限也能改 DACL，所以不能保留创建者（普通用户）作为所有者。
+        ValidateNotReparsePoint(path, isDirectory: false);
+        new FileInfo(path).SetAccessControl(BuildFileSecurity(setOwner: true));
+        ValidateProtectedFile(path);
+    }
+
+    private static void ValidateProtectedDirectory(string path)
+    {
+        ValidateTrustedOwner(path, isDirectory: true);
+        ValidateNotReparsePoint(path, isDirectory: true);
+        var security = new DirectoryInfo(path).GetAccessControl(
+            AccessControlSections.Owner | AccessControlSections.Access);
+        if (!security.AreAccessRulesProtected)
+        {
+            throw new IOException("代理目录的 DACL 仍受父目录继承控制，拒绝使用。");
+        }
+
+        ValidateAccessRules(security.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier)));
+    }
+
+    private static void ValidateProtectedFile(string path)
+    {
+        ValidateTrustedOwner(path, isDirectory: false);
+        ValidateNotReparsePoint(path, isDirectory: false);
+        var security = new FileSecurity(path, AccessControlSections.Owner | AccessControlSections.Access);
+        if (!security.AreAccessRulesProtected)
+        {
+            throw new IOException("代理文件的 DACL 仍受父目录继承控制，拒绝使用。");
+        }
+
+        ValidateAccessRules(security.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier)));
+    }
+
+    internal static void ValidateAccessRules(AuthorizationRuleCollection rules)
+    {
+        var administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        var users = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+        const FileSystemRights writeRights =
+            FileSystemRights.Write
+            | FileSystemRights.Delete
+            | FileSystemRights.DeleteSubdirectoriesAndFiles
+            | FileSystemRights.ChangePermissions
+            | FileSystemRights.TakeOwnership;
+
+        var systemRights = (FileSystemRights)0;
+        var administratorRights = (FileSystemRights)0;
+        var userRights = (FileSystemRights)0;
+
+        foreach (FileSystemAccessRule rule in rules)
+        {
+            if (rule.AccessControlType != AccessControlType.Allow)
+            {
+                throw new IOException("代理路径包含拒绝规则，拒绝使用。");
+            }
+
+            // 只继承给子对象的 ACE 不作用于当前目录/文件。把它计入必需权限
+            // 会让一个实际不可访问的 DACL 被误判为安全。
+            if ((rule.PropagationFlags & PropagationFlags.InheritOnly) != 0)
+            {
+                throw new IOException("代理路径包含仅继承规则，拒绝使用。");
+            }
+
+            var identity = (SecurityIdentifier)rule.IdentityReference;
+            if (identity.Equals(administrators))
+            {
+                administratorRights |= rule.FileSystemRights;
+                continue;
+            }
+
+            if (identity.Equals(system))
+            {
+                systemRights |= rule.FileSystemRights;
+                continue;
+            }
+
+            if (identity.Equals(users))
+            {
+                if ((rule.FileSystemRights & writeRights) != 0)
+                {
+                    throw new IOException("代理路径授予普通用户写入权限，拒绝使用。");
+                }
+
+                userRights |= rule.FileSystemRights;
+                continue;
+            }
+
+            throw new IOException("代理路径包含非管理员身份，拒绝使用。");
+        }
+
+        // 只拒绝“多余权限”还不够：空 DACL 或缺少管理员完全控制的 DACL
+        // 会让后续替换代理失败，也可能把读取权限误当成可执行权限。这里要求
+        // 三个最小允许 ACE 的实际权限位都存在。
+        if ((systemRights & FileSystemRights.FullControl) != FileSystemRights.FullControl)
+        {
+            throw new IOException("代理路径缺少 SYSTEM 完全控制权限，拒绝使用。");
+        }
+
+        if ((administratorRights & FileSystemRights.FullControl) != FileSystemRights.FullControl)
+        {
+            throw new IOException("代理路径缺少 Administrators 完全控制权限，拒绝使用。");
+        }
+
+        if ((userRights & FileSystemRights.ReadAndExecute) != FileSystemRights.ReadAndExecute)
+        {
+            throw new IOException("代理路径缺少 Builtin Users 读取/执行权限，拒绝使用。");
+        }
+    }
+
+    internal static void ValidateTrustedOwner(string path, bool isDirectory)
+    {
+        FileSystemSecurity security = isDirectory
+            ? new DirectoryInfo(path).GetAccessControl(AccessControlSections.Owner)
+            : new FileSecurity(path, AccessControlSections.Owner);
+        var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        if (owner is null
+            || (!owner.Equals(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null))
+                && !owner.Equals(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null))))
+        {
+            throw new IOException("代理路径的所有者不是 Administrators/SYSTEM，拒绝使用。");
+        }
+    }
+
+    internal static void ValidateNotReparsePoint(string path, bool isDirectory)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var current = isDirectory
+            ? new DirectoryInfo(fullPath)
+            : new FileInfo(fullPath).Directory;
+
+        // 只检查最后一级不够：普通用户无法改写受保护的 ProgramData 子目录，
+        // 但仍要把祖先目录联接/符号链接一并拒绝，避免路径在检查后被重定向。
+        while (current is not null)
+        {
+            if ((current.Attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new IOException($"代理路径的祖先目录是重解析点，拒绝使用：{current.FullName}");
+            }
+
+            current = current.Parent;
+        }
+
+        var attributes = isDirectory
+            ? new DirectoryInfo(fullPath).Attributes
+            : File.GetAttributes(fullPath);
+        if ((attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new IOException("代理路径是重解析点，拒绝使用。");
+        }
+    }
+
     private AgentWriteOutcome WriteAgentIfChanged()
     {
         var assembly = typeof(SessionAgentService).Assembly;
@@ -1326,6 +1710,11 @@ internal sealed class SessionAgentService : IDisposable
         // 平白让所有代理互杀一轮。
         if (File.Exists(AgentPath))
         {
+            // 每次复用前重新验证并加固 DACL，防止旧版本或外部工具留下可写 ACL。
+            if (_protectAgentDirectory)
+            {
+                ProtectAgentFile(AgentPath);
+            }
             try
             {
                 var existing = File.ReadAllBytes(AgentPath);
@@ -1347,7 +1736,23 @@ internal sealed class SessionAgentService : IDisposable
         // 正在运行的可执行文件——旧进程继续用改名后的文件跑，新文件占回原名字。
         var tempPath = AgentPath + ".new";
         var retiredPath = AgentPath + ".old";
+        DeleteFileIfExists(tempPath);
+        // 先创建空文件并加固，再写入内容；不能先写完整可执行文件再收紧 ACL。
+        using (File.Create(tempPath))
+        {
+        }
+
+        if (_protectAgentDirectory)
+        {
+            ProtectAgentFile(tempPath);
+        }
+
         File.WriteAllBytes(tempPath, buffer);
+        if (_protectAgentDirectory)
+        {
+            // 写入后再次以磁盘对象为准核对，防止临时路径在两步之间被替换。
+            ValidateProtectedFile(tempPath);
+        }
 
         if (File.Exists(AgentPath))
         {
@@ -1402,6 +1807,13 @@ internal sealed class SessionAgentService : IDisposable
             // 继续轮询——否则一个在跑的旧代理写来的切换请求没人处理。
             // 但这次替换确实失败了，必须如实上报，不能当成「内容没变」。
             return AgentWriteOutcome.FailedRolledBack;
+        }
+
+        // 移动完成后重新核对正式文件，防止替换过程中目标被外部改写或 ACL 被放宽。
+        // 同一卷上的改名会保留临时文件的 DACL，但这里仍以磁盘上的最终对象为准。
+        if (_protectAgentDirectory)
+        {
+            ValidateProtectedFile(AgentPath);
         }
 
         // 旧文件此刻可能还被旧进程占着，删不掉也无所谓：下次启动还会再试一次。
@@ -1465,14 +1877,42 @@ internal sealed class SessionAgentService : IDisposable
         key.SetValue(RunValueName, commandLine, Microsoft.Win32.RegistryValueKind.String);
     }
 
+    /// <summary>
+    /// 删除普通文件；不存在视为成功。重解析点、目录或删除失败都必须让调用方
+    /// 失败关闭，不能因为 File.Exists 对悬空链接返回 false 就继续写入并跟随链接。
+    /// </summary>
+    private static void DeleteFileIfExists(string path)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new IOException($"拒绝删除重解析点：{path}");
+            }
+
+            if ((attributes & FileAttributes.Directory) != 0)
+            {
+                throw new IOException($"期望文件但发现目录：{path}");
+            }
+
+            File.Delete(path);
+        }
+        catch (FileNotFoundException)
+        {
+            // 文件不存在，正常的新建路径。
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // 父目录不存在，由后续写入明确失败。
+        }
+    }
+
     private static void TryDelete(string path)
     {
         try
         {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
+            DeleteFileIfExists(path);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {

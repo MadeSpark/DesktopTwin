@@ -1,4 +1,10 @@
 using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Windows.Threading;
 using DesktopTwin.Services;
 using Xunit;
 
@@ -417,5 +423,457 @@ public sealed class SessionAgentServiceTests
             [(7, AgentPath)]);
 
         Assert.Equal(SessionAgentService.AgentProcessPresence.Absent, result);
+    }
+
+    [Fact]
+    public void 代理DACL必须同时具备管理员系统完全控制和用户读取执行()
+    {
+        var rules = BuildRules(
+            Allow(WellKnownSidType.LocalSystemSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinAdministratorsSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinUsersSid, FileSystemRights.ReadAndExecute));
+
+        SessionAgentService.ValidateAccessRules(rules);
+    }
+
+    [Fact]
+    public void 代理DACL缺少SYSTEM完全控制时必须失败()
+    {
+        var rules = BuildRules(
+            Allow(WellKnownSidType.BuiltinAdministratorsSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinUsersSid, FileSystemRights.ReadAndExecute));
+
+        var exception = Assert.Throws<IOException>(
+            () => SessionAgentService.ValidateAccessRules(rules));
+
+        Assert.Contains("SYSTEM", exception.Message);
+    }
+
+    [Fact]
+    public void 代理DACL缺少Administrators完全控制时必须失败()
+    {
+        var rules = BuildRules(
+            Allow(WellKnownSidType.LocalSystemSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinUsersSid, FileSystemRights.ReadAndExecute));
+
+        var exception = Assert.Throws<IOException>(
+            () => SessionAgentService.ValidateAccessRules(rules));
+
+        Assert.Contains("Administrators", exception.Message);
+    }
+
+    [Fact]
+    public void 代理DACL缺少普通用户读取执行时必须失败()
+    {
+        var rules = BuildRules(
+            Allow(WellKnownSidType.LocalSystemSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinAdministratorsSid, FileSystemRights.FullControl));
+
+        var exception = Assert.Throws<IOException>(
+            () => SessionAgentService.ValidateAccessRules(rules));
+
+        Assert.Contains("Builtin Users", exception.Message);
+    }
+
+    [Fact]
+    public void 代理DACL出现普通用户写权限时必须失败()
+    {
+        var rules = BuildRules(
+            Allow(WellKnownSidType.LocalSystemSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinAdministratorsSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinUsersSid, FileSystemRights.Modify));
+
+        var exception = Assert.Throws<IOException>(
+            () => SessionAgentService.ValidateAccessRules(rules));
+
+        Assert.Contains("写入", exception.Message);
+    }
+
+    [Fact]
+    public void 固化DACL在创建时即保护且普通用户只有读取执行权限()
+    {
+        var directorySecurity = SessionAgentService.BuildDirectorySecurity(setOwner: true);
+        Assert.True(directorySecurity.AreAccessRulesProtected);
+        Assert.Equal(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            directorySecurity.GetOwner(typeof(SecurityIdentifier)));
+
+        var directoryRules = directorySecurity.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier));
+        SessionAgentService.ValidateAccessRules(directoryRules);
+        Assert.Equal(3, directoryRules.Count);
+        var directoryUsersRule = directoryRules
+            .Cast<FileSystemAccessRule>()
+            .Single(rule => rule.IdentityReference.Equals(
+                new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null)));
+        Assert.Equal(
+            FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize,
+            directoryUsersRule.FileSystemRights);
+        Assert.Equal(
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            directoryUsersRule.InheritanceFlags);
+        Assert.Equal(PropagationFlags.None, directoryUsersRule.PropagationFlags);
+
+        var fileSecurity = SessionAgentService.BuildFileSecurity(setOwner: true);
+        Assert.True(fileSecurity.AreAccessRulesProtected);
+        Assert.Equal(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            fileSecurity.GetOwner(typeof(SecurityIdentifier)));
+
+        var fileRules = fileSecurity.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier));
+        SessionAgentService.ValidateAccessRules(fileRules);
+        Assert.Equal(3, fileRules.Count);
+        Assert.All(
+            fileRules.Cast<FileSystemAccessRule>(),
+            rule => Assert.Equal(InheritanceFlags.None, rule.InheritanceFlags));
+        var fileUsersRule = fileRules
+            .Cast<FileSystemAccessRule>()
+            .Single(rule => rule.IdentityReference.Equals(
+                new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null)));
+        Assert.Equal(
+            FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize,
+            fileUsersRule.FileSystemRights);
+    }
+
+    [Fact]
+    public void 用户拥有的代理路径所有者不可信时拒绝()
+    {
+        var directory = CreateTempDirectory();
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var owner = new DirectoryInfo(directory)
+                .GetAccessControl(AccessControlSections.Owner)
+                .GetOwner(typeof(SecurityIdentifier));
+            if (owner is not null
+                && (owner.Equals(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null))
+                    || owner.Equals(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null))))
+            {
+                // 以 SYSTEM/Administrators 运行测试时不具备“不可信所有者”夹具。
+                return;
+            }
+
+            var exception = Assert.Throws<IOException>(
+                () => SessionAgentService.ValidateTrustedOwner(directory, isDirectory: true));
+            Assert.Contains("所有者", exception.Message);
+        }
+        finally
+        {
+            DeleteTempDirectory(directory);
+        }
+    }
+
+    [Fact]
+    public void 代理路径任一级祖先为目录联接时拒绝()
+    {
+        var root = CreateTempDirectory();
+        var target = Path.Combine(root, "target");
+        var junction = Path.Combine(root, "junction");
+        try
+        {
+            Directory.CreateDirectory(target);
+            var command = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = command,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            startInfo.ArgumentList.Add("/d");
+            startInfo.ArgumentList.Add("/c");
+            startInfo.ArgumentList.Add("mklink");
+            startInfo.ArgumentList.Add("/J");
+            startInfo.ArgumentList.Add(junction);
+            startInfo.ArgumentList.Add(target);
+            using var process = Process.Start(startInfo)
+                ?? throw new IOException("无法启动 mklink 测试进程。");
+            Assert.True(process.WaitForExit(10_000), "创建目录联接超时。");
+            Assert.Equal(0, process.ExitCode);
+
+            var childDirectory = Path.Combine(junction, "child");
+            Directory.CreateDirectory(childDirectory);
+            var agentPath = Path.Combine(childDirectory, "DesktopTwin.Agent.exe");
+            File.WriteAllBytes(agentPath, Array.Empty<byte>());
+
+            var exception = Assert.Throws<IOException>(
+                () => SessionAgentService.ValidateNotReparsePoint(agentPath, isDirectory: false));
+            Assert.Contains("祖先目录是重解析点", exception.Message);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(junction))
+                {
+                    Directory.Delete(junction, recursive: false);
+                }
+            }
+            catch (IOException)
+            {
+                // 清理失败不应掩盖真正的断言结果。
+            }
+
+            DeleteTempDirectory(root);
+        }
+    }
+
+    [Fact]
+    public void 隔离目录安装会加固临时与最终文件并跳过未变化内容()
+    {
+        if (!IsElevated())
+        {
+            // 设置所有者需要提升权限；非提升测试进程不做会失败的 DACL 夹具。
+            return;
+        }
+
+        var root = CreateTempDirectory();
+        try
+        {
+            var dataDirectory = Path.Combine(root, "Data");
+            var agentDirectory = Path.Combine(root, "Agent");
+            using var service = new SessionAgentService(
+                Dispatcher.CurrentDispatcher,
+                dataDirectory,
+                agentDirectory,
+                protectAgentDirectory: true);
+
+            Assert.True(
+                service.EnsureInstalled("Ctrl+Alt+U", null, out var firstError, updateStartupEntry: false),
+                firstError);
+            var agentPath = service.AgentPath;
+            var original = File.ReadAllBytes(agentPath);
+            AssertProtectedDirectory(root);
+            AssertProtectedDirectory(agentDirectory);
+            AssertProtectedFile(agentPath);
+            Assert.False(File.Exists(agentPath + ".new"));
+            Assert.False(File.Exists(agentPath + ".old"));
+
+            var tampered = File.ReadAllBytes(agentPath);
+            tampered[0] ^= 0xFF;
+            File.WriteAllBytes(agentPath, tampered);
+            Assert.True(
+                service.EnsureInstalled("Ctrl+Alt+U", null, out var repairError, updateStartupEntry: false),
+                repairError);
+            Assert.Equal(original, File.ReadAllBytes(agentPath));
+            AssertProtectedFile(agentPath);
+            Assert.False(File.Exists(agentPath + ".new"));
+            Assert.False(File.Exists(agentPath + ".old"));
+
+            var timestamp = File.GetLastWriteTimeUtc(agentPath);
+            Thread.Sleep(1100);
+            Assert.True(
+                service.EnsureInstalled("Ctrl+Alt+U", null, out var unchangedError, updateStartupEntry: false),
+                unchangedError);
+            Assert.Equal(timestamp, File.GetLastWriteTimeUtc(agentPath));
+            AssertProtectedFile(agentPath);
+        }
+        finally
+        {
+            DeleteTempDirectory(root);
+        }
+    }
+
+    [Fact]
+    public void 旧版AppData代理启动命令只做精确目标匹配()
+    {
+        var legacy = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin Legacy",
+            "DesktopTwin.Agent.exe");
+
+        Assert.True(SessionAgentService.IsLegacyAgentCommand(
+            $"\"{legacy}\" --hotkey Alt+Q",
+            legacy));
+        Assert.True(SessionAgentService.IsLegacyAgentCommand(
+            legacy,
+            legacy));
+        Assert.True(SessionAgentService.IsLegacyAgentCommand(
+            $"\"{legacy}\"",
+            legacy));
+        Assert.False(SessionAgentService.IsLegacyAgentCommand(
+            $"\"{legacy}",
+            legacy));
+        Assert.False(SessionAgentService.IsLegacyAgentCommand(
+            $"\"{legacy}.bak\" --hotkey Alt+Q",
+            legacy));
+        Assert.False(SessionAgentService.IsLegacyAgentCommand(
+            $"\"{legacy}\"suffix",
+            legacy));
+        Assert.False(SessionAgentService.IsLegacyAgentCommand(
+            $"powershell.exe -File \"{legacy}\"",
+            legacy));
+        Assert.False(SessionAgentService.IsLegacyAgentCommand(
+            "\"C:\\Temp\\DesktopTwin.Agent.exe\" --hotkey Alt+Q",
+            legacy));
+    }
+
+    [Fact]
+    public void 隔离期间只迁移已存在的旧版代理启动命令()
+    {
+        const string newCommand = "\"C:\\ProgramData\\DesktopTwin\\Agent\\DesktopTwin.Agent.exe\" --hotkey Alt+Q";
+        const string legacyCommand = "\"C:\\Users\\Test\\AppData\\Roaming\\DesktopTwin\\DesktopTwin.Agent.exe\" --hotkey Alt+Q";
+
+        var legacy = SessionAgentService.PlanRunSynchronization(
+            legacyCommand,
+            newCommand,
+            updateStartupEntry: false,
+            isLegacyRun: true,
+            manageLegacyDefaultInstallation: true);
+        Assert.True(legacy.WriteRunValue);
+        Assert.True(legacy.DeleteLegacyAgentFile);
+
+        var absent = SessionAgentService.PlanRunSynchronization(
+            currentRun: null,
+            newCommand,
+            updateStartupEntry: false,
+            isLegacyRun: false,
+            manageLegacyDefaultInstallation: true);
+        Assert.False(absent.WriteRunValue);
+        Assert.False(absent.DeleteLegacyAgentFile);
+
+        var unrecognized = SessionAgentService.PlanRunSynchronization(
+            "\"C:\\Users\\Test\\AppData\\Roaming\\DesktopTwin\\DesktopTwin.Agent.exe.bak\"",
+            newCommand,
+            updateStartupEntry: false,
+            isLegacyRun: false,
+            manageLegacyDefaultInstallation: true);
+        Assert.False(unrecognized.WriteRunValue);
+        Assert.False(unrecognized.DeleteLegacyAgentFile);
+
+        var alreadyMigrated = SessionAgentService.PlanRunSynchronization(
+            newCommand,
+            newCommand,
+            updateStartupEntry: true,
+            isLegacyRun: false,
+            manageLegacyDefaultInstallation: true);
+        Assert.False(alreadyMigrated.WriteRunValue);
+        Assert.True(alreadyMigrated.DeleteLegacyAgentFile);
+    }
+
+    [Fact]
+    public void 正常安装允许新建启动项但测试布局绝不清理旧文件()
+    {
+        const string newCommand = "\"C:\\ProgramData\\DesktopTwin\\Agent\\DesktopTwin.Agent.exe\" --hotkey Alt+Q";
+        var plan = SessionAgentService.PlanRunSynchronization(
+            currentRun: null,
+            newCommand,
+            updateStartupEntry: true,
+            isLegacyRun: false,
+            manageLegacyDefaultInstallation: false);
+
+        Assert.True(plan.WriteRunValue);
+        Assert.False(plan.DeleteLegacyAgentFile);
+    }
+
+    [Fact]
+    public void 代理DACL出现仅继承规则时必须失败()
+    {
+        var rules = BuildDirectoryRules(
+            Allow(WellKnownSidType.LocalSystemSid, FileSystemRights.FullControl),
+            Allow(WellKnownSidType.BuiltinAdministratorsSid, FileSystemRights.FullControl),
+            new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+                FileSystemRights.ReadAndExecute,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.InheritOnly,
+                AccessControlType.Allow));
+
+        var exception = Assert.Throws<IOException>(
+            () => SessionAgentService.ValidateAccessRules(rules));
+
+        Assert.Contains("继承", exception.Message);
+    }
+
+    private static bool IsElevated()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static string CreateTempDirectory() =>
+        Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin.Tests." + Guid.NewGuid().ToString("N"));
+
+    private static void DeleteTempDirectory(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path, recursive: true);
+        }
+    }
+
+    private static void AssertProtectedDirectory(string path)
+    {
+        var security = new DirectoryInfo(path).GetAccessControl(
+            AccessControlSections.Owner | AccessControlSections.Access);
+        Assert.True(security.AreAccessRulesProtected);
+        Assert.Equal(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            security.GetOwner(typeof(SecurityIdentifier)));
+        SessionAgentService.ValidateAccessRules(security.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier)));
+    }
+
+    private static void AssertProtectedFile(string path)
+    {
+        var security = new FileSecurity(path, AccessControlSections.Owner | AccessControlSections.Access);
+        Assert.True(security.AreAccessRulesProtected);
+        Assert.Equal(
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            security.GetOwner(typeof(SecurityIdentifier)));
+        SessionAgentService.ValidateAccessRules(security.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier)));
+    }
+
+    private static FileSystemAccessRule Allow(
+        WellKnownSidType sidType,
+        FileSystemRights rights)
+    {
+        return new FileSystemAccessRule(
+            new SecurityIdentifier(sidType, null),
+            rights,
+            AccessControlType.Allow);
+    }
+
+    private static AuthorizationRuleCollection BuildRules(
+        params FileSystemAccessRule[] accessRules)
+    {
+        var security = new FileSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (var rule in accessRules)
+        {
+            security.AddAccessRule(rule);
+        }
+
+        return security.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier));
+    }
+
+    private static AuthorizationRuleCollection BuildDirectoryRules(
+        params FileSystemAccessRule[] accessRules)
+    {
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        foreach (var rule in accessRules)
+        {
+            security.AddAccessRule(rule);
+        }
+
+        return security.GetAccessRules(
+            includeExplicit: true,
+            includeInherited: false,
+            targetType: typeof(SecurityIdentifier));
     }
 }

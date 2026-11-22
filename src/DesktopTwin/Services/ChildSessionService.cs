@@ -1391,7 +1391,7 @@ public sealed class ChildSessionService : IDisposable
 
                         // 用户显式启用启动项时也不能绕过会话边界：如果旧日志仍在，
                         // 必须确认没有活动分身，避免恢复后由连接/登录触发器再次拉起程序。
-                        return service.GetRestoreBlockResult() ?? service.Restore();
+                        return service.RestoreIfChildAbsent();
                     }
 
                     var existingSessionId = ChildSessionNativeMethods.GetChildSessionIdStrict();
@@ -1520,17 +1520,10 @@ public sealed class ChildSessionService : IDisposable
                 return StartupSnoozeResult.Ok("没有需要恢复的启动项。");
             }
 
-            var blocked = _startupSnooze.GetRestoreBlockResult();
-            if (blocked is not null)
-            {
-                AppLog.Warn(blocked.Message);
-                return blocked;
-            }
-
             StartupSnoozeResult result;
             try
             {
-                result = _startupSnooze.Restore();
+                result = _startupSnooze.RestoreIfChildAbsent();
             }
             catch (Exception exception) when (IsStartupSnoozeException(exception))
             {

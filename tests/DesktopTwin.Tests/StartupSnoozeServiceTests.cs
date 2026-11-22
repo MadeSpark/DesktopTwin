@@ -1461,6 +1461,199 @@ public sealed class StartupSnoozeServiceTests
     }
 
     [Fact]
+    public void 恢复遇到缺席后出现会话时必须保留日志且不再查询()
+    {
+        WithTestDirectory(directory =>
+        {
+            var calls = 0;
+            var presences = new Queue<StartupSnoozeService.ChildSessionPresence>(new[]
+            {
+                StartupSnoozeService.ChildSessionPresence.Absent,
+                StartupSnoozeService.ChildSessionPresence.Present,
+                StartupSnoozeService.ChildSessionPresence.Absent
+            });
+            var service = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    calls++;
+                    return presences.Dequeue();
+                },
+                TimeSpan.Zero);
+            WriteTestJournal(service, CreateEmptyTestJournal(completed: true));
+
+            var result = service.RecoverOnStartup();
+
+            Assert.Null(result);
+            Assert.Equal(2, calls);
+            Assert.True(service.HasPendingJournal);
+            Assert.True(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 恢复遇到未知状态时必须保留日志且不再查询()
+    {
+        WithTestDirectory(directory =>
+        {
+            var calls = 0;
+            var presences = new Queue<StartupSnoozeService.ChildSessionPresence>(new[]
+            {
+                StartupSnoozeService.ChildSessionPresence.Absent,
+                StartupSnoozeService.ChildSessionPresence.Unknown,
+                StartupSnoozeService.ChildSessionPresence.Absent
+            });
+            var service = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    calls++;
+                    return presences.Dequeue();
+                },
+                TimeSpan.Zero);
+            WriteTestJournal(service, CreateEmptyTestJournal(completed: true));
+
+            var result = service.RecoverOnStartup();
+
+            Assert.NotNull(result);
+            Assert.False(result!.Success);
+            Assert.Contains("无法确认", result.Message);
+            Assert.Equal(2, calls);
+            Assert.True(service.HasPendingJournal);
+            Assert.True(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 恢复遇到无效会话状态枚举时必须失败关闭()
+    {
+        WithTestDirectory(directory =>
+        {
+            var service = new StartupSnoozeService(
+                directory,
+                () => (StartupSnoozeService.ChildSessionPresence)int.MaxValue);
+            WriteTestJournal(service, CreateEmptyTestJournal(completed: true));
+
+            var result = service.RecoverOnStartup();
+
+            Assert.NotNull(result);
+            Assert.False(result!.Success);
+            Assert.Contains("状态返回值无效", result.Message);
+            Assert.True(service.HasPendingJournal);
+            Assert.True(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 恢复闸门遇到无效会话状态枚举时必须失败关闭()
+    {
+        WithTestDirectory(directory =>
+        {
+            var service = new StartupSnoozeService(
+                directory,
+                () => (StartupSnoozeService.ChildSessionPresence)int.MaxValue);
+
+            var blocked = service.GetRestoreBlockResult();
+
+            Assert.NotNull(blocked);
+            Assert.False(blocked!.Success);
+            Assert.Contains("状态返回值无效", blocked.Message);
+
+            var atomic = service.RestoreIfChildAbsent();
+            Assert.False(atomic.Success);
+            Assert.Contains("状态返回值无效", atomic.Message);
+        });
+    }
+
+    [Fact]
+    public void 恢复只有连续三次确认缺席后才清理日志()
+    {
+        WithTestDirectory(directory =>
+        {
+            var calls = 0;
+            var service = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    calls++;
+                    return StartupSnoozeService.ChildSessionPresence.Absent;
+                },
+                TimeSpan.Zero);
+            WriteTestJournal(service, CreateEmptyTestJournal(completed: true));
+
+            var result = service.RecoverOnStartup();
+
+            Assert.NotNull(result);
+            Assert.True(result!.Success);
+            Assert.Equal(StartupSnoozeService.ConfirmedAbsenceScans, calls);
+            Assert.False(service.HasPendingJournal);
+            Assert.False(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 恢复前闸门同样要求连续三次确认缺席()
+    {
+        WithTestDirectory(directory =>
+        {
+            var blockedCalls = 0;
+            var blockedPresences = new Queue<StartupSnoozeService.ChildSessionPresence>(new[]
+            {
+                StartupSnoozeService.ChildSessionPresence.Absent,
+                StartupSnoozeService.ChildSessionPresence.Present,
+                StartupSnoozeService.ChildSessionPresence.Absent
+            });
+            var blocked = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    blockedCalls++;
+                    return blockedPresences.Dequeue();
+                },
+                TimeSpan.Zero);
+
+            Assert.NotNull(blocked.GetRestoreBlockResult());
+            Assert.Equal(2, blockedCalls);
+
+            var allowedCalls = 0;
+            var allowed = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    allowedCalls++;
+                    return StartupSnoozeService.ChildSessionPresence.Absent;
+                },
+                TimeSpan.Zero);
+
+            Assert.Null(allowed.GetRestoreBlockResult());
+            Assert.Equal(StartupSnoozeService.ConfirmedAbsenceScans, allowedCalls);
+        });
+    }
+
+    [Fact]
+    public void 恢复前三次缺席探测之间使用默认确认间隔()
+    {
+        WithTestDirectory(directory =>
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var timestamps = new List<long>();
+            var service = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    timestamps.Add(clock.ElapsedMilliseconds);
+                    return StartupSnoozeService.ChildSessionPresence.Absent;
+                });
+
+            Assert.Null(service.GetRestoreBlockResult());
+
+            Assert.Equal(StartupSnoozeService.ConfirmedAbsenceScans, timestamps.Count);
+            Assert.True(timestamps[1] - timestamps[0] >= 200);
+            Assert.True(timestamps[2] - timestamps[1] >= 200);
+        });
+    }
+
+    [Fact]
     public void 已有分身会话时没有日志必须拒绝接管()
     {
         WithTestDirectory(directory =>
@@ -1563,6 +1756,87 @@ public sealed class StartupSnoozeServiceTests
                 Assert.False(File.Exists(service.JournalPath));
             });
         }
+    }
+
+    [Fact]
+    public void 新会话出现在启动项写入前时失败并保留日志()
+    {
+        WithTestDirectory(directory =>
+        {
+            var calls = 0;
+            var presences = new Queue<StartupSnoozeService.ChildSessionPresence>(new[]
+            {
+                StartupSnoozeService.ChildSessionPresence.Absent,
+                StartupSnoozeService.ChildSessionPresence.Present
+            });
+            var service = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    calls++;
+                    return presences.Dequeue();
+                },
+                TimeSpan.Zero,
+                () => new List<string>(),
+                () => new StartupSnoozeSnapshot(
+                    new List<StartupSnoozeRegistryEntry>(),
+                    new List<StartupSnoozeTaskEntry>(),
+                    new List<StartupSnoozeUwpEntry>()));
+
+            var result = service.EnsureSnoozed();
+
+            // 第一次探测在互斥体内通过；枚举并落盘日志后，写入系统状态前
+            // 的第二次探测必须立即失败关闭。
+            Assert.False(result.Success);
+            Assert.Equal(2, calls);
+            Assert.Contains("尚未执行", result.Message);
+            Assert.True(File.Exists(service.JournalPath));
+            var journal = JsonSerializer.Deserialize<StartupSnoozeJournal>(
+                File.ReadAllText(service.JournalPath));
+            Assert.NotNull(journal);
+            Assert.False(journal!.Completed);
+        });
+    }
+
+    [Fact]
+    public void 空启动项在返回成功前出现新会话时失败并保留日志()
+    {
+        WithTestDirectory(directory =>
+        {
+            var calls = 0;
+            var presences = new Queue<StartupSnoozeService.ChildSessionPresence>(new[]
+            {
+                StartupSnoozeService.ChildSessionPresence.Absent,
+                StartupSnoozeService.ChildSessionPresence.Absent,
+                StartupSnoozeService.ChildSessionPresence.Present
+            });
+            var service = new StartupSnoozeService(
+                directory,
+                () =>
+                {
+                    calls++;
+                    return presences.Dequeue();
+                },
+                TimeSpan.Zero,
+                () => new List<string>(),
+                () => new StartupSnoozeSnapshot(
+                    new List<StartupSnoozeRegistryEntry>(),
+                    new List<StartupSnoozeTaskEntry>(),
+                    new List<StartupSnoozeUwpEntry>()));
+
+            var result = service.EnsureSnoozed();
+
+            // 空清单没有系统写入，但最后一次探测仍必须阻止调用方继续连接；
+            // 日志保持未完成，供会话结束后按原始状态收尾。
+            Assert.False(result.Success);
+            Assert.Equal(3, calls);
+            Assert.Contains("空关停日志已保留", result.Message);
+            Assert.True(service.HasPendingJournal);
+            var journal = JsonSerializer.Deserialize<StartupSnoozeJournal>(
+                File.ReadAllText(service.JournalPath));
+            Assert.NotNull(journal);
+            Assert.False(journal!.Completed);
+        });
     }
 
     [Fact]

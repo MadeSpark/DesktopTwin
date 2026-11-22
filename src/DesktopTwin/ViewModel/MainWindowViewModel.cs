@@ -220,7 +220,7 @@ public partial class MainWindowViewModel : ObservableObject
                     notifyUser: false,
                     notifySuccess: false,
                     rollbackOnFailure: false),
-                syncSessionAgent: SyncSessionAgent,
+                syncSessionAgent: () => SyncSessionAgent(),
                 stopMcp: StopMcpService,
                 setUiEnabled: value => McpEnabled = value,
                 updateStatus: UpdateMcpStatus,
@@ -595,6 +595,20 @@ public partial class MainWindowViewModel : ObservableObject
             ShowNotification(
                 Locale.Get("Snooze.RecoveryFailed.Title"),
                 Locale.Format("Snooze.RecoveryFailed.Message", exception.GetBaseException().Message),
+                InfoBarSeverity.Error,
+                TimeSpan.FromSeconds(15));
+            return;
+        }
+
+        // 恢复成功后，隔离日志中的 StartupApproved 原状态已回写。此时必须重新
+        // 同步一次代理：升级前遗留的 AppData Run 值需要迁移到 ProgramData，
+        // 否则旧的可写代理仍可能在下次登录时执行。同步失败则中止连接。
+        if (!SyncSessionAgent(startInChildSession: false))
+        {
+            AppLog.Warn("连接前同步分身代理失败，已阻止启动。");
+            ShowNotification(
+                Locale.Get("Agent.SyncFailed.Title"),
+                Locale.Get("Agent.SyncFailed.Message"),
                 InfoBarSeverity.Error,
                 TimeSpan.FromSeconds(15));
             return;
@@ -1527,7 +1541,7 @@ public partial class MainWindowViewModel : ObservableObject
     /// 按当前功能开关同步分身端参数：UU 热键与 MCP 控制管道可以独立启用。
     /// </summary>
     /// <returns>分身端是否已按所需设置安装并可用。</returns>
-    private bool SyncSessionAgent()
+    private bool SyncSessionAgent(bool startInChildSession = true)
     {
         if (_hotkeyWindow is null)
         {
@@ -1542,7 +1556,8 @@ public partial class MainWindowViewModel : ObservableObject
             var controlPipe = McpEnabled ? _settings.Current.Mcp.PipeName : null;
 
             // 子会话开着或关停日志尚未恢复时，HKCU Run 可能正被隔离。
-            // 这时只更新内存参数并显式拉起当前会话用的代理，绝不改写启动项。
+            // 这时只更新内存参数；若 Run 仍精确指向旧版 AppData 代理，可安全
+            // 原地改成新路径，但绝不新建 Run 值或重新启用被隔离的启动项。
             var deferStartupMutation = _childSessionService.ShouldDeferSessionAgentStartupMutation();
             if (string.IsNullOrWhiteSpace(hotkey) && string.IsNullOrWhiteSpace(controlPipe))
             {
@@ -1561,7 +1576,11 @@ public partial class MainWindowViewModel : ObservableObject
             }
 
             // 自启项只在下次登录时生效；当前分身已经在运行时立刻补拉一份。
-            _ = _sessionAgent.TryStartInChildSession();
+            if (startInChildSession)
+            {
+                _ = _sessionAgent.TryStartInChildSession();
+            }
+
             return true;
         }
         catch (Exception exception)

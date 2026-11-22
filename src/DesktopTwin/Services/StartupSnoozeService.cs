@@ -25,6 +25,14 @@ namespace DesktopTwin.Services;
 /// 本次日志涉及的全部启动程序；常驻阶段只拦截由会话 0 服务拉起的副本，
 /// 避免厂商服务绕过启动项开关后，在分身里长期留下重复程序。
 /// </param>
+/// <summary>
+/// 启动项枚举快照；仅用于无副作用的隔离流程测试。
+/// </summary>
+internal sealed record StartupSnoozeSnapshot(
+    List<StartupSnoozeRegistryEntry> Registry,
+    List<StartupSnoozeTaskEntry> Tasks,
+    List<StartupSnoozeUwpEntry> Uwp);
+
 public sealed record StartupSnoozeResult(
     bool Success,
     string Message,
@@ -128,11 +136,17 @@ public sealed class StartupSnoozeService
         WriteIndented = true
     };
 
+    private static readonly TimeSpan DefaultPresenceConfirmationDelay =
+        TimeSpan.FromMilliseconds(250);
+
     private readonly object _gate = new();
     private readonly bool _useMachineJournal;
     private readonly string? _journalValueName;
     private readonly string? _legacyJournalPath;
     private readonly Func<ChildSessionPresence> _childSessionPresenceProvider;
+    private readonly TimeSpan _presenceConfirmationDelay;
+    private readonly Func<List<string>> _refusalReasonsProvider;
+    private readonly Func<StartupSnoozeSnapshot>? _startupSnapshotProvider;
     private bool _appliedInThisInstance;
 
     /// <summary>
@@ -153,7 +167,10 @@ public sealed class StartupSnoozeService
     /// </summary>
     internal StartupSnoozeService(
         string? directory,
-        Func<ChildSessionPresence>? childSessionPresence)
+        Func<ChildSessionPresence>? childSessionPresence,
+        TimeSpan? presenceConfirmationDelay = null,
+        Func<List<string>>? refusalReasonsProvider = null,
+        Func<StartupSnoozeSnapshot>? startupSnapshotProvider = null)
     {
         Directory = directory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -163,6 +180,9 @@ public sealed class StartupSnoozeService
             ?? (_useMachineJournal
                 ? QueryNativeChildSessionPresence
                 : static () => ChildSessionPresence.Absent);
+        _presenceConfirmationDelay = presenceConfirmationDelay ?? DefaultPresenceConfirmationDelay;
+        _refusalReasonsProvider = refusalReasonsProvider ?? GetRefusalReasons;
+        _startupSnapshotProvider = startupSnapshotProvider;
         _journalValueName = _useMachineJournal ? BuildJournalValueName() : null;
         _legacyJournalPath = _useMachineJournal
             ? Path.Combine(
@@ -244,11 +264,60 @@ public sealed class StartupSnoozeService
     }
 
     /// <summary>
+    /// 恢复闸门要求的连续缺席次数。WTS 的单次查询可能刚好落在会话销毁或
+    /// 新会话创建的过渡窗口里，恢复启动项前必须跨过这个窗口。
+    /// </summary>
+    internal const int ConfirmedAbsenceScans = 3;
+
+    /// <summary>
+    /// 查询子会话存在性；只有连续 <see cref="ConfirmedAbsenceScans"/> 次都返回
+    /// <see cref="ChildSessionPresence.Absent"/> 才把结论视为“确认不存在”。
+    /// Present/Unknown 立即返回，绝不继续等待或把后续 Absent 当成确认。
+    /// </summary>
+    private ChildSessionPresence QueryConfirmedChildSessionPresence()
+    {
+        for (var scan = 0; scan < ConfirmedAbsenceScans; scan++)
+        {
+            var presence = QueryChildSessionPresence();
+            if (presence != ChildSessionPresence.Absent)
+            {
+                return presence;
+            }
+
+            if (scan + 1 < ConfirmedAbsenceScans && _presenceConfirmationDelay > TimeSpan.Zero)
+            {
+                Thread.Sleep(_presenceConfirmationDelay);
+            }
+        }
+
+        return ChildSessionPresence.Absent;
+    }
+
+    /// <summary>
+    /// 新开分身、修改启动项前的闸门：任何已存在或无法确认的分身会话都必须
+    /// 失败关闭。这里用单次严格探测配合写入前/后的复检；恢复路径另用三次确认。
+    /// </summary>
+    private StartupSnoozeResult? GetNewSessionIsolationBlockResult()
+    {
+        return QueryChildSessionPresence() switch
+        {
+            ChildSessionPresence.Present => StartupSnoozeResult.Fail(
+                "检测到已有分身会话，但没有走旧会话接管流程，已拒绝修改启动项。"
+                + "请先关闭已有分身，或使用可核对的关停日志接管它。"),
+            ChildSessionPresence.Unknown => StartupSnoozeResult.Fail(
+                "无法确认是否已有分身会话，已拒绝修改启动项。请关闭 DesktopTwin 后重试。"),
+            ChildSessionPresence.Absent => null,
+            _ => StartupSnoozeResult.Fail(
+                "分身会话状态返回值无效，已拒绝修改启动项。请关闭 DesktopTwin 后重试。")
+        };
+    }
+
+    /// <summary>
     /// 隐式恢复启动项前的统一闸门：只有连续确认没有子会话时才能恢复。
     /// </summary>
     internal StartupSnoozeResult? GetRestoreBlockResult()
     {
-        return QueryChildSessionPresence() switch
+        return QueryConfirmedChildSessionPresence() switch
         {
             ChildSessionPresence.Present => StartupSnoozeResult.Fail(
                 "检测到分身会话仍在运行，已保留启动项关停日志。"
@@ -256,7 +325,9 @@ public sealed class StartupSnoozeService
             ChildSessionPresence.Unknown => StartupSnoozeResult.Fail(
                 "无法确认分身会话是否已经结束，已保留启动项关停日志。"
                 + "请关闭 DesktopTwin 后稍后重试，确认没有分身会话后才能恢复启动项。"),
-            _ => null
+            ChildSessionPresence.Absent => null,
+            _ => StartupSnoozeResult.Fail(
+                "分身会话状态返回值无效，已保留启动项关停日志，拒绝恢复。")
         };
     }
 
@@ -270,21 +341,11 @@ public sealed class StartupSnoozeService
     {
         lock (_gate)
         {
-            var presence = QueryChildSessionPresence();
-            if (presence == ChildSessionPresence.Present)
-            {
-                return StartupSnoozeResult.Fail(
-                    "检测到已有分身会话，但没有走旧会话接管流程，已拒绝修改启动项。"
-                    + "请先关闭已有分身，或使用可核对的关停日志接管它。");
-            }
-
-            if (presence == ChildSessionPresence.Unknown)
-            {
-                return StartupSnoozeResult.Fail(
-                    "无法确认是否已有分身会话，已拒绝修改启动项。请关闭 DesktopTwin 后重试。");
-            }
-
-            return WithRestoreMutex(() => EnsureSnoozedCore(adoptExistingJournal: false));
+            // 会话探测和启动项写入必须在同一把跨进程恢复互斥体内完成。
+            // 在锁外先探测、再排队拿锁，会给新会话在空档中出现的窗口。
+            return WithRestoreMutex(() => EnsureSnoozedCore(
+                adoptExistingJournal: false,
+                requireAbsentSession: true));
         }
     }
 
@@ -296,25 +357,43 @@ public sealed class StartupSnoozeService
     {
         lock (_gate)
         {
-            if (QueryChildSessionPresence() != ChildSessionPresence.Present)
+            // 接管同样必须在互斥体内重新核对「会话仍在」和「日志仍在」。
+            // 否则排队拿锁期间会话可能已经退出，旧日志也可能已被恢复。
+            return WithRestoreMutex(() =>
             {
-                return StartupSnoozeResult.Fail(
-                    "无法确认已有分身会话仍在运行，已拒绝接管启动项隔离。");
-            }
+                if (QueryChildSessionPresence() != ChildSessionPresence.Present)
+                {
+                    return StartupSnoozeResult.Fail(
+                        "无法确认已有分身会话仍在运行，已拒绝接管启动项隔离。");
+                }
 
-            if (!IsSnoozed)
-            {
-                return StartupSnoozeResult.Fail(
-                    "检测到已有分身会话，但没有可核对的启动项关停日志。"
-                    + "为避免在未知会话下修改启动项，已拒绝连接；请先注销已有分身再重试。");
-            }
+                if (!IsSnoozed)
+                {
+                    return StartupSnoozeResult.Fail(
+                        "检测到已有分身会话，但没有可核对的启动项关停日志。"
+                        + "为避免在未知会话下修改启动项，已拒绝连接；请先注销已有分身再重试。");
+                }
 
-            return WithRestoreMutex(() => EnsureSnoozedCore(adoptExistingJournal: true));
+                return EnsureSnoozedCore(
+                    adoptExistingJournal: true,
+                    requireAbsentSession: false);
+            });
         }
     }
 
-    private StartupSnoozeResult EnsureSnoozedCore(bool adoptExistingJournal)
+    private StartupSnoozeResult EnsureSnoozedCore(
+        bool adoptExistingJournal,
+        bool requireAbsentSession)
     {
+        if (requireAbsentSession)
+        {
+            var presenceBlock = GetNewSessionIsolationBlockResult();
+            if (presenceBlock is not null)
+            {
+                return presenceBlock;
+            }
+        }
+
         if (_legacyJournalPath is not null && File.Exists(_legacyJournalPath) && !IsSnoozed)
         {
             AppLog.Warn("发现旧版用户可写目录中的启动项关停日志，拒绝把它当作提权恢复指令：" + _legacyJournalPath);
@@ -418,7 +497,7 @@ public sealed class StartupSnoozeService
             }
         }
 
-            var refusals = GetRefusalReasons();
+        var refusals = _refusalReasonsProvider();
             if (refusals.Count > 0)
             {
                 AppLog.Warn("存在未覆盖的启动源，已拒绝关停：" + string.Join("；", refusals));
@@ -440,13 +519,23 @@ public sealed class StartupSnoozeService
 
             try
             {
-                journal.Registry = CollectRegistryEntries(
-                    warnings,
-                    journal.DeferredExecutables,
-                    exceptions,
-                    blockedStartupItems);
-                journal.Tasks = CollectScheduledTasks();
-                journal.Uwp = CollectUwpTasks();
+                if (_startupSnapshotProvider is null)
+                {
+                    journal.Registry = CollectRegistryEntries(
+                        warnings,
+                        journal.DeferredExecutables,
+                        exceptions,
+                        blockedStartupItems);
+                    journal.Tasks = CollectScheduledTasks();
+                    journal.Uwp = CollectUwpTasks();
+                }
+                else
+                {
+                    var snapshot = _startupSnapshotProvider();
+                    journal.Registry = snapshot.Registry;
+                    journal.Tasks = snapshot.Tasks;
+                    journal.Uwp = snapshot.Uwp;
+                }
             }
             catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException
                                                   or IOException or InvalidOperationException
@@ -485,6 +574,20 @@ public sealed class StartupSnoozeService
                 return StartupSnoozeResult.Fail("保存启动项关停日志失败，未做任何修改：" + exception.Message);
             }
 
+            if (requireAbsentSession)
+            {
+                // 枚举启动项可能耗时。日志已经保存，但还没有写任何系统状态；
+                // 此时若子会话出现，必须保留日志并失败关闭，不能继续关停或连接。
+                var preMutationBlock = GetNewSessionIsolationBlockResult();
+                if (preMutationBlock is not null)
+                {
+                    AppLog.Warn("关停启动项前检测到子会话出现或状态未知，已保留关停日志并取消连接。");
+                    return StartupSnoozeResult.Fail(
+                        preMutationBlock.Message + " 启动项隔离尚未执行，关停日志已保留。",
+                        warnings);
+                }
+            }
+
             if (journal.Registry.Count == 0 && journal.Tasks.Count == 0 && journal.Uwp.Count == 0)
             {
                 if (blockedStartupItems.Count > 0)
@@ -498,6 +601,21 @@ public sealed class StartupSnoozeService
                     return StartupSnoozeResult.Fail(
                         blockedReason + "。启动项回滚：" + blockedRollback.Message,
                         warnings.Concat(blockedStartupItems).ToArray());
+                }
+
+                if (requireAbsentSession)
+                {
+                    // 空清单不写系统状态，但仍要在返回成功前做最后一次探测；
+                    // 否则会话在枚举期间出现时，连接流程会把“没有启动项”误当成
+                    // 可以安全继续。
+                    var emptyJournalBlock = GetNewSessionIsolationBlockResult();
+                    if (emptyJournalBlock is not null)
+                    {
+                        AppLog.Warn("空启动项清单完成前检测到子会话出现或状态未知，已取消连接。");
+                        return StartupSnoozeResult.Fail(
+                            emptyJournalBlock.Message + " 空关停日志已保留，未连接分身。",
+                            warnings);
+                    }
                 }
 
                 // 没有可关的东西也要落一份日志：否则「已关停」状态无法表示，
@@ -542,6 +660,40 @@ public sealed class StartupSnoozeService
                 return StartupSnoozeResult.Fail(
                     "关停启动项失败，已回滚：" + exception.Message + "；" + rollback.Message,
                     warnings);
+            }
+
+            if (requireAbsentSession)
+            {
+                // 写入系统状态期间子会话可能刚刚出现。此时启动项可能已经在
+                // 分身里被触发，不能再把隔离当成成功并继续连接；保留未完成
+                // 日志（否则恢复时会丢失原始状态），等确认会话结束后再恢复。
+                var postWriteBlock = GetNewSessionIsolationBlockResult();
+                if (postWriteBlock is not null)
+                {
+                    journal.Warnings = warnings;
+                    journal.Completed = false;
+                    var persistProblem = string.Empty;
+                    try
+                    {
+                        SaveJournal(journal);
+                    }
+                    catch (Exception exception) when (exception is IOException
+                                                          or UnauthorizedAccessException
+                                                          or System.Security.SecurityException)
+                    {
+                        persistProblem = " 此外，保存未完成关停日志失败：" + exception.Message;
+                        AppLog.Error("保存子会话出现后的未完成关停日志失败。", exception);
+                    }
+
+                    AppLog.Warn(
+                        "关停启动项期间检测到子会话出现或状态未知，已保留日志并取消连接。"
+                        + persistProblem);
+                    return StartupSnoozeResult.Fail(
+                        postWriteBlock.Message
+                        + " 启动项关停可能已经写入；未完成日志已保留，"
+                        + "请在确认分身会话结束后再恢复启动项。" + persistProblem,
+                        warnings);
+                }
             }
 
             blockedStartupItems = blockedStartupItems
@@ -601,6 +753,18 @@ public sealed class StartupSnoozeService
         lock (_gate)
         {
             return WithRestoreMutex(RestoreCore);
+        }
+    }
+
+    /// <summary>
+    /// 会话边界与恢复动作在同一个跨进程互斥体内完成：确认连续缺席后，
+    /// 不允许新子会话在恢复前插入，避免“检查通过后会话出现、启动项却被重新打开”。
+    /// </summary>
+    internal StartupSnoozeResult RestoreIfChildAbsent()
+    {
+        lock (_gate)
+        {
+            return WithRestoreMutex(() => GetRestoreBlockResult() ?? RestoreCore());
         }
     }
 
@@ -1060,7 +1224,7 @@ public sealed class StartupSnoozeService
             return null;
         }
 
-        switch (QueryChildSessionPresence())
+        switch (QueryConfirmedChildSessionPresence())
         {
             case ChildSessionPresence.Present:
                 // 崩溃恢复会刻意保留断线的子会话。此时恢复启动项，会让下次登录
@@ -1074,9 +1238,15 @@ public sealed class StartupSnoozeService
                     "无法确认上次的分身会话是否已经结束，已保留启动项关停日志，不会重新打开启动项。"
                     + "请稍后重试；若持续失败，请关闭 DesktopTwin 并检查系统会话状态。");
 
-            default:
+            case ChildSessionPresence.Absent:
                 AppLog.Warn("确认没有分身会话，正在按上次未完成的日志恢复启动项。");
                 return RestoreCore();
+
+            default:
+                AppLog.Warn("分身会话状态返回值无效，保留启动项关停日志并拒绝恢复。");
+                return StartupSnoozeResult.Fail(
+                    "分身会话状态返回值无效，已保留启动项关停日志，不会重新打开启动项。"
+                    + "请关闭 DesktopTwin 后重试。");
         }
     }
 
