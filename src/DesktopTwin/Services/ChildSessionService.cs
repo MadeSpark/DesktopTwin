@@ -280,6 +280,14 @@ public sealed class ChildSessionService : IDisposable
         uint? sessionId) => journalExists || !querySucceeded || sessionId.HasValue;
 
     /// <summary>
+    /// 登录完成后可能已等待数秒的隔离检查只能作用于捕获时的启动代际；
+    /// 后续启动已推进代际时，旧事件的失败与成功续体都必须作废。
+    /// </summary>
+    internal static bool IsCurrentLoginGeneration(
+        int capturedGeneration,
+        int currentGeneration) => capturedGeneration == currentGeneration;
+
+    /// <summary>
     /// 系统组合键是否发送到分身。
     /// </summary>
     public bool SendSystemShortcutsToRemote { get; private set; }
@@ -517,6 +525,30 @@ public sealed class ChildSessionService : IDisposable
         }
     }
 
+    /// <summary>
+    /// 被注销作废的旧启动流程只能在没有新启动接手时恢复启动项。
+    /// 新启动可能已经基于同一份日志重新完成隔离；旧流程若随后无条件恢复，
+    /// 会在新会话创建前把启动项重新打开，形成半隔离窗口。
+    /// </summary>
+    private bool HasNewerStartOperation(int startGeneration)
+    {
+        lock (_startOperationGate)
+        {
+            return ShouldTreatStartAsSuperseded(
+                startGeneration,
+                _startOperationGeneration,
+                _startOperation is { IsCompleted: false });
+        }
+    }
+
+    internal static bool ShouldTreatStartAsSuperseded(
+        int startGeneration,
+        int activeStartGeneration,
+        bool activeStartOperationExists)
+    {
+        return activeStartOperationExists && activeStartGeneration != startGeneration;
+    }
+
     private async Task StartCoreAsync(int? expectedGeneration)
     {
         ThrowIfDisposed();
@@ -529,6 +561,10 @@ public sealed class ChildSessionService : IDisposable
         }
 
         var startGeneration = _startGeneration;
+        // 外壳模式与启动项隔离必须来自同一个快照，并一直用到原生 Connect。
+        // 设置菜单可在后台预检期间被切换；若两处各读一次最新值，可能出现
+        // “注册表启动项已恢复，但 RDP 仍使用替代 shell”或反过来的半隔离状态。
+        var startupAppsEnabled = _settings.Current.Session.StartupAppsEnabled;
 
         // 预检可能读上千个计划任务 XML（深扫还要读内容）。这里已经跑在 UI 线程上了，
         // 直接调用会把界面卡住，所以扔到后台再回来。
@@ -583,24 +619,46 @@ public sealed class ChildSessionService : IDisposable
                 // 分身用同一账户登录，Windows 会把用户和公共启动项在子会话里再跑一遍；
                 // 单实例软件收到协议 / IPC 调用后还会把窗口拉回主桌面，于是「分身里启动」
                 // 变成「主桌面又冒出来一堆窗口」。连接前先按日志把这些启动源临时关掉。
-                startupIsolation = await PrepareStartupIsolationAsync().ConfigureAwait(true);
+                //
+                // 门卫必须在外壳日志落盘之前就存在且校验通过：一旦 Winlogon Shell
+                // 已改向门卫而文件缺失，下一次父会话登录将没有可用外壳。
+                if (!startupAppsEnabled
+                    && !SessionAgentService.TryEnsureShellGateInstalled(
+                        out _,
+                        out var shellGateError))
+                {
+                    throw new InvalidOperationException(
+                        "外壳门卫准备失败，已取消连接：" + shellGateError);
+                }
+
+                startupIsolation = await PrepareStartupIsolationAsync(startupAppsEnabled)
+                    .ConfigureAwait(true);
                 if (_disposed || startGeneration != _startGeneration)
                 {
                     // EnsureSnoozed 可能刚好在 Dispose 的恢复之后才落盘。这里必须
                     // 再按日志恢复一次，否则应用退出后会留下「开机启动被关掉」的状态。
                     if (_startupSnooze.IsSnoozed)
                     {
-                        try
+                        if (HasNewerStartOperation(startGeneration))
                         {
-                            var cleanup = await Task.Run(RestoreStartupIsolationCore).ConfigureAwait(true);
-                            if (!cleanup.Success)
-                            {
-                                AppLog.Warn("被取消的启动流程未能恢复启动项：" + cleanup.Message);
-                            }
+                            AppLog.Info("新一次启动已接手启动项日志，被取消的旧流程保留隔离状态。");
                         }
-                        catch (Exception exception) when (IsStartupSnoozeException(exception))
+                        else
                         {
-                            AppLog.Warn("被取消的启动流程恢复启动项时出错。", exception);
+                            try
+                            {
+                                // 注销可能仍在等待子会话退出。只有连续确认会话缺席才允许恢复；
+                                // 会话仍存在时保留日志，由注销流程在终止完成后恢复。
+                                var cleanup = await Task.Run(RestoreStartupIsolationCore).ConfigureAwait(true);
+                                if (!cleanup.Success)
+                                {
+                                    AppLog.Warn("被取消的启动流程暂未恢复启动项：" + cleanup.Message);
+                                }
+                            }
+                            catch (Exception exception) when (IsStartupSnoozeException(exception))
+                            {
+                                AppLog.Warn("被取消的启动流程恢复启动项时出错。", exception);
+                            }
                         }
                     }
 
@@ -619,43 +677,55 @@ public sealed class ChildSessionService : IDisposable
                 StartStartupGuard(
                     startupIsolation.StartupExecutables,
                     startupIsolation.ManagedStartupExecutables);
-                ConnectCore(Locale.Get("Svc.Status.Starting"));
+                ConnectCore(Locale.Get("Svc.Status.Starting"), startupAppsEnabled);
             }
             catch
             {
-                _autoLaunchPending = false;
-                _initialConnectionRetriesRemaining = 0;
-
-                // ConnectCore 同步失败时连接流程不会再进入会话生命周期；
-                // 这里立即恢复启动项，不能等 20 秒孤儿兜底，更不能让用户
-                // 以为失败后系统仍处于「隔离中」。
-                if (startupIsolation is { Success: true }
-                    && _startupSnooze.IsSnoozed
-                    && ConnectedState == 0
-                    && (_desktopWindow?.RdpHost.ConnectedState ?? 0) == 0)
+                var superseded = HasNewerStartOperation(startGeneration);
+                if (superseded)
                 {
-                    try
+                    AppLog.Info("新一次启动已接手连接状态，失败收尾不再修改共享状态或恢复启动项。");
+                }
+                else
+                {
+                    _autoLaunchPending = false;
+                    _initialConnectionRetriesRemaining = 0;
+
+                    // ConnectCore 同步失败时连接流程不会再进入会话生命周期；
+                    // 这里立即恢复启动项，不能等 20 秒孤儿兜底，更不能让用户
+                    // 以为失败后系统仍处于「隔离中」。
+                    if (startupIsolation is { Success: true }
+                        && _startupSnooze.IsSnoozed
+                        && ConnectedState == 0
+                        && (_desktopWindow?.RdpHost.ConnectedState ?? 0) == 0)
                     {
-                        var restore = await Task.Run(RestoreStartupIsolationCore).ConfigureAwait(true);
-                        if (restore.Success)
+                        try
                         {
-                            // 只有启动项确实写回且当前没有已连接的分身时才撤掉守卫。
-                            // 恢复失败时会话可能仍在运行，守卫必须继续兜底启动程序。
-                            StopStartupGuard();
+                            var restore = await Task.Run(RestoreStartupIsolationCore).ConfigureAwait(true);
+                            if (restore.Success)
+                            {
+                                // 只有启动项确实写回且当前没有已连接的分身时才撤掉守卫。
+                                // 恢复失败时会话可能仍在运行，守卫必须继续兜底启动程序。
+                                StopStartupGuard();
+                            }
+                            else
+                            {
+                                AppLog.Warn("连接启动失败后暂未恢复启动项，将等待会话退出后重试：" + restore.Message);
+                            }
                         }
-                        else
+                        catch (Exception exception) when (IsStartupSnoozeException(exception))
                         {
-                            AppLog.Warn("连接启动失败后恢复启动项失败，将等待孤儿兜底重试：" + restore.Message);
+                            AppLog.Warn("连接启动失败后恢复启动项时出错。", exception);
                         }
-                    }
-                    catch (Exception exception) when (IsStartupSnoozeException(exception))
-                    {
-                        AppLog.Warn("连接启动失败后恢复启动项时出错。", exception);
                     }
                 }
 
                 completionSource.TrySetResult(false);
-                _connectionAttemptCompletionSource = null;
+                if (ReferenceEquals(_connectionAttemptCompletionSource, completionSource))
+                {
+                    _connectionAttemptCompletionSource = null;
+                }
+
                 throw;
             }
         }
@@ -1369,9 +1439,10 @@ public sealed class ChildSessionService : IDisposable
     /// 默认关掉本机启动项；用户显式勾了「在分身里运行开机自启动项」就反过来，
     /// 把可能残留的关停日志恢复掉，让启动项照常运行。
     /// </summary>
-    private async Task<StartupSnoozeResult> PrepareStartupIsolationAsync()
+    private async Task<StartupSnoozeResult> PrepareStartupIsolationAsync(
+        bool startupAppsEnabled)
     {
-        var suppress = !_settings.Current.Session.StartupAppsEnabled;
+        var suppress = !startupAppsEnabled;
         var service = _startupSnooze;
 
         StartupSnoozeResult result;
@@ -1395,9 +1466,14 @@ public sealed class ChildSessionService : IDisposable
                     }
 
                     var existingSessionId = ChildSessionNativeMethods.GetChildSessionIdStrict();
+                    // 替代 shell 已屏蔽 Explorer，注册表 Run/RunOnce/Startup 文件夹
+                    // 不会在分身上执行。这样既不碰火绒等自保护启动项，也仍隔离
+                    // 计划任务和 UWP。已有旧日志中的注册表项继续由恢复路径处理。
                     return existingSessionId.HasValue
-                        ? service.EnsureSnoozedForExistingChildSession()
-                        : service.EnsureSnoozed();
+                        ? service.EnsureSnoozedForExistingChildSession(
+                            isolateRegistryStartupEntries: false)
+                        : service.EnsureSnoozed(
+                            isolateRegistryStartupEntries: false);
                 })
                 .ConfigureAwait(true);
         }
@@ -1974,7 +2050,17 @@ public sealed class ChildSessionService : IDisposable
         _disposeCancellationTokenSource.Dispose();
     }
 
-    private void ConnectCore(string operationMessage)
+    /// <summary>
+    /// 无论用户是否允许启动项，都不再使用 RDP 的 StartProgram/WorkDir。
+    /// <c>ConnectToChildSession</c> 会忽略这两个设置；真正可验证的外壳接管是
+    /// 当前用户 Winlogon Shell（启动项隔离时）或默认 Explorer。
+    /// </summary>
+    private static void ConfigureRdpShell(MainWindow window)
+    {
+        window.RdpHost.ClearShellGate();
+    }
+
+    private void ConnectCore(string operationMessage, bool startupAppsEnabled)
     {
         // WTS 查询失败时绝不能当作「没有已有会话」继续新建，否则会重复登录、
         // 重复拉起程序，并破坏启动项隔离的会话边界。
@@ -1990,6 +2076,8 @@ public sealed class ChildSessionService : IDisposable
 
         if (window.RdpHost.ConnectedState == 0)
         {
+            ConfigureRdpShell(window);
+
             // 会话是新建的才需要自动拉起目标程序；接管已有会话时不能替用户再开一份。
             _autoLaunchPending = existingSessionId is null
                                  && _settings.Current.Launch.AutoLaunchOnConnect
@@ -2287,7 +2375,7 @@ public sealed class ChildSessionService : IDisposable
         string message,
         int expectedGeneration)
     {
-        if (expectedGeneration != _startGeneration)
+        if (!IsCurrentLoginGeneration(expectedGeneration, Volatile.Read(ref _startGeneration)))
         {
             return;
         }
@@ -2336,6 +2424,28 @@ public sealed class ChildSessionService : IDisposable
         object? sender,
         ChildSessionConnectionFailedEventArgs e)
     {
+        // 旧控件或上一轮连接迟到的失败事件不能覆盖新一轮尝试的状态。
+        // 重试方法会以本服务作为 sender 合成失败事件，因此这里同时承认 self。
+        var senderIsForeign = sender is not null
+                              && !ReferenceEquals(sender, this)
+                              && !ReferenceEquals(sender, _desktopWindow?.RdpHost);
+
+        // 初始化/重试期间由连接完成源接收；分辨率等设置触发的重连则由待处理
+        // 设置标记接收。两者都不存在时，这轮尝试已经结束，迟到事件只能忽略。
+        var completionSource = _connectionAttemptCompletionSource;
+        var connectionAttemptPending = completionSource is { Task.IsCompleted: false };
+        var settingsReconnectPending = _pendingRdpSettingChanges != RdpSettingChange.None;
+        if (!ShouldAcceptRdpConnectionFailure(
+                _disposed,
+                Volatile.Read(ref _isolationFailureInProgress) != 0,
+                senderIsForeign,
+                connectionAttemptPending,
+                settingsReconnectPending))
+        {
+            AppLog.Warn("已忽略上一代、外来或已结束连接的迟到 RDP 失败事件。");
+            return;
+        }
+
         _lastConnectionFailure = e;
 
         // 这一轮连接结束了，停止盯凭据弹窗；下一次连接会重新开始计数。
@@ -2367,6 +2477,30 @@ public sealed class ChildSessionService : IDisposable
         CompleteConnectionFailure(e);
     }
 
+    /// <summary>
+    /// 登录事件可能早于替代 shell 进程创建。短暂轮询并绑定当前子会话身份，
+    /// 只有确认门卫仍在该会话中运行才允许继续；超时交由统一隔离失败路径注销。
+    /// </summary>
+    private static async Task<(bool Confirmed, string Error)> WaitForShellGateAsync()
+    {
+        var error = "未能在分身中确认外壳门卫。";
+        const int attempts = 40;
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            if (SessionAgentService.TryConfirmShellGateProcess(out error))
+            {
+                return (true, string.Empty);
+            }
+
+            if (attempt + 1 < attempts)
+            {
+                await Task.Delay(250).ConfigureAwait(true);
+            }
+        }
+
+        return (false, error);
+    }
+
     // RDP 报告连接成功后稍作等待，让新分身会话的桌面初始化完成。
     // 使用 OnLoginComplete 等待实际登录完成，避免依赖固定时长的延时。
     private async void OnRdpLoginCompleted(object? sender, EventArgs e)
@@ -2377,13 +2511,32 @@ public sealed class ChildSessionService : IDisposable
             return;
         }
 
-        _lastConnectionFailure = null;
-        _initialConnectionRetriesRemaining = 0;
-        _connectionRetryInProgress = false;
-        _credentialFailureSuspected = false;
-        // 登录成功之后一切照旧：下一次连接该自动填还是自动填。
-        _suppressCredentialDialogFill = false;
-        ChildSessionEnvironmentCheck.ClearConnectionFailure();
+        // 会话登录事件属于事件到达时的这一代连接。下面的外壳门卫验证可能等待
+        // 十秒；这期间用户完全可能注销并重新启动，因此代际必须在这里冻结，
+        // 不能在 await 之后读取最新值，否则旧事件会把新会话误判为失败并注销。
+        var loginGeneration = Volatile.Read(ref _startGeneration);
+
+        // 迟到事件可能在暂停期间排进调度队列。这里必须先于任何共享字段写入
+        // 判断代际，否则旧事件会清掉新一轮连接刚记录的失败、重试和凭据状态。
+        if (!IsCurrentLoginGeneration(
+                loginGeneration,
+                Volatile.Read(ref _startGeneration)))
+        {
+            AppLog.Info("忽略上一代 RDP 连接的迟到登录完成事件。");
+            return;
+        }
+
+        // 外壳模式读控件在发起 Connect 时冻结的选择，不能读可随时切换的设置。
+        // 控件也必须仍是当前桌面窗口的控件，避免已销毁窗口的迟到事件操作新连接。
+        var rdpHost = sender as RdpActiveXHost;
+        if (rdpHost is null || !ReferenceEquals(rdpHost, _desktopWindow?.RdpHost))
+        {
+            AppLog.Warn("收到不属于当前桌面窗口的 RDP 登录完成事件，已忽略。");
+            return;
+        }
+
+        var usesAlternateShell = rdpHost.UsesAlternateShell;
+        var watchMode = WatchModeEnabled;
 
         // 登录已经完成，再盯着凭据弹窗只会误填下一个（比如用户手动打开的安全对话框）。
         _autoLogin?.StopWatching();
@@ -2394,19 +2547,56 @@ public sealed class ChildSessionService : IDisposable
 
         // 输入窗口每次连接都会新建，观看模式需要重新施加到新窗口上。
         // 这里必须读回原生窗口状态，不能只相信设置值；失败立即注销，不能带着
-        // 可接收本机输入的 RDP 窗口继续运行。
-        var rdpHost = _desktopWindow?.RdpHost;
-        var inputResult = rdpHost?.SetInputBlocked(WatchModeEnabled)
-            ?? RdpInputWindowApplyResult.WindowMissing;
-        if (WatchModeEnabled && inputResult != RdpInputWindowApplyResult.Applied)
+        // 可接收本机输入的 RDP 窗口继续运行。此步骤必须早于门卫验证的等待。
+        var inputResult = rdpHost.SetInputBlocked(watchMode);
+        if (watchMode && inputResult != RdpInputWindowApplyResult.Applied)
         {
             var sessionId = ChildSessionNativeMethods.TryGetChildSessionId();
             _ = AbortForIsolationFailureAsync(
                 sessionId,
                 Locale.Get("Rdp.Error.WatchModeEnforceFailed"),
-                _startGeneration);
+                loginGeneration);
             return;
         }
+
+        if (usesAlternateShell)
+        {
+            // 启动项隔离的真正边界在这里：仅仅写入了 StartProgram 还不够，
+            // 必须证明当前会话里隐藏门卫已经运行。否则 Explorer 可能已按默认
+            // shell 启动，此时继续连接会把开机启动程序带进分身。
+            var gate = await WaitForShellGateAsync();
+            if (!gate.Confirmed)
+            {
+                var sessionId = ChildSessionNativeMethods.TryGetChildSessionId();
+                _ = AbortForIsolationFailureAsync(
+                    sessionId,
+                    "替代外壳验证失败，已注销分身：" + gate.Error,
+                    loginGeneration);
+                return;
+            }
+
+            AppLog.Info("已确认分身由 DesktopTwin 隐藏外壳门卫接管。");
+        }
+
+        if (!IsCurrentLoginGeneration(
+                loginGeneration,
+                Volatile.Read(ref _startGeneration))
+            || Volatile.Read(ref _isolationFailureInProgress) != 0)
+        {
+            // 门卫验证成功也不能让旧连接或已判定隔离失败的连接继续消费
+            // 新连接的完成源、自动启动标记或设置状态。
+            AppLog.Info("忽略已被后续启动或隔离失败取代的 RDP 登录完成事件。");
+            return;
+        }
+
+        // 只有输入与外壳隔离都确认后，才允许提交共享的连接成功状态。
+        _lastConnectionFailure = null;
+        _initialConnectionRetriesRemaining = 0;
+        _connectionRetryInProgress = false;
+        _credentialFailureSuspected = false;
+        // 登录成功之后一切照旧：下一次连接该自动填还是自动填。
+        _suppressCredentialDialogFill = false;
+        ChildSessionEnvironmentCheck.ClearConnectionFailure();
 
         _connectionAttemptCompletionSource?.TrySetResult(true);
 
@@ -2433,15 +2623,25 @@ public sealed class ChildSessionService : IDisposable
             RefreshState(Locale.Get("Svc.Status.LoginInitialized"));
         }
 
-        if (!_autoLaunchPending)
+        if (!IsCurrentLoginGeneration(
+                loginGeneration,
+                Volatile.Read(ref _startGeneration))
+            || Volatile.Read(ref _isolationFailureInProgress) != 0
+            || !_autoLaunchPending)
         {
             return;
         }
 
         _autoLaunchPending = false;
         await Task.Yield();
-        if (_disposed)
+        if (_disposed
+            || !IsCurrentLoginGeneration(
+                loginGeneration,
+                Volatile.Read(ref _startGeneration))
+            || Volatile.Read(ref _isolationFailureInProgress) != 0)
         {
+            // 让出 UI 队列后可能已经注销、重启或判定隔离失败；旧续体不能
+            // 消费新一轮的 _autoLaunchPending，更不能把目标程序拉进新会话。
             return;
         }
 
@@ -2769,6 +2969,19 @@ public sealed class ChildSessionService : IDisposable
             or InvalidOperationException
             or FileNotFoundException
             or ArgumentException;
+    }
+
+    internal static bool ShouldAcceptRdpConnectionFailure(
+        bool disposed,
+        bool isolationFailureInProgress,
+        bool senderIsForeign,
+        bool connectionAttemptPending,
+        bool settingsReconnectPending)
+    {
+        return !disposed
+               && !isolationFailureInProgress
+               && !senderIsForeign
+               && (connectionAttemptPending || settingsReconnectPending);
     }
 
     private void ThrowIfDisposed()

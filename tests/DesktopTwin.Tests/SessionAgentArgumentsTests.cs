@@ -429,4 +429,70 @@ public sealed class SessionAgentArgumentsTests
         Assert.True(r.TestMode);
         Assert.True(r.NoHotkey);
     }
+
+    [Fact]
+    public void 外壳门卫只接受当前会话内的精确系统资源管理器路径()
+    {
+        const string cWindows = @"C:\Windows";
+        const string dWindows = @"D:\Windows";
+        var cExplorer = Path.Combine(cWindows, "explorer.exe");
+        var dExplorer = Path.Combine(dWindows, "explorer.exe");
+
+        // 唯一允许：同一会话 + Windows 目录下大小写不敏感的 explorer.exe。
+        Assert.True(IsExactExplorerProcessIdentity(7, 7, cExplorer, cWindows));
+        Assert.True(IsExactExplorerProcessIdentity(
+            7, 7, cExplorer.ToUpperInvariant(), cWindows.ToUpperInvariant()));
+        Assert.True(IsExactExplorerProcessIdentity(7, 7, dExplorer, dWindows));
+
+        var rejected = new[]
+        {
+            (Current: 7, Candidate: 8, Path: cExplorer, Windows: cWindows),
+            (Current: 0, Candidate: 0, Path: cExplorer, Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: Path.Combine(cWindows, "System32", "explorer.exe"), Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: Path.Combine(cWindows, "System32", "..", "explorer.exe"), Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: cExplorer + ".", Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: cExplorer + ":stream", Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: @"\\?\C:\Windows\explorer.exe", Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: cExplorer, Windows: dWindows),
+            (Current: 7, Candidate: 7, Path: "explorer.exe", Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: Path.Combine(cWindows, "renamed.exe"), Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: cExplorer + Path.DirectorySeparatorChar, Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: cWindows + Path.DirectorySeparatorChar, Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: "", Windows: cWindows),
+            (Current: 7, Candidate: 7, Path: cExplorer, Windows: "")
+        };
+
+        foreach (var item in rejected)
+        {
+            Assert.False(
+                IsExactExplorerProcessIdentity(
+                    item.Current,
+                    item.Candidate,
+                    item.Path,
+                    item.Windows),
+                $"不应接受外壳路径：{item.Path}；会话：{item.Current}/{item.Candidate}");
+        }
+    }
+
+    private static bool IsExactExplorerProcessIdentity(
+        int currentSessionId,
+        int candidateSessionId,
+        string? candidateImagePath,
+        string windowsDirectory)
+    {
+        var agent = LoadAgentAssembly();
+        var programType = agent.GetType("DesktopTwinSessionAgent.Program")
+            ?? throw new InvalidOperationException("DesktopTwinSessionAgent.Program not found");
+        var method = programType.GetMethod(
+                "IsExactExplorerProcessIdentity",
+                BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("IsExactExplorerProcessIdentity method not found");
+        return (bool)method.Invoke(null, new object?[]
+        {
+            currentSessionId,
+            candidateSessionId,
+            candidateImagePath,
+            windowsDirectory
+        })!;
+    }
 }

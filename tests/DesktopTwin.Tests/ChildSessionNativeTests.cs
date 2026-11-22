@@ -114,4 +114,76 @@ public sealed class ChildSessionNativeTests
             querySucceeded: true,
             sessionId: null));
     }
+
+    [Fact]
+    public void 延迟登录检查在启动代际推进后必须作废()
+    {
+        Assert.False(ChildSessionService.IsCurrentLoginGeneration(
+            capturedGeneration: 4,
+            currentGeneration: 5));
+    }
+
+    [Fact]
+    public void 延迟登录检查仍属于同一启动代际时才可继续()
+    {
+        Assert.True(ChildSessionService.IsCurrentLoginGeneration(
+            capturedGeneration: 5,
+            currentGeneration: 5));
+    }
+
+    [Fact]
+    public void 新启动已接手时旧启动失败不得恢复启动项()
+    {
+        Assert.True(ChildSessionService.ShouldTreatStartAsSuperseded(
+            startGeneration: 4,
+            activeStartGeneration: 5,
+            activeStartOperationExists: true));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void 同一代际的启动不得误判为被新启动取代(
+        bool activeStartOperationExists)
+    {
+        Assert.False(ChildSessionService.ShouldTreatStartAsSuperseded(
+            startGeneration: 5,
+            activeStartGeneration: 5,
+            activeStartOperationExists));
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void 当前初始化或设置重连仍必须接收RDP失败事件(
+        bool connectionAttemptPending,
+        bool settingsReconnectPending)
+    {
+        Assert.True(ChildSessionService.ShouldAcceptRdpConnectionFailure(
+            disposed: false,
+            isolationFailureInProgress: false,
+            senderIsForeign: false,
+            connectionAttemptPending,
+            settingsReconnectPending));
+    }
+
+    [Theory]
+    [InlineData(true, false, false, false, false)]
+    [InlineData(false, true, false, true, false)]
+    [InlineData(false, false, true, true, false)]
+    [InlineData(false, false, false, false, false)]
+    public void 已结束外来隔离失败或已释放连接的RDP事件必须丢弃(
+        bool disposed,
+        bool isolationFailureInProgress,
+        bool senderIsForeign,
+        bool connectionAttemptPending,
+        bool settingsReconnectPending)
+    {
+        Assert.False(ChildSessionService.ShouldAcceptRdpConnectionFailure(
+            disposed,
+            isolationFailureInProgress,
+            senderIsForeign,
+            connectionAttemptPending,
+            settingsReconnectPending));
+    }
 }

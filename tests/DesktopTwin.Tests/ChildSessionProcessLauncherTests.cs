@@ -33,6 +33,7 @@ public sealed class ChildSessionProcessLauncherTests
     [InlineData("DesktopTwin-SessionLaunch-{0123456789abcdef0123456789abcdef}", false)]
     [InlineData("desktoptwin-sessionlaunch-0123456789abcdef0123456789abcdef", false)]
     [InlineData("DesktopTwin-SessionLaunch-0123456789abcdef0123456789abcdef-extra", false)]
+    [InlineData("DesktopTwin-SessionAgent-Autostart", false)]
     public void 临时任务名必须是精确前缀和32位GUID(string taskName, bool expected)
     {
         Assert.Equal(expected, ChildSessionProcessLauncher.IsManagedTemporaryTaskName(taskName));
@@ -73,6 +74,34 @@ public sealed class ChildSessionProcessLauncherTests
         Assert.True(ChildSessionProcessLauncher.HasExpectedTaskRegistrationInfo(
             ChildSessionProcessLauncher.TaskAuthor,
             description));
+    }
+
+    [Fact]
+    public void 持久登录任务使用固定名称且不会被临时任务清扫误删()
+    {
+        Assert.Equal(
+            "DesktopTwin-SessionAgent-Autostart",
+            ChildSessionProcessLauncher.SessionAgentStartupTaskName);
+        Assert.False(ChildSessionProcessLauncher.IsManagedTemporaryTaskName(
+            ChildSessionProcessLauncher.SessionAgentStartupTaskName));
+    }
+
+    [Fact]
+    public void 持久登录任务只接受精确的作者和描述()
+    {
+        Assert.True(ChildSessionProcessLauncher.HasExpectedSessionAgentTaskRegistrationInfo(
+            ChildSessionProcessLauncher.TaskAuthor,
+            ChildSessionProcessLauncher.SessionAgentStartupTaskDescription));
+
+        Assert.False(ChildSessionProcessLauncher.HasExpectedSessionAgentTaskRegistrationInfo(
+            "SomeoneElse",
+            ChildSessionProcessLauncher.SessionAgentStartupTaskDescription));
+        Assert.False(ChildSessionProcessLauncher.HasExpectedSessionAgentTaskRegistrationInfo(
+            ChildSessionProcessLauncher.TaskAuthor,
+            "用户自定义任务"));
+        Assert.False(ChildSessionProcessLauncher.HasExpectedSessionAgentTaskRegistrationInfo(
+            ChildSessionProcessLauncher.TaskAuthor,
+            ChildSessionProcessLauncher.SessionAgentStartupTaskDescription + " "));
     }
 
     [Fact]

@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
@@ -43,6 +44,10 @@ internal sealed class RdpActiveXHost : AxHost
     private bool _smartSizingEnabled = true;
     private readonly RdpSmartSizingController _smartSizing;
     private bool _inputBlocked;
+    private bool _shellGateSelectionConfigured;
+    private bool _useAlternateShell;
+    private string? _shellGateProgramPath;
+    private string? _shellGateWorkingDirectory;
     private Func<(string UserName, string Domain, string Password)?>? _credentialProvider;
 
     internal event EventHandler<ChildSessionConnectionFailedEventArgs>? ConnectionFailed;
@@ -89,6 +94,78 @@ internal sealed class RdpActiveXHost : AxHost
         _credentialProvider = provider;
     }
 
+    /// <summary>
+    /// 指定替代资源管理器的隐藏外壳门卫。路径必须已经由
+    /// <see cref="SessionAgentService.TryEnsureShellGateInstalled"/> 释放并验证。
+    /// 这里再次校验固定文件名、同目录关系、普通文件和绝对路径，避免任意程序
+    /// 被误写进 RDP 的 StartProgram。
+    /// </summary>
+    internal void SetShellGate(string programPath, string workingDirectory)
+    {
+        if (!Path.IsPathFullyQualified(programPath)
+            || !Path.IsPathFullyQualified(workingDirectory))
+        {
+            throw new ArgumentException("外壳门卫路径必须是绝对路径。");
+        }
+
+        var normalizedProgram = Path.GetFullPath(programPath);
+        var normalizedDirectory = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(workingDirectory));
+        if (!string.Equals(
+                Path.GetFileName(normalizedProgram),
+                SessionAgentService.ShellGateFileName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("外壳门卫文件名不符合固定安装约定。");
+        }
+
+        var actualDirectory = Path.GetDirectoryName(normalizedProgram);
+        if (string.IsNullOrWhiteSpace(actualDirectory)
+            || !string.Equals(
+                Path.TrimEndingDirectorySeparator(actualDirectory),
+                normalizedDirectory,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("外壳门卫必须位于指定的工作目录中。");
+        }
+
+        if (!File.Exists(normalizedProgram))
+        {
+            throw new FileNotFoundException("外壳门卫文件不存在。", normalizedProgram);
+        }
+
+        var attributes = File.GetAttributes(normalizedProgram);
+        if ((attributes & FileAttributes.ReparsePoint) != 0
+            || (attributes & FileAttributes.Directory) != 0)
+        {
+            throw new IOException("外壳门卫必须是普通文件，不能是目录或重解析点。");
+        }
+
+        _shellGateSelectionConfigured = true;
+        _useAlternateShell = true;
+        _shellGateProgramPath = normalizedProgram;
+        _shellGateWorkingDirectory = normalizedDirectory;
+    }
+
+    /// <summary>
+    /// 用户显式允许在分身中运行启动项时恢复 Explorer。下一次连接会清空
+    /// StartProgram/WorkDir 并读回确认，不能只依赖控件上次会话的残留值。
+    /// </summary>
+    internal void ClearShellGate()
+    {
+        _shellGateSelectionConfigured = true;
+        _useAlternateShell = false;
+        _shellGateProgramPath = null;
+        _shellGateWorkingDirectory = null;
+    }
+
+    /// <summary>
+    /// 本次连接实际选择的外壳模式。登录后续验证必须读这里，不能重新读取
+    /// 可随时被用户改动的设置，否则连接使用 Explorer 时可能跳过门卫检查，
+    /// 或连接使用门卫时误按 Explorer 模式收尾。
+    /// </summary>
+    internal bool UsesAlternateShell => _useAlternateShell;
+
     internal void ConnectToChildSession(DrawingSize desktopSize)
     {
         if (ConnectedState != 0)
@@ -112,6 +189,22 @@ internal sealed class RdpActiveXHost : AxHost
 
         var securedSettings = GetComProperty(client, "SecuredSettings2")
             ?? throw new COMException(Locale.Get("Rdp.Error.SecuredSettings"));
+        if (!_shellGateSelectionConfigured)
+        {
+            throw new COMException("尚未选择分身外壳模式，拒绝连接。");
+        }
+
+        // 整个连接只认调用开始时的模式。后面的 COM 调用可能处理消息并发生重入，
+        // 若逐步读取字段，连接参数、读回校验和 Connect 前的预检可能属于两种模式。
+        var useAlternateShell = _useAlternateShell;
+        var shellGateProgram = useAlternateShell
+            ? _shellGateProgramPath
+              ?? throw new COMException("尚未配置并验证外壳门卫，拒绝连接分身。")
+            : string.Empty;
+        var shellGateDirectory = useAlternateShell
+            ? _shellGateWorkingDirectory
+              ?? throw new COMException("尚未配置外壳门卫工作目录，拒绝连接分身。")
+            : string.Empty;
         // 观看模式必须把键盘钩子留在远程会话内。SendSystemShortcutsToRemote
         // 只影响控制模式；用户以前存下的 true 不能在观看/MCP 模式下恢复本机钩子。
         var hookMode = GetSafeKeyboardHookMode(
@@ -138,6 +231,34 @@ internal sealed class RdpActiveXHost : AxHost
                 securedSettings,
                 "AudioRedirectionMode",
                 _audioMuted ? DisableRemoteAudio : RedirectAudioToClient));
+        RunComStep(Locale.Get("Rdp.Step.ShellGate"), () =>
+        {
+            // 替代默认 shell：隐藏门卫不会启动 Explorer，因此 Run、RunOnce、
+            // Startup 文件夹、UWP shell 启动项与 shell 计划任务都不会被加载。
+            // StartProgram 语义是“程序名”，门卫路径不含空格且已做受保护安装。
+            // 用户显式允许启动项时清空这两个属性，让 Explorer 成为默认 shell。
+            SetComProperty(securedSettings, "StartProgram", shellGateProgram);
+            SetComProperty(securedSettings, "WorkDir", shellGateDirectory);
+            var actualProgram = GetComProperty(securedSettings, "StartProgram");
+            var actualDirectory = GetComProperty(securedSettings, "WorkDir");
+            var pathsMatch = useAlternateShell
+                ? MatchesConfiguredPath(
+                      actualProgram,
+                      shellGateProgram,
+                      isDirectory: false)
+                  && MatchesConfiguredPath(
+                      actualDirectory,
+                      shellGateDirectory,
+                      isDirectory: true)
+                : IsUnsetConfiguredPath(actualProgram)
+                  && IsUnsetConfiguredPath(actualDirectory);
+            if (!pathsMatch)
+            {
+                throw new COMException(
+                    $"外壳配置读回不一致：StartProgram={actualProgram ?? "(空)"}，"
+                    + $"WorkDir={actualDirectory ?? "(空)"}。");
+            }
+        });
 
         var advancedSettings = GetComProperty(client, "AdvancedSettings7")
             ?? throw new COMException(Locale.Get("Rdp.Error.AdvancedSettings"));
@@ -176,7 +297,7 @@ internal sealed class RdpActiveXHost : AxHost
 
         // 写入后、原生 Connect 前再读回一次。若控件在配置过程中改写了隔离属性，
         // 这里必须终止连接；测试也以该入口证明失败时 Connect 不会被调用。
-        RunIsolationPreflightBeforeConnect(
+        Action connect = () => RunIsolationPreflightBeforeConnect(
             hookMode,
             () => GetComProperty(securedSettings, "KeyboardHookMode"),
             () => GetComProperty(advancedSettings, "RedirectClipboard"),
@@ -190,7 +311,9 @@ internal sealed class RdpActiveXHost : AxHost
                 _disconnectRequested = false;
                 try
                 {
-                    RunComStep(Locale.Get("Rdp.Step.Connect"), () => InvokeComMethod(client, "Connect"));
+                    RunComStep(
+                        Locale.Get("Rdp.Step.Connect"),
+                        () => InvokeComMethod(client, "Connect"));
                 }
                 catch
                 {
@@ -198,6 +321,22 @@ internal sealed class RdpActiveXHost : AxHost
                     throw;
                 }
             });
+        if (useAlternateShell)
+        {
+            RunShellGatePreflightBeforeConnect(
+                shellGateProgram,
+                shellGateDirectory,
+                () => GetComProperty(securedSettings, "StartProgram"),
+                () => GetComProperty(securedSettings, "WorkDir"),
+                connect);
+        }
+        else
+        {
+            RunExplorerShellPreflightBeforeConnect(
+                () => GetComProperty(securedSettings, "StartProgram"),
+                () => GetComProperty(securedSettings, "WorkDir"),
+                connect);
+        }
     }
 
     internal void SendShowDesktopShortcut()
@@ -311,6 +450,154 @@ internal sealed class RdpActiveXHost : AxHost
             ulong value => value == (ulong)expected,
             _ => false
         };
+    }
+
+    /// <summary>
+    /// 在调用 RDP 原生 Connect 前重新确认替代 shell 的程序与工作目录。
+    /// 任一读回缺失、带命令行参数、相对路径或不匹配都失败关闭。
+    /// </summary>
+    internal static void RunShellGatePreflightBeforeConnect(
+        string expectedProgramPath,
+        string expectedWorkingDirectory,
+        Func<object?> readStartProgram,
+        Func<object?> readWorkingDirectory,
+        Action connect)
+    {
+        ArgumentNullException.ThrowIfNull(readStartProgram);
+        ArgumentNullException.ThrowIfNull(readWorkingDirectory);
+        ArgumentNullException.ThrowIfNull(connect);
+        if (!TryNormalizeConfiguredPath(
+                expectedProgramPath,
+                isDirectory: false,
+                out var expectedProgram)
+            || !TryNormalizeConfiguredPath(
+                expectedWorkingDirectory,
+                isDirectory: true,
+                out var expectedDirectory))
+        {
+            throw new COMException("外壳门卫的期望路径无效，拒绝连接。");
+        }
+
+        var actualProgram = readStartProgram();
+        if (!TryNormalizeConfiguredPath(
+                actualProgram as string,
+                isDirectory: false,
+                out var normalizedProgram)
+            || !string.Equals(
+                normalizedProgram,
+                expectedProgram,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new COMException(
+                $"连接前 StartProgram 读回 {actualProgram ?? "(空)"}，期望 {expectedProgram}。");
+        }
+
+        var actualDirectory = readWorkingDirectory();
+        if (!TryNormalizeConfiguredPath(
+                actualDirectory as string,
+                isDirectory: true,
+                out var normalizedDirectory)
+            || !string.Equals(
+                normalizedDirectory,
+                expectedDirectory,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new COMException(
+                $"连接前 WorkDir 读回 {actualDirectory ?? "(空)"}，期望 {expectedDirectory}。");
+        }
+
+        connect();
+    }
+
+    /// <summary>
+    /// 用户显式启用启动项时，连接前必须确认 StartProgram/WorkDir 确实为空，
+    /// 否则上一次替代 shell 的残留值仍会屏蔽 Explorer。
+    /// </summary>
+    internal static void RunExplorerShellPreflightBeforeConnect(
+        Func<object?> readStartProgram,
+        Func<object?> readWorkingDirectory,
+        Action connect)
+    {
+        ArgumentNullException.ThrowIfNull(readStartProgram);
+        ArgumentNullException.ThrowIfNull(readWorkingDirectory);
+        ArgumentNullException.ThrowIfNull(connect);
+        var actualProgram = readStartProgram();
+        if (!IsUnsetConfiguredPath(actualProgram))
+        {
+            throw new COMException(
+                $"连接前 StartProgram 读回 {actualProgram ?? "(空)"}，期望为空。");
+        }
+
+        var actualDirectory = readWorkingDirectory();
+        if (!IsUnsetConfiguredPath(actualDirectory))
+        {
+            throw new COMException(
+                $"连接前 WorkDir 读回 {actualDirectory ?? "(空)"}，期望为空。");
+        }
+
+        connect();
+    }
+
+    internal static bool IsUnsetConfiguredPath(object? actual) =>
+        actual is null || actual is string value && string.IsNullOrWhiteSpace(value);
+
+    internal static bool MatchesConfiguredPath(
+        object? actual,
+        string expected,
+        bool isDirectory) =>
+        TryNormalizeConfiguredPath(actual as string, isDirectory, out var normalizedActual)
+        && TryNormalizeConfiguredPath(expected, isDirectory, out var normalizedExpected)
+        && string.Equals(
+            normalizedActual,
+            normalizedExpected,
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool TryNormalizeConfiguredPath(
+        string? value,
+        bool isDirectory,
+        out string normalized)
+    {
+        normalized = string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var candidate = value.Trim();
+        if (candidate.Length >= 2 && candidate[0] == '"' && candidate[^1] == '"')
+        {
+            candidate = candidate[1..^1];
+            if (candidate.Length == 0 || candidate.Contains('"'))
+            {
+                return false;
+            }
+        }
+        else if (candidate.Contains('"'))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!Path.IsPathFullyQualified(candidate))
+            {
+                return false;
+            }
+
+            normalized = Path.GetFullPath(candidate);
+            if (isDirectory)
+            {
+                normalized = Path.TrimEndingDirectorySeparator(normalized);
+            }
+
+            return normalized.Length > 0;
+        }
+        catch (Exception exception) when (exception is ArgumentException
+                                              or NotSupportedException
+                                              or PathTooLongException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

@@ -26,6 +26,17 @@ internal readonly record struct LoginCompletionUpdate(
     bool InvalidateObservedSession);
 
 /// <summary>
+/// 进程树中单个节点的稳定身份。父 PID 来自同一轮 Toolhelp 快照，启动时间与
+/// 会话号在打开句柄后复核，避免把 PID 回收后的新进程当作祖先。
+/// </summary>
+internal readonly record struct ProcessAncestryInfo(
+    int ProcessId,
+    int ParentProcessId,
+    uint SessionId,
+    DateTime StartedAt,
+    string? ExecutablePath);
+
+/// <summary>
 /// 子会话启动程序守卫。
 ///
 /// 第一道防线仍是把注册表 / 计划任务里的启动源临时关掉。杀毒软件、单实例程序
@@ -289,6 +300,25 @@ internal sealed class StartupGuardService : IDisposable
     }
 
     /// <summary>
+    /// 已存在进程只在“会话 0 服务拉起”的证据下拦截。重连到正在使用的子会话时，
+    /// 用户先前打开的窗口只能走登录阶段兜底；但厂商服务注入的启动副本即使早于
+    /// 守卫启动，也必须清理，否则接管已有会话会永久漏放这些副本。
+    /// </summary>
+    internal static bool ShouldTerminateObservedProcess(
+        bool existedBeforeGuard,
+        bool allowDirectFallback,
+        bool directFallbackMatch,
+        bool serviceSpawnMatch)
+    {
+        if (serviceSpawnMatch)
+        {
+            return true;
+        }
+
+        return !existedBeforeGuard && allowDirectFallback && directFallbackMatch;
+    }
+
+    /// <summary>
     /// 判定当前观察到的会话是否仍是同一登录身份。登录时间任一方向未知时
     /// 宁可失败关闭，也不把旧基线沿用到可能复用的会话号上。两边都为 null
     /// 只允许在明确的登录兜底上限内等待；超过上限必须交给调用方失败关闭。
@@ -407,6 +437,10 @@ internal sealed class StartupGuardService : IDisposable
     /// 常驻在会话 0，却把用户界面进程创建到子会话；这正是禁用启动项后
     /// 仍出现重复程序的原因。用户自己从子会话启动的同路径程序父进程在
     /// 子会话，不会命中。
+    ///
+    /// 该方法保留为直接父进程的轻量判定，供兼容测试和单层调用使用；
+    /// 实际扫描使用 <see cref="ShouldTerminateManagedServiceSpawn"/>，允许
+    /// GameViewerServer.exe 这类精确受管中间进程桥接到会话 0 的厂商服务。
     /// </summary>
     internal static bool ShouldTerminateServiceSpawn(
         uint processSessionId,
@@ -433,6 +467,81 @@ internal sealed class StartupGuardService : IDisposable
 
         return ProcessNativeMethods.TryNormalizeImagePath(executablePath, out var normalized)
                && exactPaths.Contains(normalized);
+    }
+
+    /// <summary>
+    /// 常驻阶段的严格进程树判定。候选进程本身仍必须是目标会话里的精确受管
+    /// 路径；从它的直接父进程开始，只允许经过目标会话里同样精确受管的中间
+    /// 进程，最终到达会话 0 的已存在祖先。最多八层，任何一环读不到路径、
+    /// 会话不符、启动时间倒序、出现环或 PID 复用迹象都失败关闭。
+    ///
+    /// 这条路径专门覆盖 crashpad_handler.exe：它通常由子会话里的
+    /// GameViewerServer.exe 拉起，而后者由会话 0 的 GameViewerService.exe
+    /// 拉起。绝不沿任意服务或登录基础设施向上走。
+    /// </summary>
+    internal static bool ShouldTerminateManagedServiceSpawn(
+        uint processSessionId,
+        uint targetSessionId,
+        uint mainSessionId,
+        string? executablePath,
+        int parentProcessId,
+        DateTime processStartedAt,
+        IReadOnlySet<string> exactPaths,
+        Func<int, ProcessAncestryInfo?> resolveAncestor,
+        int maximumDepth = 8)
+    {
+        if (targetSessionId == mainSessionId
+            || processSessionId != targetSessionId
+            || processSessionId == mainSessionId
+            || parentProcessId <= 0
+            || maximumDepth <= 0
+            || string.IsNullOrWhiteSpace(executablePath)
+            || !ProcessNativeMethods.TryNormalizeImagePath(executablePath, out var normalizedCandidate)
+            || !exactPaths.Contains(normalizedCandidate))
+        {
+            return false;
+        }
+
+        var seenProcessIds = new HashSet<int>();
+        var childStartedAt = processStartedAt;
+        var ancestorProcessId = parentProcessId;
+
+        for (var depth = 0; depth < maximumDepth; depth++)
+        {
+            if (ancestorProcessId <= 0 || !seenProcessIds.Add(ancestorProcessId))
+            {
+                return false;
+            }
+
+            var ancestor = resolveAncestor(ancestorProcessId);
+            if (ancestor is not { } identity
+                || identity.ProcessId != ancestorProcessId
+                || identity.StartedAt > childStartedAt)
+            {
+                return false;
+            }
+
+            // 会话 0 的服务祖先可以是任意的已安装服务；关键是它必须真实存在、
+            // 早于子进程启动，并且从候选进程到它之间的每一层都由精确受管程序
+            // 构成。绝不能放宽为按进程名或安装目录匹配。
+            if (identity.SessionId == 0)
+            {
+                return true;
+            }
+
+            if (identity.SessionId != targetSessionId
+                || string.IsNullOrWhiteSpace(identity.ExecutablePath)
+                || !ProcessNativeMethods.TryNormalizeImagePath(identity.ExecutablePath, out var normalizedAncestor)
+                || !exactPaths.Contains(normalizedAncestor))
+            {
+                return false;
+            }
+
+            childStartedAt = identity.StartedAt;
+            ancestorProcessId = identity.ParentProcessId;
+        }
+
+        return false;
     }
 
     private void Monitor()
@@ -719,10 +828,16 @@ internal sealed class StartupGuardService : IDisposable
             return;
         }
 
-        foreach (var process in processes)
+        // 先完成整轮判定，再统一终止。这样父进程 GameViewerServer.exe 不会在
+        // 子进程 crashpad_handler.exe 被检查前先退出，进程树证据不会因枚举
+        // 顺序而丢失。Process 对象持有已固定句柄，后续 Kill 仍指向原进程。
+        var interceptions = new List<(Process Process, string DisplayPath, DateTime StartedAt)>();
+        try
         {
-            using (process)
+            var cancelled = false;
+            foreach (var process in processes)
             {
+                var keepForInterception = false;
                 try
                 {
                     var sessionId = (uint)process.SessionId;
@@ -746,12 +861,9 @@ internal sealed class StartupGuardService : IDisposable
                         continue;
                     }
 
-                    if (startedAt < _guardStartedUtc
+                    var existedBeforeGuard = startedAt < _guardStartedUtc
                         || (_baselineProcesses.TryGetValue(process.Id, out var baselineStartedAt)
-                            && startedAt == baselineStartedAt))
-                    {
-                        continue;
-                    }
+                            && startedAt == baselineStartedAt);
 
                     // 先拿到并缓存内核进程句柄。PID 可能在枚举和 Kill 之间被复用；
                     // 缓存句柄后，后续读取和终止都只针对这一轮看到的原进程。
@@ -803,35 +915,40 @@ internal sealed class StartupGuardService : IDisposable
                             + "该进程可能仍需人工核查：" + process.ProcessName);
                     }
 
-                    var directFallbackMatch = allowDirectFallback
+                    var directFallbackMatch = !existedBeforeGuard
                         && ShouldTerminate(
                             sessionId,
                             targetSessionId,
                             _mainSessionId,
                             executablePath,
                             _fallbackPaths);
-                    if (!directFallbackMatch)
+                    var parentProcessId = parentProcessIds.TryGetValue(process.Id, out var capturedParentId)
+                        ? capturedParentId
+                        : 0;
+                    var serviceSpawnMatch = ShouldTerminateManagedServiceSpawn(
+                        sessionId,
+                        targetSessionId,
+                        _mainSessionId,
+                        executablePath,
+                        parentProcessId,
+                        startedAt,
+                        _managedPaths,
+                        ancestorProcessId => TryGetAncestryInfo(
+                            ancestorProcessId,
+                            parentProcessIds));
+                    if (!ShouldTerminateObservedProcess(
+                            existedBeforeGuard,
+                            allowDirectFallback,
+                            directFallbackMatch,
+                            serviceSpawnMatch))
                     {
-                        var parentIdentity = TryGetParentProcessIdentity(
-                            process.Id,
-                            parentProcessIds);
-                        if (!ShouldTerminateServiceSpawn(
-                                sessionId,
-                                targetSessionId,
-                                _mainSessionId,
-                                executablePath,
-                                parentIdentity?.SessionId,
-                                parentIdentity?.StartedAt,
-                                startedAt,
-                                _managedPaths))
-                        {
-                            continue;
-                        }
+                        continue;
                     }
 
                     if (_cancellation.IsCancellationRequested)
                     {
-                        return;
+                        cancelled = true;
+                        break;
                     }
 
                     // 同一个受保护进程可能每 500 毫秒被重新枚举；只在启动时间
@@ -846,42 +963,11 @@ internal sealed class StartupGuardService : IDisposable
                         _failedProcesses.Remove(process.Id);
                     }
 
-                    var displayPath = executablePath ?? process.ProcessName;
-                    try
-                    {
-                        process.Kill();
-                        if (!process.WaitForExit(1000))
-                        {
-                            throw new InvalidOperationException("进程未在 1 秒内退出。");
-                        }
-
-                        Interlocked.Increment(ref _intercepted);
-                        AppLog.Info($"已拦截分身自启动：{displayPath} (PID {process.Id})");
-                    }
-                    catch (Exception exception) when (exception is Win32Exception
-                                                          or InvalidOperationException
-                                                          or NotSupportedException)
-                    {
-                        _failedProcesses[process.Id] = startedAt;
-                        var accessDenied = exception is Win32Exception { NativeErrorCode: 5 };
-                        var hint = accessDenied
-                            ? "；这通常是安全软件自保护拦截。请只在安全软件中放行 DesktopTwin 的精确程序 "
-                              + $"{Environment.ProcessPath ?? "DesktopTwin.exe"}，"
-                              + "不要放行被拦截的启动程序，也不要关闭自保护。"
-                            : string.Empty;
-                        var failureMessage =
-                            $"拦截分身自启动失败：{displayPath} (PID {process.Id})："
-                            + $"{exception.GetBaseException().Message}{hint}";
-                        if (_reportedFailurePaths.Add(displayPath))
-                        {
-                            AppLog.Warn(failureMessage, exception);
-                        }
-
-                        // 受保护进程无法终止意味着子会话已经不符合隔离保证。
-                        // 不能只缓存失败后继续扫描，否则 MCP 会继续控制一个
-                        // 已经混入本机启动程序的桌面。
-                        RaiseIsolationFailure(targetSessionId, failureMessage);
-                    }
+                    interceptions.Add((
+                        process,
+                        executablePath ?? process.ProcessName,
+                        startedAt));
+                    keepForInterception = true;
                 }
                 catch (Exception exception) when (exception is Win32Exception
                                                       or InvalidOperationException
@@ -889,6 +975,72 @@ internal sealed class StartupGuardService : IDisposable
                 {
                     // 进程在枚举和读取之间退出是常态。
                 }
+                finally
+                {
+                    if (!keepForInterception)
+                    {
+                        process.Dispose();
+                    }
+                }
+            }
+
+            if (cancelled)
+            {
+                return;
+            }
+
+            foreach (var interception in interceptions)
+            {
+                var process = interception.Process;
+                try
+                {
+                    // 二次确认句柄仍对应同一进程，随后 Kill 不会落到复用的 PID。
+                    if ((uint)process.SessionId != targetSessionId
+                        || process.StartTime.ToUniversalTime() != interception.StartedAt)
+                    {
+                        continue;
+                    }
+
+                    process.Kill();
+                    if (!process.WaitForExit(1000))
+                    {
+                        throw new InvalidOperationException("进程未在 1 秒内退出。");
+                    }
+
+                    Interlocked.Increment(ref _intercepted);
+                    AppLog.Info($"已拦截分身自启动：{interception.DisplayPath} (PID {process.Id})");
+                }
+                catch (Exception exception) when (exception is Win32Exception
+                                                      or InvalidOperationException
+                                                      or NotSupportedException)
+                {
+                    _failedProcesses[process.Id] = interception.StartedAt;
+                    var accessDenied = exception is Win32Exception { NativeErrorCode: 5 };
+                    var hint = accessDenied
+                        ? "；这通常是安全软件自保护拦截。请只在安全软件中放行 DesktopTwin 的精确程序 "
+                          + $"{Environment.ProcessPath ?? "DesktopTwin.exe"}，"
+                          + "不要放行被拦截的启动程序，也不要关闭自保护。"
+                        : string.Empty;
+                    var failureMessage =
+                        $"拦截分身自启动失败：{interception.DisplayPath} (PID {process.Id})："
+                        + $"{exception.GetBaseException().Message}{hint}";
+                    if (_reportedFailurePaths.Add(interception.DisplayPath))
+                    {
+                        AppLog.Warn(failureMessage, exception);
+                    }
+
+                    // 受保护进程无法终止意味着子会话已经不符合隔离保证。
+                    // 不能只缓存失败后继续扫描，否则 MCP 会继续控制一个
+                    // 已经混入本机启动程序的桌面。
+                    RaiseIsolationFailure(targetSessionId, failureMessage);
+                }
+            }
+        }
+        finally
+        {
+            foreach (var interception in interceptions)
+            {
+                interception.Process.Dispose();
             }
         }
     }
@@ -948,7 +1100,7 @@ internal sealed class StartupGuardService : IDisposable
         }
     }
 
-    private static (uint SessionId, DateTime StartedAt)? TryGetParentProcessIdentity(
+    private static ProcessAncestryInfo? TryGetAncestryInfo(
         int processId,
         IReadOnlyDictionary<int, int> parentProcessIds)
     {
@@ -961,14 +1113,43 @@ internal sealed class StartupGuardService : IDisposable
 
         try
         {
-            using var parent = Process.GetProcessById(parentProcessId);
-            return ((uint)parent.SessionId, parent.StartTime.ToUniversalTime());
+            using var ancestor = Process.GetProcessById(processId);
+            // 固定句柄后复核两次身份。MainModule 可能因保护进程拒绝读取，此时
+            // 中间节点必须失败关闭；只有会话 0 的根节点不需要路径。
+            _ = ancestor.Handle;
+            var sessionId = (uint)ancestor.SessionId;
+            var startedAt = ancestor.StartTime.ToUniversalTime();
+            if ((uint)ancestor.SessionId != sessionId
+                || ancestor.StartTime.ToUniversalTime() != startedAt)
+            {
+                return null;
+            }
+
+            string? executablePath = null;
+            try
+            {
+                executablePath = ancestor.MainModule?.FileName;
+            }
+            catch (Exception exception) when (exception is Win32Exception
+                                                  or InvalidOperationException
+                                                  or NotSupportedException)
+            {
+                // 路径保留为 null，由调用方拒绝把它当作受管中间节点。
+            }
+
+            return new ProcessAncestryInfo(
+                processId,
+                parentProcessId,
+                sessionId,
+                startedAt,
+                executablePath);
         }
         catch (Exception exception) when (exception is ArgumentException
                                               or InvalidOperationException
-                                              or Win32Exception)
+                                              or Win32Exception
+                                              or NotSupportedException)
         {
-            // 父进程可能在枚举与查询之间退出；无法证明是服务拉起时不终止。
+            // 祖先可能在枚举与查询之间退出；无法证明完整链路时不终止。
             return null;
         }
     }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
@@ -39,6 +40,7 @@ internal sealed class SessionAgentService : IDisposable
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     internal const string RunValueName = "DesktopTwinSessionAgent";
     internal const string AgentFileName = "DesktopTwin.Agent.exe";
+    internal const string ShellGateFileName = "DesktopTwin.ShellGate.exe";
     private const string AgentResourceName = "DesktopTwin.Agent.exe";
     private const string RequestFileName = "uu-switch-request.json";
     private const string HeartbeatFileName = "session-agent-heartbeat.txt";
@@ -109,8 +111,10 @@ internal sealed class SessionAgentService : IDisposable
 
     private readonly string _dataDirectory;
     private readonly string _agentDirectory;
+    private readonly string _legacyAgentPath;
     private readonly bool _protectAgentDirectory;
     private readonly bool _manageLegacyDefaultInstallation;
+    private readonly ISessionAgentStartupRegistration _startupRegistration;
 
     /// <summary>
     /// 串行化「检查、替换、下发」整段流程，避免状态轮询在旧进程枚举或等待
@@ -136,13 +140,63 @@ internal sealed class SessionAgentService : IDisposable
     private bool _lastAgentProbeResult;
     private bool _disposed;
 
+    /// <summary>
+    /// 卸载阶段需要删除的持久自启项。生产实现直接操作任务计划程序和当前用户
+    /// Run；测试通过假实现验证失败关闭顺序，绝不能触碰真实启动项。
+    /// </summary>
+    internal interface ISessionAgentStartupRegistration
+    {
+        bool TryDeleteLogonTask(out string error);
+
+        void DeleteRunValue(string? expectedCommandLine);
+    }
+
+    /// <summary>
+    /// 隔离期间停用功能时，对当前子会话中精确匹配的代理执行的一次收尾操作。
+    /// 测试注入固定结果，绝不能触碰真实进程。
+    /// </summary>
+    internal readonly record struct AgentStopResult(bool Success, string Error);
+
+    private readonly Func<AgentStopResult> _stopIsolatedAgent;
+    private readonly string _shellGatePath;
+
+    /// <summary>
+    /// 生产自启项实现。所有真实注册表/任务计划操作都集中在这里，测试注入假实现后
+    /// 不会触碰当前用户的启动状态。
+    /// </summary>
+    private sealed class WindowsSessionAgentStartupRegistration
+        : ISessionAgentStartupRegistration
+    {
+        private readonly string _agentPath;
+        private readonly string _legacyAgentPath;
+
+        internal WindowsSessionAgentStartupRegistration(string agentPath, string legacyAgentPath)
+        {
+            _agentPath = agentPath;
+            _legacyAgentPath = legacyAgentPath;
+        }
+
+        public bool TryDeleteLogonTask(out string error) =>
+            ChildSessionProcessLauncher.TryDeleteSessionAgentLogonTask(out error);
+
+        public void DeleteRunValue(string? expectedCommandLine) =>
+            DeleteManagedRunValue(_agentPath, _legacyAgentPath, expectedCommandLine);
+    }
+
     public SessionAgentService(
         Dispatcher dispatcher,
         string? dataDirectory = null,
         string? agentDirectory = null,
-        bool? protectAgentDirectory = null)
+        bool? protectAgentDirectory = null,
+        bool? manageLegacyDefaultInstallation = null,
+        string? legacyAgentPath = null,
+        ISessionAgentStartupRegistration? startupRegistration = null,
+        Func<AgentStopResult>? stopIsolatedAgent = null,
+        string? shellGatePath = null)
     {
         _dispatcher = dispatcher;
+        _stopIsolatedAgent = stopIsolatedAgent ?? StopAgentForStartupIsolation;
+        _shellGatePath = shellGatePath ?? DefaultShellGatePath;
         _dataDirectory = dataDirectory
             ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -155,10 +209,14 @@ internal sealed class SessionAgentService : IDisposable
             ?? (dataDirectory is null && agentDirectory is null);
         _agentDirectory = agentDirectory
             ?? (dataDirectory ?? DefaultAgentDirectory);
+        _legacyAgentPath = legacyAgentPath ?? LegacyAgentPath;
 
         // 只有真正的生产布局才允许触碰旧版 AppData 代理。测试即使显式要求
         // 加固目录，也绝不能清理当前用户实际使用的旧文件或 Run 值。
-        _manageLegacyDefaultInstallation = dataDirectory is null && agentDirectory is null;
+        _manageLegacyDefaultInstallation = manageLegacyDefaultInstallation
+            ?? (dataDirectory is null && agentDirectory is null);
+        _startupRegistration = startupRegistration
+            ?? new WindowsSessionAgentStartupRegistration(AgentPath, _legacyAgentPath);
     }
 
     /// <summary>
@@ -188,6 +246,15 @@ internal sealed class SessionAgentService : IDisposable
     internal static string DefaultAgentPath => Path.Combine(DefaultAgentDirectory, AgentFileName);
 
     /// <summary>
+    /// 替代资源管理器的隐藏外壳门卫。与分身端使用同一份内嵌字节，
+    /// 仅通过 --shell-gate 参数切换行为；独立文件名可避免进程探测把两者
+    /// 误认为同一个分身端。
+    /// </summary>
+    internal static string DefaultShellGatePath => Path.Combine(
+        DefaultAgentDirectory,
+        ShellGateFileName);
+
+    /// <summary>
     /// 旧版本把代理释放到当前用户的 AppData。升级时必须迁移 Run 值并清理该
     /// 文件，否则启动项会继续执行用户可写目录中的旧代理。
     /// </summary>
@@ -198,19 +265,27 @@ internal sealed class SessionAgentService : IDisposable
 
     /// <summary>
     /// 判断一条启动命令是否精确指向旧版代理。旧版始终给路径加双引号，但这里
-    /// 也接受无参数的无引号路径；只做前缀匹配，避免把同名前缀的其它程序当成代理。
+    /// 也接受无参数的无引号路径；只做目标路径匹配，避免把同名前缀的其它程序当成代理。
     /// </summary>
-    internal static bool IsLegacyAgentCommand(string? commandLine, string legacyAgentPath)
+    internal static bool IsLegacyAgentCommand(string? commandLine, string legacyAgentPath) =>
+        IsAgentCommand(commandLine, legacyAgentPath);
+
+    /// <summary>
+    /// 判断 Run 值是否精确指向指定的代理可执行文件。命令允许携带任意参数，但路径
+    /// 结束后必须是空白或闭合引号；反引号、同名前缀、powershell 包装和残缺引号
+    /// 一律不算本产品所有，删除时必须失败关闭。
+    /// </summary>
+    internal static bool IsAgentCommand(string? commandLine, string agentPath)
     {
-        if (string.IsNullOrWhiteSpace(commandLine) || string.IsNullOrWhiteSpace(legacyAgentPath))
+        if (string.IsNullOrWhiteSpace(commandLine) || string.IsNullOrWhiteSpace(agentPath))
         {
             return false;
         }
 
-        string normalizedLegacy;
+        string normalizedAgent;
         try
         {
-            normalizedLegacy = Path.GetFullPath(legacyAgentPath);
+            normalizedAgent = Path.GetFullPath(agentPath);
         }
         catch (Exception exception) when (exception is ArgumentException
                                               or NotSupportedException
@@ -222,16 +297,16 @@ internal sealed class SessionAgentService : IDisposable
         var expanded = Environment.ExpandEnvironmentVariables(commandLine).TrimStart();
         var quoted = expanded.StartsWith('"');
         var pathText = quoted ? expanded[1..] : expanded;
-        if (!pathText.StartsWith(normalizedLegacy, StringComparison.OrdinalIgnoreCase))
+        if (!pathText.StartsWith(normalizedAgent, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        var nextIndex = normalizedLegacy.Length;
+        var nextIndex = normalizedAgent.Length;
         if (quoted)
         {
             // 开头有双引号时，路径结束后必须有配对的结束引号；不能把
-            // ""...DesktopTwin.Agent.exe" 这种残缺命令误认成旧版启动项。
+            // ""...DesktopTwin.Agent.exe" 这种残缺命令误认成本产品启动项。
             return nextIndex < pathText.Length
                 && pathText[nextIndex] == '"'
                 && (nextIndex + 1 == pathText.Length || char.IsWhiteSpace(pathText[nextIndex + 1]));
@@ -241,27 +316,39 @@ internal sealed class SessionAgentService : IDisposable
     }
 
     /// <summary>
-    /// Run 值的只读同步决策。隔离期间只允许改写已经存在的旧版代理命令，
-    /// 绝不新建值；只有最终命令精确指向新代理时才允许清理旧文件。
+    /// Run 值只有在命令被证明指向当前或旧版代理时才允许删除。用于卸载前的
+    /// 最后一道校验，避免同名但属于其它程序的 Run 值被误删。
     /// </summary>
-    internal readonly record struct RunSynchronizationPlan(
-        bool WriteRunValue,
+    internal static bool IsManagedAgentRunValue(
+        string? commandLine,
+        string agentPath,
+        string legacyAgentPath) =>
+        IsAgentCommand(commandLine, agentPath)
+        || IsAgentCommand(commandLine, legacyAgentPath);
+
+    /// <summary>
+    /// 自启项的同步决策。正常安装先注册当前用户登录任务，再删除旧 HKCU Run；
+    /// 隔离期间完全冻结自启态：不新建、不改写、不删除任务、Run 值或旧版代理文件。
+    /// </summary>
+    internal readonly record struct StartupSynchronizationPlan(
+        bool CreateOrUpdateLoginTask,
+        bool RemoveRunValue,
         bool DeleteLegacyAgentFile);
 
-    internal static RunSynchronizationPlan PlanRunSynchronization(
-        string? currentRun,
-        string commandLine,
+    internal static StartupSynchronizationPlan PlanStartupSynchronization(
         bool updateStartupEntry,
-        bool isLegacyRun,
+        bool isManagedRun,
         bool manageLegacyDefaultInstallation)
     {
-        var write = (updateStartupEntry || isLegacyRun)
-            && !string.Equals(currentRun, commandLine, StringComparison.Ordinal);
-        var effectiveRun = write ? commandLine : currentRun;
-        return new RunSynchronizationPlan(
-            write,
-            manageLegacyDefaultInstallation
-                && string.Equals(effectiveRun, commandLine, StringComparison.Ordinal));
+        // 隔离期间（updateStartupEntry=false）必须保持启动态与关停日志完全一致：
+        // 不新建或更新登录任务、不改写或删除 Run 值、也不删除旧版代理文件。
+        // 否则日志记录的原始命令会与实际状态分叉，恢复后可能指向不存在的程序。
+        return new StartupSynchronizationPlan(
+            CreateOrUpdateLoginTask: updateStartupEntry && manageLegacyDefaultInstallation,
+            RemoveRunValue: updateStartupEntry
+                && manageLegacyDefaultInstallation
+                && isManagedRun,
+            DeleteLegacyAgentFile: updateStartupEntry && manageLegacyDefaultInstallation);
     }
 
     /// <summary>
@@ -295,6 +382,127 @@ internal sealed class SessionAgentService : IDisposable
     }
 
     /// <summary>
+    /// 枚举当前子会话中的外壳门卫。只认会话号、登录时间与完整镜像路径，
+    /// 绝不按进程名或模糊路径放行。更新过程中仍运行的旧文件允许 .old 别名，
+    /// 但别名必须来自受保护的固定安装目录。
+    /// </summary>
+    internal static bool TryConfirmShellGateProcess(out string error)
+    {
+        error = string.Empty;
+        if (!TryCaptureChildSessionIdentity(out var identity, out error))
+        {
+            return false;
+        }
+
+        if (!TryConfirmChildSessionIdentity(identity, out error))
+        {
+            return false;
+        }
+
+        var presence = ProbeShellGateProcess(identity);
+        if (presence != AgentProcessPresence.Matching)
+        {
+            error = presence switch
+            {
+                AgentProcessPresence.Absent => "子会话中没有已确认的外壳门卫进程。",
+                AgentProcessPresence.Conflict => "子会话中存在同名但路径不符的外壳门卫进程，拒绝继续。",
+                _ => "无法确认子会话外壳门卫进程的身份。"
+            };
+            return false;
+        }
+
+        if (!TryConfirmChildSessionIdentity(identity, out error))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static AgentProcessPresence ProbeShellGateProcess(ChildSessionIdentity identity)
+    {
+        if (!identity.IsComplete)
+        {
+            return AgentProcessPresence.Unknown;
+        }
+
+        var processName = Path.GetFileNameWithoutExtension(ShellGateFileName);
+        Process[] candidates;
+        try
+        {
+            candidates = Process.GetProcessesByName(processName);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+                                              or System.ComponentModel.Win32Exception
+                                              or NotSupportedException
+                                              or System.Security.SecurityException)
+        {
+            AppLog.Warn("无法枚举外壳门卫候选进程，无法确认其存在。", exception);
+            return AgentProcessPresence.Unknown;
+        }
+
+        var identities = new List<(int? SessionId, string? ImagePath)>();
+        try
+        {
+            foreach (var process in candidates)
+            {
+                int? processSessionId = null;
+                try
+                {
+                    processSessionId = process.SessionId;
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    identities.Add((null, null));
+                    continue;
+                }
+
+                if (processSessionId <= 0)
+                {
+                    identities.Add((processSessionId, null));
+                    continue;
+                }
+
+                if ((uint)processSessionId.Value != identity.SessionId)
+                {
+                    continue;
+                }
+
+                string? processPath = null;
+                try
+                {
+                    processPath = process.MainModule?.FileName;
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    // 分类器会把身份不完整的候选判为 Unknown。
+                }
+
+                identities.Add((processSessionId, processPath));
+            }
+        }
+        finally
+        {
+            foreach (var process in candidates)
+            {
+                process.Dispose();
+            }
+        }
+
+        return ClassifyAgentProcessPresence(
+            DefaultShellGatePath,
+            identity,
+            identities,
+            [DefaultShellGatePath + ".old"]);
+    }
+
+    /// <summary>
     /// 请求文件路径。
     /// </summary>
     public string RequestPath => Path.Combine(_dataDirectory, RequestFileName);
@@ -305,13 +513,80 @@ internal sealed class SessionAgentService : IDisposable
     public string HeartbeatPath => Path.Combine(_dataDirectory, HeartbeatFileName);
 
     /// <summary>
-    /// 安装（或更新）分身端：释放 exe、按需写自启项，并开始轮询请求。
+    /// 释放并验证替代资源管理器的外壳门卫。该动作与热键、MCP 是否启用无关：
+    /// 只要主程序可能连接分身，RDP 的 StartProgram 就必须指向一个已验证的本地程序。
+    /// </summary>
+    internal static bool TryEnsureShellGateInstalled(out string gatePath, out string error)
+    {
+        gatePath = string.Empty;
+        error = string.Empty;
+
+        try
+        {
+            var directory = Path.GetFullPath(DefaultAgentDirectory);
+            var parent = Directory.GetParent(directory)?.FullName
+                ?? throw new IOException("外壳门卫目录不能是卷根目录，拒绝创建。");
+            EnsureProtectedDirectory(parent);
+            EnsureProtectedDirectory(directory);
+
+            var target = Path.GetFullPath(DefaultShellGatePath);
+            var outcome = WriteExecutableIfChanged(target, "外壳门卫", protect: true);
+            if (outcome == AgentWriteOutcome.FailedRolledBack)
+            {
+                throw new IOException("外壳门卫更新失败，目标路径上仍是旧版本。");
+            }
+
+            ValidateProtectedFile(target);
+            var assembly = typeof(SessionAgentService).Assembly;
+            var resourceName = ResolveAgentResourceName(assembly);
+            using var expectedStream = assembly.GetManifestResourceStream(resourceName)
+                ?? throw new InvalidOperationException(Locale.Get("Agent.EmbeddedMissing"));
+            var expected = new byte[expectedStream.Length];
+            var offset = 0;
+            while (offset < expected.Length)
+            {
+                var read = expectedStream.Read(expected, offset, expected.Length - offset);
+                if (read <= 0)
+                {
+                    break;
+                }
+
+                offset += read;
+            }
+
+            var actual = File.ReadAllBytes(target);
+            if (offset != expected.Length
+                || actual.Length != expected.Length
+                || !BytesEqual(actual, expected))
+            {
+                throw new IOException("外壳门卫与当前内嵌版本不一致，拒绝使用。");
+            }
+
+            gatePath = target;
+            return true;
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException
+                                              or System.Security.SecurityException
+                                              or IOException
+                                              or COMException
+                                              or InvalidOperationException
+                                              or ArgumentException
+                                              or NotSupportedException)
+        {
+            error = "外壳门卫安装失败：" + exception.Message;
+            AppLog.Warn(error, exception);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 安装（或更新）分身端：释放 exe、按需注册登录任务并开始轮询请求。
     /// </summary>
     /// <param name="hotkey">当前热键组合，形如 <c>Ctrl+Alt+U</c>；为空表示不注册热键。</param>
     /// <param name="controlPipe">MCP 控制管道名；为空表示不开放控制通道。</param>
     /// <param name="error">失败原因。</param>
     /// <param name="updateStartupEntry">
-    /// 是否允许改写 HKCU Run。启动项隔离或子会话状态未知时必须为 false，
+    /// 是否允许修改自启项。启动项隔离或子会话状态未知时必须为 false，
     /// 否则会把刚关停的分身端自启项重新打开，破坏隔离日志与系统状态的一致性。
     /// </param>
     public bool EnsureInstalled(
@@ -333,7 +608,7 @@ internal sealed class SessionAgentService : IDisposable
         if (!string.Equals(_hotkeyArgument, nextHotkey, StringComparison.Ordinal)
             || !string.Equals(_controlPipeArgument, nextControlPipe, StringComparison.Ordinal))
         {
-            // 即使启动项隔离禁止写 Run，当前会话里的旧代理仍必须换成新参数。
+            // 即使启动项隔离禁止写自启项，当前会话里的旧代理仍必须换成新参数。
             NeedsRestart = true;
         }
 
@@ -371,31 +646,40 @@ internal sealed class SessionAgentService : IDisposable
         try
         {
             var currentRun = ReadRunKey();
-            var isLegacyRun = _manageLegacyDefaultInstallation
-                && IsLegacyAgentCommand(currentRun, LegacyAgentPath);
-            var commandLine = BuildCommandLine();
-            var runPlan = PlanRunSynchronization(
-                currentRun,
-                commandLine,
+            var isManagedRun = _manageLegacyDefaultInstallation
+                && IsManagedAgentRunValue(currentRun, AgentPath, _legacyAgentPath);
+            var arguments = BuildAgentArguments();
+            var startupPlan = PlanStartupSynchronization(
                 updateStartupEntry,
-                isLegacyRun,
+                isManagedRun,
                 _manageLegacyDefaultInstallation);
 
-            if (runPlan.WriteRunValue)
+            if (startupPlan.CreateOrUpdateLoginTask)
             {
-                WriteRunKey(commandLine);
-                currentRun = commandLine;
-                NeedsRestart = true;
+                // 必须先让持久任务注册成功，后面才能删除旧的 Run 值。
+                // 任务失败时保留原 Run，用户至少不会失去原有的自启能力。
+                ChildSessionProcessLauncher.CreateOrUpdateSessionAgentLogonTask(
+                    AgentPath,
+                    arguments);
             }
 
-            if (runPlan.DeleteLegacyAgentFile)
+            if (startupPlan.RemoveRunValue)
             {
-                TryDelete(LegacyAgentPath);
+                // 任务已注册成功，删除旧 Run 才能避免同一登录点被两个自启项触发。
+                // 传入刚才校验过的精确值；若值在检查后被改写，删除会失败关闭。
+                _startupRegistration.DeleteRunValue(currentRun);
+            }
+
+            if (startupPlan.DeleteLegacyAgentFile)
+            {
+                TryDelete(_legacyAgentPath);
             }
         }
         catch (Exception exception) when (exception is UnauthorizedAccessException
                                               or System.Security.SecurityException
-                                              or IOException)
+                                              or IOException
+                                              or COMException
+                                              or InvalidOperationException)
         {
             error = Locale.Format("Agent.Error.RunKeyFailed", exception.Message);
             AppLog.Warn(error, exception);
@@ -932,13 +1216,28 @@ internal sealed class SessionAgentService : IDisposable
     internal static AgentProcessPresence ClassifyAgentProcessPresence(
         string? expectedAgentPath,
         ChildSessionIdentity identity,
-        IEnumerable<(int? SessionId, string? ImagePath)> candidates)
+        IEnumerable<(int? SessionId, string? ImagePath)> candidates,
+        IReadOnlyCollection<string>? additionalExpectedPaths = null)
     {
         ArgumentNullException.ThrowIfNull(candidates);
         if (!identity.IsComplete
             || !ProcessNativeMethods.TryNormalizeImagePath(expectedAgentPath, out var expectedPath))
         {
             return AgentProcessPresence.Unknown;
+        }
+
+        var expectedPaths = new List<string> { expectedPath };
+        if (additionalExpectedPaths is not null)
+        {
+            foreach (var path in additionalExpectedPaths)
+            {
+                if (!ProcessNativeMethods.TryNormalizeImagePath(path, out var normalized))
+                {
+                    return AgentProcessPresence.Unknown;
+                }
+
+                expectedPaths.Add(normalized);
+            }
         }
 
         var hasConflict = false;
@@ -962,7 +1261,8 @@ internal sealed class SessionAgentService : IDisposable
                 continue;
             }
 
-            if (string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase))
+            if (expectedPaths.Exists(path =>
+                    string.Equals(path, actualPath, StringComparison.OrdinalIgnoreCase)))
             {
                 return AgentProcessPresence.Matching;
             }
@@ -1197,41 +1497,135 @@ internal sealed class SessionAgentService : IDisposable
     }
 
     /// <summary>
-    /// 卸载分身端：删自启项、停轮询、删代理与日志。
+    /// 启动项隔离期间停用热键/MCP 时，只停止当前子会话中精确匹配的代理。
+    /// 不创建、不删除、不改写任何启动项或代理文件；当前根本没有子会话时是安全的空操作。
+    /// WTS 查询失败、会话身份不完整或进程身份不可证明时必须失败关闭。
+    /// </summary>
+    private AgentStopResult StopAgentForStartupIsolation()
+    {
+        lock (_agentStartSync)
+        {
+            if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
+            {
+                return new AgentStopResult(
+                    false,
+                    "无法查询 RDP Child Session，不能安全确认是否仍有旧分身端在运行。");
+            }
+
+            if (sessionId is null)
+            {
+                return new AgentStopResult(true, string.Empty);
+            }
+
+            var childSessionId = sessionId.Value;
+            var logonTimeUtc = ChildSessionNativeMethods.TryGetSessionLogonTime(childSessionId);
+            if (!TryBindChildSessionIdentity(
+                    querySucceeded: true,
+                    queriedSessionId: childSessionId,
+                    logonTimeUtc: logonTimeUtc,
+                    out var identity,
+                    out var identityError))
+            {
+                return new AgentStopResult(false, identityError);
+            }
+
+            if (!TryStopExistingAgentProcess(identity, out _))
+            {
+                return new AgentStopResult(
+                    false,
+                    $"未能安全停止分身会话 {DescribeIdentity(identity)} 中的旧代理。");
+            }
+
+            // 下次启动判断必须重新枚举，不能沿用停用前缓存的「在线」结果。
+            _lastAgentProbeTicks = -100_000;
+            _lastAgentProbeResult = false;
+            _lastLaunchTickCount = -1;
+            return new AgentStopResult(true, string.Empty);
+        }
+    }
+
+    /// <summary>
+    /// 卸载分身端：删登录任务与旧版 Run、停轮询、删代理与日志。
     /// </summary>
     /// <param name="removeStartupEntry">
-    /// 启动项隔离期间为 false。此时 Run 值已由隔离日志关停，不能删除、改写
-    /// 或删除被它引用的代理文件，否则恢复日志时无法还原原来的自启状态。
+    /// 启动项隔离期间为 false。此时任务和 Run 值已由隔离日志关停，不能删除、改写
+    /// 或删除被它引用的代理文件，否则恢复日志时无法还原原来的自启状态；但必须停止
+    /// 当前子会话中仍在运行的旧代理，避免已停用的热键/MCP 继续生效。
     /// </param>
-    public void Uninstall(bool removeStartupEntry = true)
+    /// <param name="removeShellGate">
+    /// 仅在确认没有子会话、启动项也已恢复正常时允许删除替代资源管理器门卫。
+    /// 隔离期间 removeStartupEntry 为 false 时该参数不生效，门卫文件必须保留供
+    /// 当前 RDP 连接和后续恢复使用。
+    /// </param>
+    /// <returns>
+    /// 启动项已确认删除且代理文件清理完成时返回 true。任务或 Run 删除失败时
+    /// 返回 false，并保留代理文件，避免留下一个指向已删除程序的登录任务。
+    /// </returns>
+    public bool Uninstall(bool removeStartupEntry = true, bool removeShellGate = true)
     {
         StopPolling();
         if (!removeStartupEntry)
         {
-            return;
+            var stopResult = _stopIsolatedAgent();
+            if (!stopResult.Success)
+            {
+                AppLog.Warn($"隔离期间停用分身端失败，保留全部启动项和代理文件：{stopResult.Error}");
+                return false;
+            }
+
+            return true;
         }
 
-        try
-        {
-            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
-            key?.DeleteValue(RunValueName, throwOnMissingValue: false);
-        }
-        catch (Exception exception) when (exception is UnauthorizedAccessException
-                                              or System.Security.SecurityException
-                                              or IOException)
-        {
-            AppLog.Warn("删除分身端自启项失败。", exception);
-        }
-
-        TryDelete(AgentPath);
         if (_manageLegacyDefaultInstallation)
         {
-            TryDelete(LegacyAgentPath);
+            if (!_startupRegistration.TryDeleteLogonTask(out var taskError))
+            {
+                AppLog.Warn($"删除分身端登录任务失败，保留代理文件：{taskError}");
+                return false;
+            }
+
+            try
+            {
+                // 卸载时没有先前读取值；生产实现会在同一个键句柄里重新读取并验证
+                // 命令目标，foreign/伪造的同名 Run 值一律拒绝删除。
+                _startupRegistration.DeleteRunValue(expectedCommandLine: null);
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException
+                                                  or System.Security.SecurityException
+                                                  or IOException
+                                                  or InvalidDataException
+                                                  or InvalidOperationException)
+            {
+                // Run 仍可能在下次登录时拉起代理，因此不能在删除失败后把目标文件删掉。
+                AppLog.Warn("删除分身端旧版 Run 自启项失败，保留代理文件。", exception);
+                return false;
+            }
+        }
+
+        var agentDeleted = TryDeleteStrict(AgentPath, "分身端代理文件");
+        var legacyDeleted = !_manageLegacyDefaultInstallation
+            || TryDeleteStrict(_legacyAgentPath, "旧版分身端代理文件");
+        if (!agentDeleted || !legacyDeleted)
+        {
+            return false;
         }
 
         TryDelete(RequestPath);
         TryDelete(HeartbeatPath);
         TryDelete(Path.Combine(_dataDirectory, AgentLogFileName));
+
+        if (removeShellGate && _manageLegacyDefaultInstallation)
+        {
+            // 只有正常卸载路径允许移除门卫及其更新别名；此时启动任务和 Run
+            // 均已删除，不再有迟到的子会话可引用 StartProgram。
+            if (!TryDeleteStrict(_shellGatePath, "外壳门卫文件")
+                || !TryDeleteStrict(_shellGatePath + ".old", "旧版外壳门卫文件"))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <inheritdoc />
@@ -1310,11 +1704,6 @@ internal sealed class SessionAgentService : IDisposable
 
         AppLog.Info("收到分身端的热键请求，开始切换。");
         _dispatcher.BeginInvoke(() => SwitchRequested?.Invoke(this, EventArgs.Empty));
-    }
-
-    private string BuildCommandLine()
-    {
-        return $"\"{AgentPath}\" {BuildAgentArguments()}";
     }
 
     private string BuildAgentArguments()
@@ -1686,7 +2075,17 @@ internal sealed class SessionAgentService : IDisposable
         }
     }
 
-    private AgentWriteOutcome WriteAgentIfChanged()
+    private AgentWriteOutcome WriteAgentIfChanged() =>
+        WriteExecutableIfChanged(AgentPath, "分身端", _protectAgentDirectory);
+
+    /// <summary>
+    /// 原子释放内嵌可执行文件。分身端与外壳门卫共享同一份字节和同一套
+    /// 失败关闭规则；调用方只有在返回 Unchanged/Updated 后才能使用目标路径。
+    /// </summary>
+    private static AgentWriteOutcome WriteExecutableIfChanged(
+        string targetPath,
+        string displayName,
+        bool protect)
     {
         var assembly = typeof(SessionAgentService).Assembly;
         var resourceName = ResolveAgentResourceName(assembly);
@@ -1708,16 +2107,16 @@ internal sealed class SessionAgentService : IDisposable
 
         // 内容没变就不重写：重写会推进修改时间，分身端据此判断「自己是不是旧版本」，
         // 平白让所有代理互杀一轮。
-        if (File.Exists(AgentPath))
+        if (File.Exists(targetPath))
         {
             // 每次复用前重新验证并加固 DACL，防止旧版本或外部工具留下可写 ACL。
-            if (_protectAgentDirectory)
+            if (protect)
             {
-                ProtectAgentFile(AgentPath);
+                ProtectAgentFile(targetPath);
             }
             try
             {
-                var existing = File.ReadAllBytes(AgentPath);
+                var existing = File.ReadAllBytes(targetPath);
                 if (existing.Length == buffer.Length && BytesEqual(existing, buffer))
                 {
                     return AgentWriteOutcome.Unchanged;
@@ -1731,40 +2130,40 @@ internal sealed class SessionAgentService : IDisposable
 
         // 先写临时文件，再把旧文件「改名让位」，最后把新文件搬到正式名字上。
         //
-        // 不能直接覆盖或删除旧文件：正在运行的代理把自己的 exe 映射住了，
+        // 不能直接覆盖或删除旧文件：正在运行的程序把自己的 exe 映射住了，
         // 删除/覆盖都会失败（Device or resource busy）。但 Windows 允许**重命名**
         // 正在运行的可执行文件——旧进程继续用改名后的文件跑，新文件占回原名字。
-        var tempPath = AgentPath + ".new";
-        var retiredPath = AgentPath + ".old";
+        var tempPath = targetPath + ".new";
+        var retiredPath = targetPath + ".old";
         DeleteFileIfExists(tempPath);
         // 先创建空文件并加固，再写入内容；不能先写完整可执行文件再收紧 ACL。
         using (File.Create(tempPath))
         {
         }
 
-        if (_protectAgentDirectory)
+        if (protect)
         {
             ProtectAgentFile(tempPath);
         }
 
         File.WriteAllBytes(tempPath, buffer);
-        if (_protectAgentDirectory)
+        if (protect)
         {
             // 写入后再次以磁盘对象为准核对，防止临时路径在两步之间被替换。
             ValidateProtectedFile(tempPath);
         }
 
-        if (File.Exists(AgentPath))
+        if (File.Exists(targetPath))
         {
             TryDelete(retiredPath);
             try
             {
-                File.Move(AgentPath, retiredPath);
+                File.Move(targetPath, retiredPath);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
-                // 连改名都不行（极少见）：留着旧代理继续跑，下次启动再换。
-                AppLog.Warn("旧分身端无法改名让位，本次沿用旧版本。", exception);
+                // 连改名都不行（极少见）：留着旧程序继续跑，下次启动再换。
+                AppLog.Warn($"旧{displayName}无法改名让位，本次沿用旧版本。", exception);
                 TryDelete(tempPath);
                 return AgentWriteOutcome.Unchanged;
             }
@@ -1772,54 +2171,49 @@ internal sealed class SessionAgentService : IDisposable
 
         try
         {
-            File.Move(tempPath, AgentPath);
+            File.Move(tempPath, targetPath);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            // 旧文件刚才已经被改名让位，这里再失败，AgentPath 上就什么都没有了：
-            // 自启项指着这个路径，代理再也起不来。先把旧版本放回去。
-            AppLog.Warn("释放新分身端失败，回滚到旧版本。", exception);
+            // 旧文件刚才已经被改名让位，这里再失败，targetPath 上就什么都没有了。
+            AppLog.Warn($"释放新{displayName}失败，回滚到旧版本。", exception);
 
             try
             {
-                if (!File.Exists(AgentPath) && File.Exists(retiredPath))
+                if (!File.Exists(targetPath) && File.Exists(retiredPath))
                 {
-                    File.Move(retiredPath, AgentPath);
+                    File.Move(retiredPath, targetPath);
                 }
             }
             catch (Exception rollbackException) when (rollbackException is IOException
                                                           or UnauthorizedAccessException)
             {
-                AppLog.Error("回滚旧分身端失败，代理可能无法启动。", rollbackException);
+                AppLog.Error($"回滚旧{displayName}失败，可能无法启动。", rollbackException);
             }
 
             TryDelete(tempPath);
 
-            if (!File.Exists(AgentPath))
+            if (!File.Exists(targetPath))
             {
-                // 回滚也没能留下可执行文件：这次安装是失败的。返回 false 会被
-                // 调用方当成「内容没变」，接着写自启项并报成功，而路径上是空的。
+                // 回滚也没能留下可执行文件：这次安装是失败的，不能当成「内容没变」。
                 throw new IOException(
-                    "分身端安装失败：目标路径没有可用的可执行文件。", exception);
+                    $"{displayName}安装失败：目标路径没有可用的可执行文件。", exception);
             }
 
-            // 回滚成功说明旧代理还在、还能用：不抛异常，让调用方继续写自启项、
-            // 继续轮询——否则一个在跑的旧代理写来的切换请求没人处理。
-            // 但这次替换确实失败了，必须如实上报，不能当成「内容没变」。
+            // 回滚成功说明旧版本还在、还能用；但这次替换确实失败了，必须如实上报。
             return AgentWriteOutcome.FailedRolledBack;
         }
 
         // 移动完成后重新核对正式文件，防止替换过程中目标被外部改写或 ACL 被放宽。
-        // 同一卷上的改名会保留临时文件的 DACL，但这里仍以磁盘上的最终对象为准。
-        if (_protectAgentDirectory)
+        if (protect)
         {
-            ValidateProtectedFile(AgentPath);
+            ValidateProtectedFile(targetPath);
         }
 
         // 旧文件此刻可能还被旧进程占着，删不掉也无所谓：下次启动还会再试一次。
         TryDelete(retiredPath);
 
-        AppLog.Info($"分身端已释放：{AgentPath}");
+        AppLog.Info($"{displayName}已释放：{targetPath}");
         return AgentWriteOutcome.Updated;
     }
 
@@ -1870,11 +2264,51 @@ internal sealed class SessionAgentService : IDisposable
         return true;
     }
 
-    private static void WriteRunKey(string commandLine)
+    /// <summary>
+    /// 删除本产品拥有的 HKCU Run 值。键不存在或值已不存在都视为成功；
+    /// 同名但无法证明指向当前/旧版代理的命令、非字符串值、以及读取后又被改写的
+    /// 值都必须失败关闭，绝不能按名称盲删用户或其它程序的数据。
+    /// </summary>
+    private static void DeleteManagedRunValue(
+        string agentPath,
+        string legacyAgentPath,
+        string? expectedCommandLine)
     {
-        using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKeyPath, writable: true)
-            ?? throw new InvalidOperationException("无法打开 HKCU 的 Run 键。");
-        key.SetValue(RunValueName, commandLine, Microsoft.Win32.RegistryValueKind.String);
+        using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+        if (key is null)
+        {
+            return;
+        }
+
+        var currentValue = key.GetValue(RunValueName);
+        if (currentValue is null)
+        {
+            return;
+        }
+
+        if (currentValue is not string currentCommandLine)
+        {
+            throw new InvalidDataException(
+                $"拒绝删除非字符串的 {RunValueName} Run 值。");
+        }
+
+        if (expectedCommandLine is not null
+            && !string.Equals(
+                currentCommandLine,
+                expectedCommandLine,
+                StringComparison.Ordinal))
+        {
+            throw new IOException(
+                $"{RunValueName} Run 值在检查后已改变，拒绝删除。");
+        }
+
+        if (!IsManagedAgentRunValue(currentCommandLine, agentPath, legacyAgentPath))
+        {
+            throw new InvalidDataException(
+                $"拒绝删除不属于本产品的 {RunValueName} Run 值。");
+        }
+
+        key.DeleteValue(RunValueName, throwOnMissingValue: false);
     }
 
     /// <summary>
@@ -1917,6 +2351,20 @@ internal sealed class SessionAgentService : IDisposable
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             AppLog.Warn($"删除文件失败：{path}", exception);
+        }
+    }
+
+    private static bool TryDeleteStrict(string path, string description)
+    {
+        try
+        {
+            DeleteFileIfExists(path);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            AppLog.Warn($"删除{description}失败：{path}", exception);
+            return false;
         }
     }
 

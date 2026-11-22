@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
@@ -510,6 +511,114 @@ public sealed class McpLoopbackServerTests
         var response = await reader.ReadToEndAsync(timeout.Token);
 
         Assert.StartsWith("HTTP/1.1 413", response, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task 超限请求体持续上传时错误响应不会被连接重置覆盖()
+    {
+        using var server = CreateServer();
+        server.Start();
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, server.Port);
+        await using var stream = client.GetStream();
+        var path = new Uri(server.Endpoint).PathAndQuery;
+        const int contentLength = (8 * 1024 * 1024) + 1;
+        var header =
+            $"POST {path} HTTP/1.1\r\n" +
+            $"Host: 127.0.0.1:{server.Port}\r\n" +
+            "Content-Type: application/json\r\n" +
+            $"Content-Length: {contentLength}\r\n" +
+            "Connection: close\r\n\r\n";
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(header));
+
+        var upload = Task.Run(async () =>
+        {
+            var chunk = new byte[64 * 1024];
+            var remaining = contentLength;
+            while (remaining > 0)
+            {
+                var count = Math.Min(chunk.Length, remaining);
+                await stream.WriteAsync(chunk.AsMemory(0, count));
+                remaining -= count;
+                // 让请求体传输持续到旧实现的 500ms drain 上限之后，
+                // 模拟真实 HTTP 客户端在等待响应时仍受背压继续上传。
+                await Task.Delay(TimeSpan.FromMilliseconds(5));
+            }
+
+            await stream.FlushAsync();
+        });
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+        var response = await reader.ReadToEndAsync(timeout.Token);
+        try
+        {
+            await upload.WaitAsync(timeout.Token);
+        }
+        catch (IOException)
+        {
+            // 服务端可以先完成 413 并停止接收后续实体；这里只要求响应本身
+            // 未被 Windows 的 RST 覆盖，不要求客户端一定写完全部已声明实体。
+        }
+
+        Assert.StartsWith("HTTP/1.1 413", response, StringComparison.Ordinal);
+        Assert.Contains("Request body too large.", response, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task 错误响应读空声明的请求体后释放连接槽位()
+    {
+        using var server = CreateServer();
+        server.Start();
+        var path = new Uri(server.Endpoint).PathAndQuery;
+        var host = $"Host: 127.0.0.1:{server.Port}\r\n";
+        var clients = new List<TcpClient>();
+        try
+        {
+            for (var index = 0; index < 16; index++)
+            {
+                var client = new TcpClient();
+                await client.ConnectAsync(IPAddress.Loopback, server.Port);
+                clients.Add(client);
+                var stream = client.GetStream();
+                var request =
+                    $"POST /not-the-mcp-path HTTP/1.1\r\n" +
+                    host +
+                    "Content-Type: application/json\r\n" +
+                    "Content-Length: 1024\r\n" +
+                    "Connection: close\r\n\r\n";
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(request));
+                await stream.WriteAsync(new byte[1024]);
+
+                using var responseTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+                var status = await reader.ReadLineAsync(responseTimeout.Token);
+                Assert.StartsWith("HTTP/1.1 404", status, StringComparison.Ordinal);
+            }
+
+            using var probe = new TcpClient();
+            await probe.ConnectAsync(IPAddress.Loopback, server.Port);
+            var probeStream = probe.GetStream();
+            var probeRequest =
+                $"POST {path} HTTP/1.1\r\n" +
+                host +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: 0\r\n" +
+                "Connection: close\r\n\r\n";
+            await probeStream.WriteAsync(Encoding.ASCII.GetBytes(probeRequest));
+
+            using var probeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            using var probeReader = new StreamReader(probeStream, Encoding.ASCII, leaveOpen: true);
+            var probeStatus = await probeReader.ReadLineAsync(probeTimeout.Token);
+            Assert.StartsWith("HTTP/1.1 ", probeStatus, StringComparison.Ordinal);
+        }
+        finally
+        {
+            foreach (var client in clients)
+            {
+                client.Dispose();
+            }
+        }
     }
 
     [Fact]

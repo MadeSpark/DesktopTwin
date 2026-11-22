@@ -1040,6 +1040,41 @@ public sealed class StartupSnoozeTaskEntry
 }
 
 /// <summary>
+/// 一条本次启动隔离期间接管的当前用户 Winlogon Shell 值。
+///
+/// Winlogon 的 Shell 只在会话登录时读取；把它临时指向已验证的门卫程序，
+/// 子会话就不会启动资源管理器，因此 Run/RunOnce/Startup 文件夹等外壳启动源
+/// 不会进入子会话。Journal 必须精确记录原值是否存在、原值类型和原值内容，
+/// 恢复时不能把用户的其它 Shell 设置覆盖掉。
+/// </summary>
+public sealed class StartupSnoozeShellEntry
+{
+    /// <summary>当前用户 Winlogon 键路径。</summary>
+    public string KeyPath { get; set; } = string.Empty;
+
+    /// <summary>值名称。</summary>
+    public string ValueName { get; set; } = "Shell";
+
+    /// <summary>原值是否存在。</summary>
+    public bool OriginalExists { get; set; }
+
+    /// <summary>原值类型（<see cref="Microsoft.Win32.RegistryValueKind"/> 的整数值）。</summary>
+    public int OriginalKind { get; set; }
+
+    /// <summary>原值；原值不存在时为 <see langword="null"/>。</summary>
+    public string? OriginalValue { get; set; }
+
+    /// <summary>本次写入的 DesktopTwin 门卫完整路径。</summary>
+    public string ManagedValue { get; set; } = string.Empty;
+
+    /// <summary>是否已经准备写入；必须在写入 Winlogon 前落盘。</summary>
+    public bool WriteAttempted { get; set; }
+
+    /// <summary>写入后是否已严格回读确认。</summary>
+    public bool WriteConfirmed { get; set; }
+}
+
+/// <summary>
 /// 一条被关闭的 UWP 启动任务。
 /// </summary>
 public sealed class StartupSnoozeUwpEntry
@@ -1073,9 +1108,10 @@ public sealed class StartupSnoozeUwpEntry
 public sealed class StartupSnoozeJournal
 {
     /// <summary>
-    /// 日志格式版本。版本 2 增加计划任务写入前标记；版本 3 要求计划任务身份。
+    /// 日志格式版本。版本 2 增加计划任务写入前标记；版本 3 要求计划任务身份；
+    /// 版本 4 增加当前用户 Winlogon Shell 的精确接管记录。
     /// </summary>
-    public int Version { get; set; } = 3;
+    public int Version { get; set; } = 4;
 
     /// <summary>创建时间。</summary>
     public DateTimeOffset CreatedAt { get; set; }
@@ -1094,6 +1130,12 @@ public sealed class StartupSnoozeJournal
 
     /// <summary>UWP 启动任务。</summary>
     public List<StartupSnoozeUwpEntry> Uwp { get; set; } = new();
+
+    /// <summary>
+    /// 本次隔离接管的当前用户 Winlogon Shell。版本 4 起使用；旧日志为
+    /// <see langword="null"/>，恢复逻辑按旧格式处理。
+    /// </summary>
+    public StartupSnoozeShellEntry? Shell { get; set; }
 
     /// <summary>未能关闭、但已明确告知用户的项。</summary>
     public List<string> Warnings { get; set; } = new();

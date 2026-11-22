@@ -30,7 +30,21 @@ public static class ChildSessionProcessLauncher
     private const string SessionAgentTaskNamePrefix = "DesktopTwin-SessionAgent-";
 
     /// <summary>
-    /// 本程序注册临时任务时写入的作者。创建和清扫都必须使用这一份常量。
+    /// 分身端代理的持久登录任务名。
+    ///
+    /// 这个名字故意不以临时任务前缀结尾，避免 <see cref="SweepOrphanTasks()"/>
+    /// 把用户登录后仍应保留的任务当成异常残留删掉。
+    /// </summary>
+    internal const string SessionAgentStartupTaskName = "DesktopTwin-SessionAgent-Autostart";
+
+    /// <summary>
+    /// 持久登录任务的固定描述。创建、覆盖和删除都必须用同一份元数据校验，
+    /// 防止同名但来源不同的任务被误改或误删。
+    /// </summary>
+    internal const string SessionAgentStartupTaskDescription = "DesktopTwin 分身端登录自启";
+
+    /// <summary>
+    /// 本程序注册任务时写入的作者。创建和清扫都必须使用这一份常量。
     /// </summary>
     internal const string TaskAuthor = "DesktopTwin";
 
@@ -70,7 +84,10 @@ public static class ChildSessionProcessLauncher
 
     private const int TaskActionExecute = 0;
     private const int TaskCreate = 2;
+    private const int TaskCreateOrUpdate = 6;
     private const int TaskLogonInteractiveToken = 3;
+    private const int TaskTriggerLogon = 9;
+    private const int TaskInstancesIgnoreNew = 2;
 
     /// <summary>
     /// 以最高权限运行（管理员）。
@@ -283,6 +300,284 @@ public static class ChildSessionProcessLauncher
     }
 
     /// <summary>
+    /// 创建或更新当前用户的交互式登录任务。
+    ///
+    /// 该任务只在用户登录时触发，使用交互令牌、普通权限，不保存密码，也不注册开机触发器。
+    /// 任务名固定，因此重复安装是幂等的；覆盖前会先校验同名任务的作者与描述，
+    /// 避免把用户或其他程序创建的同名任务误当成自己的。
+    /// </summary>
+    internal static void CreateOrUpdateSessionAgentLogonTask(string executablePath, string arguments)
+    {
+        ArgumentNullException.ThrowIfNull(arguments);
+
+        var fullPath = ValidateExecutablePath(executablePath);
+        var workingDirectory = Path.GetDirectoryName(fullPath);
+        if (string.IsNullOrWhiteSpace(workingDirectory))
+        {
+            throw new ArgumentException("分身端代理没有可用的工作目录。", nameof(executablePath));
+        }
+
+        var accountName = GetCurrentUserAccountName();
+        EnsureTaskSchedulerIsTrusted();
+
+        var schedulerType = Type.GetTypeFromProgID("Schedule.Service")
+            ?? throw new InvalidOperationException("当前 Windows 未提供任务计划程序 COM 服务。");
+
+        object? schedulerObject = null;
+        object? rootFolderObject = null;
+        object? existingTaskObject = null;
+        object? existingDefinitionObject = null;
+        object? existingInfoObject = null;
+        object? taskDefinitionObject = null;
+        object? registrationInfoObject = null;
+        object? settingsObject = null;
+        object? principalObject = null;
+        object? triggersObject = null;
+        object? actionsObject = null;
+        object? triggerObject = null;
+        object? actionObject = null;
+        object? registeredTaskObject = null;
+
+        try
+        {
+            schedulerObject = Activator.CreateInstance(schedulerType)
+                ?? throw new InvalidOperationException("无法创建任务计划程序 COM 对象。");
+            dynamic scheduler = schedulerObject;
+            scheduler.Connect();
+
+            rootFolderObject = scheduler.GetFolder("\\");
+            dynamic rootFolder = rootFolderObject;
+
+            // 同名任务可能是用户或其他程序创建的。覆盖之前必须确认来源；
+            // 读不到元数据时一律拒绝，不能拿 TASK_CREATE_OR_UPDATE 去赌。
+            try
+            {
+                existingTaskObject = rootFolder.GetTask(SessionAgentStartupTaskName);
+            }
+            catch (Exception exception) when (IsTaskNotFound(exception))
+            {
+                existingTaskObject = null;
+            }
+
+            if (existingTaskObject is not null)
+            {
+                dynamic existingTask = existingTaskObject;
+                existingDefinitionObject = existingTask.Definition;
+                dynamic existingDefinition = existingDefinitionObject;
+                existingInfoObject = existingDefinition.RegistrationInfo;
+                dynamic existingInfo = existingInfoObject;
+                if (!HasExpectedSessionAgentTaskRegistrationInfo(
+                        existingInfo.Author as string,
+                        existingInfo.Description as string))
+                {
+                    throw new InvalidOperationException(
+                        $"计划任务 {SessionAgentStartupTaskName} 已存在，但不是 DesktopTwin 创建的同名任务，拒绝覆盖。");
+                }
+            }
+
+            taskDefinitionObject = scheduler.NewTask(0);
+            dynamic taskDefinition = taskDefinitionObject;
+
+            registrationInfoObject = taskDefinition.RegistrationInfo;
+            dynamic registrationInfo = registrationInfoObject;
+            registrationInfo.Author = TaskAuthor;
+            registrationInfo.Description = SessionAgentStartupTaskDescription;
+
+            settingsObject = taskDefinition.Settings;
+            dynamic settings = settingsObject;
+            settings.Enabled = true;
+            settings.Hidden = true;
+            settings.AllowDemandStart = true;
+            settings.DisallowStartIfOnBatteries = false;
+            settings.StopIfGoingOnBatteries = false;
+            settings.ExecutionTimeLimit = "PT0S";
+            settings.MultipleInstances = TaskInstancesIgnoreNew;
+            settings.RunOnlyIfIdle = false;
+
+            principalObject = taskDefinition.Principal;
+            dynamic principal = principalObject;
+            principal.UserId = accountName;
+            principal.LogonType = TaskLogonInteractiveToken;
+            principal.RunLevel = TaskRunLevelLimited;
+
+            triggersObject = taskDefinition.Triggers;
+            dynamic triggers = triggersObject;
+            triggerObject = triggers.Create(TaskTriggerLogon);
+            dynamic trigger = triggerObject;
+            trigger.UserId = accountName;
+            trigger.Enabled = true;
+
+            actionsObject = taskDefinition.Actions;
+            dynamic actions = actionsObject;
+            actionObject = actions.Create(TaskActionExecute);
+            dynamic action = actionObject;
+            action.Path = fullPath;
+            action.Arguments = arguments;
+            action.WorkingDirectory = workingDirectory;
+
+            registeredTaskObject = rootFolder.RegisterTaskDefinition(
+                SessionAgentStartupTaskName,
+                taskDefinition,
+                TaskCreateOrUpdate,
+                accountName,
+                null,
+                TaskLogonInteractiveToken,
+                null);
+
+            if (registeredTaskObject is null)
+            {
+                throw new InvalidOperationException("任务计划程序没有返回已注册的登录任务。");
+            }
+        }
+        finally
+        {
+            ReleaseComObject(registeredTaskObject);
+            ReleaseComObject(actionObject);
+            ReleaseComObject(triggerObject);
+            ReleaseComObject(actionsObject);
+            ReleaseComObject(triggersObject);
+            ReleaseComObject(principalObject);
+            ReleaseComObject(settingsObject);
+            ReleaseComObject(registrationInfoObject);
+            ReleaseComObject(taskDefinitionObject);
+            ReleaseComObject(existingInfoObject);
+            ReleaseComObject(existingDefinitionObject);
+            ReleaseComObject(existingTaskObject);
+            ReleaseComObject(rootFolderObject);
+            ReleaseComObject(schedulerObject);
+        }
+    }
+
+    /// <summary>
+    /// 删除本程序的持久登录任务。任务不存在视为成功；同名但来源不明的任务拒绝删除。
+    /// </summary>
+    /// <returns>任务已不存在或已成功删除时返回 true。</returns>
+    internal static bool TryDeleteSessionAgentLogonTask(out string error)
+    {
+        error = string.Empty;
+        object? schedulerObject = null;
+        object? rootFolderObject = null;
+        object? taskObject = null;
+        object? definitionObject = null;
+        object? registrationInfoObject = null;
+
+        try
+        {
+            EnsureTaskSchedulerIsTrusted();
+
+            var schedulerType = Type.GetTypeFromProgID("Schedule.Service");
+            if (schedulerType is null)
+            {
+                error = "当前 Windows 未提供任务计划程序 COM 服务。";
+                return false;
+            }
+
+            schedulerObject = Activator.CreateInstance(schedulerType);
+            if (schedulerObject is null)
+            {
+                error = "无法创建任务计划程序 COM 对象。";
+                return false;
+            }
+
+            dynamic scheduler = schedulerObject;
+            scheduler.Connect();
+            rootFolderObject = scheduler.GetFolder("\\");
+            dynamic rootFolder = rootFolderObject;
+
+            try
+            {
+                taskObject = rootFolder.GetTask(SessionAgentStartupTaskName);
+            }
+            catch (Exception exception) when (IsTaskNotFound(exception))
+            {
+                return true;
+            }
+
+            if (taskObject is null)
+            {
+                error = "任务计划程序返回了空的登录任务对象。";
+                return false;
+            }
+
+            dynamic task = taskObject;
+            definitionObject = task.Definition;
+            dynamic definition = definitionObject;
+            registrationInfoObject = definition.RegistrationInfo;
+            dynamic registrationInfo = registrationInfoObject;
+            if (!HasExpectedSessionAgentTaskRegistrationInfo(
+                    registrationInfo.Author as string,
+                    registrationInfo.Description as string))
+            {
+                error = $"计划任务 {SessionAgentStartupTaskName} 的来源不是 DesktopTwin，拒绝删除。";
+                return false;
+            }
+
+            rootFolder.DeleteTask(SessionAgentStartupTaskName, 0);
+            return true;
+        }
+        catch (Exception exception) when (exception is COMException
+                                              or InvalidOperationException
+                                              or UnauthorizedAccessException
+                                              or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException
+                                              or InvalidCastException)
+        {
+            error = exception.Message;
+            return false;
+        }
+        finally
+        {
+            ReleaseComObject(registrationInfoObject);
+            ReleaseComObject(definitionObject);
+            ReleaseComObject(taskObject);
+            ReleaseComObject(rootFolderObject);
+            ReleaseComObject(schedulerObject);
+        }
+    }
+
+    /// <summary>
+    /// 持久登录任务的作者与描述必须同时精确匹配。作者单独匹配不够：
+    /// 其他程序可以同样写 DesktopTwin，但不会知道这段固定描述。
+    /// </summary>
+    internal static bool HasExpectedSessionAgentTaskRegistrationInfo(
+        string? author,
+        string? description)
+    {
+        return string.Equals(author, TaskAuthor, StringComparison.Ordinal)
+            && string.Equals(description, SessionAgentStartupTaskDescription, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 任务计划程序对「任务不存在」返回两种常见 HRESULT，部分包装层则抛文件异常。
+    /// 只把这两种情况当作不存在，其他错误继续向上抛，避免误删失败被当成成功。
+    /// </summary>
+    private static bool IsTaskNotFound(Exception exception)
+    {
+        if (exception is FileNotFoundException)
+        {
+            return true;
+        }
+
+        return exception is COMException comException
+            && (comException.HResult == unchecked((int)0x8004130F)
+                || comException.HResult == unchecked((int)0x80070002));
+    }
+
+    /// <summary>
+    /// 取当前交互用户的账户名。任务创建和删除都必须绑定同一个身份。
+    /// </summary>
+    private static string GetCurrentUserAccountName()
+    {
+        using var currentIdentity = WindowsIdentity.GetCurrent();
+        var accountName = currentIdentity.Name;
+        if (string.IsNullOrWhiteSpace(accountName))
+        {
+            throw new InvalidOperationException("无法读取当前用户身份，不能注册分身端登录任务。");
+        }
+
+        return accountName;
+    }
+
+    /// <summary>
     /// 只接受本程序创建的两类任务名，且后缀必须恰好是 32 位十六进制 GUID。
     /// 名称大小写与 GUID 大小写均按 Windows 任务计划程序的实际语义处理：
     /// 前缀必须精确，GUID 的 a-f 允许大小写。
@@ -389,6 +684,8 @@ public static class ChildSessionProcessLauncher
             out string? description)
         {
             object? taskObject = null;
+            object? definitionObject = null;
+            object? registrationInfoObject = null;
             try
             {
                 dynamic rootFolder = _rootFolderObject;
@@ -401,13 +698,18 @@ public static class ChildSessionProcessLauncher
                 }
 
                 dynamic task = taskObject;
-                dynamic registrationInfo = task.Definition.RegistrationInfo;
+                definitionObject = task.Definition;
+                dynamic definition = definitionObject;
+                registrationInfoObject = definition.RegistrationInfo;
+                dynamic registrationInfo = registrationInfoObject;
                 author = registrationInfo.Author as string;
                 description = registrationInfo.Description as string;
                 return true;
             }
             finally
             {
+                ReleaseComObject(registrationInfoObject);
+                ReleaseComObject(definitionObject);
                 ReleaseComObject(taskObject);
             }
         }
@@ -696,15 +998,15 @@ public static class ChildSessionProcessLauncher
             ?? throw new InvalidOperationException("当前 Windows 未提供任务计划程序 COM 服务。");
 
         var taskName = (taskNamePrefix ?? TaskNamePrefix) + Guid.NewGuid().ToString("N");
-        string accountName;
-        using (var currentIdentity = WindowsIdentity.GetCurrent())
-        {
-            accountName = currentIdentity.Name;
-        }
+        var accountName = GetCurrentUserAccountName();
 
         object? schedulerObject = null;
         object? rootFolderObject = null;
         object? taskDefinitionObject = null;
+        object? registrationInfoObject = null;
+        object? settingsObject = null;
+        object? principalObject = null;
+        object? actionsObject = null;
         object? actionObject = null;
         object? registeredTaskObject = null;
         object? runningTaskObject = null;
@@ -722,24 +1024,31 @@ public static class ChildSessionProcessLauncher
             taskDefinitionObject = scheduler.NewTask(0);
             dynamic taskDefinition = taskDefinitionObject;
 
-            taskDefinition.RegistrationInfo.Author = TaskAuthor;
-            taskDefinition.RegistrationInfo.Description =
-                BuildTaskDescription(executablePath, childSessionId);
+            registrationInfoObject = taskDefinition.RegistrationInfo;
+            dynamic registrationInfo = registrationInfoObject;
+            registrationInfo.Author = TaskAuthor;
+            registrationInfo.Description = BuildTaskDescription(executablePath, childSessionId);
 
-            taskDefinition.Settings.Enabled = true;
-            taskDefinition.Settings.Hidden = true;
-            taskDefinition.Settings.AllowDemandStart = true;
-            taskDefinition.Settings.DisallowStartIfOnBatteries = false;
-            taskDefinition.Settings.StopIfGoingOnBatteries = false;
-            taskDefinition.Settings.ExecutionTimeLimit = "PT0S";
+            settingsObject = taskDefinition.Settings;
+            dynamic settings = settingsObject;
+            settings.Enabled = true;
+            settings.Hidden = true;
+            settings.AllowDemandStart = true;
+            settings.DisallowStartIfOnBatteries = false;
+            settings.StopIfGoingOnBatteries = false;
+            settings.ExecutionTimeLimit = "PT0S";
 
-            taskDefinition.Principal.UserId = accountName;
-            taskDefinition.Principal.LogonType = TaskLogonInteractiveToken;
-            taskDefinition.Principal.RunLevel = runAsAdministrator
+            principalObject = taskDefinition.Principal;
+            dynamic principal = principalObject;
+            principal.UserId = accountName;
+            principal.LogonType = TaskLogonInteractiveToken;
+            principal.RunLevel = runAsAdministrator
                 ? TaskRunLevelHighest
                 : TaskRunLevelLimited;
 
-            actionObject = taskDefinition.Actions.Create(TaskActionExecute);
+            actionsObject = taskDefinition.Actions;
+            dynamic actions = actionsObject;
+            actionObject = actions.Create(TaskActionExecute);
             dynamic action = actionObject;
             action.Path = executablePath;
             action.Arguments = arguments;
@@ -787,6 +1096,10 @@ public static class ChildSessionProcessLauncher
             ReleaseComObject(runningTaskObject);
             ReleaseComObject(registeredTaskObject);
             ReleaseComObject(actionObject);
+            ReleaseComObject(actionsObject);
+            ReleaseComObject(principalObject);
+            ReleaseComObject(settingsObject);
+            ReleaseComObject(registrationInfoObject);
             ReleaseComObject(taskDefinitionObject);
             ReleaseComObject(rootFolderObject);
             ReleaseComObject(schedulerObject);
@@ -806,6 +1119,15 @@ public static class ChildSessionProcessLauncher
             try
             {
                 await Task.Delay(TaskCleanupDelay).ConfigureAwait(false);
+
+                // 延迟清理同样会在提权进程中实例化 COM。必须重新做一次注册表
+                // 守卫，不能因为任务名是自己生成的，就假设 45 秒后 COM 仍然可信。
+                if (!IsManagedTemporaryTaskName(taskName))
+                {
+                    return;
+                }
+
+                EnsureTaskSchedulerIsTrusted();
 
                 var schedulerType = Type.GetTypeFromProgID("Schedule.Service");
                 if (schedulerType is null)

@@ -232,6 +232,53 @@ public sealed class StartupSnoozeServiceTests
     }
 
     [Fact]
+    public void 计划任务缓存残留仅在定义文件明确缺失时按不存在处理()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin.TaskDefinition." + Guid.NewGuid().ToString("N"));
+        var vendorDirectory = Path.Combine(root, "Vendor", "Startup");
+        Directory.CreateDirectory(vendorDirectory);
+        try
+        {
+            const string missingRelative = @"\Vendor\Startup\DeletedTask";
+            Assert.True(StartupSnoozeService.IsTaskDefinitionFileConfirmedMissing(
+                missingRelative,
+                root));
+
+            var stale = StartupSnoozeService.InterpretFailedTaskXmlQuery(
+                StartupSnoozeService.ScheduledTaskPresence.Present,
+                definitionFileConfirmedMissing: true);
+            Assert.True(stale.IsAbsent);
+
+            var unresolved = StartupSnoozeService.InterpretFailedTaskXmlQuery(
+                StartupSnoozeService.ScheduledTaskPresence.Present);
+            Assert.True(unresolved.IsUnknown);
+
+            File.WriteAllText(Path.Combine(vendorDirectory, "ExistingTask"), "<Task />");
+            Assert.False(StartupSnoozeService.IsTaskDefinitionFileConfirmedMissing(
+                @"\Vendor\Startup\ExistingTask",
+                root));
+
+            Directory.CreateDirectory(Path.Combine(vendorDirectory, "DirectoryTask"));
+            Assert.False(StartupSnoozeService.IsTaskDefinitionFileConfirmedMissing(
+                @"\Vendor\Startup\DirectoryTask",
+                root));
+
+            Assert.False(StartupSnoozeService.IsTaskDefinitionFileConfirmedMissing(
+                @"\Vendor\..\Startup\DeletedTask",
+                root));
+            Assert.False(StartupSnoozeService.IsTaskDefinitionFileConfirmedMissing(
+                @"\Vendor\Startup\..",
+                root));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void 计划任务只认_Settings_这个元素而不是同前缀的别的元素()
     {
         // 元素名前缀相同不能算命中，否则会把别的块里的 Enabled 当成本任务的开关。
@@ -441,6 +488,8 @@ public sealed class StartupSnoozeServiceTests
         Assert.True(StartupSnoozeService.IsMicrosoftSystemTaskPath(@"\Microsoft\Windows\WindowsUpdate\Scheduled Start"));
         Assert.True(StartupSnoozeService.IsMicrosoftSystemTaskPath(@"\Microsoft\Windows\Application Experience\StartupAppTask"));
         Assert.True(StartupSnoozeService.IsMicrosoftSystemTaskPath(@"\Microsoft\Windows\Task Manager\StartupAppTask"));
+        Assert.True(StartupSnoozeService.IsMicrosoftSystemTaskPath(
+            @"\Microsoft\Windows\DeviceDirectoryClient\RegisterUserDevice"));
         Assert.True(StartupSnoozeService.IsMicrosoftSystemTaskPath(@"\CreateExplorerShellUnelevatedTask"));
 
         // \Microsoft 本身、未列出的子目录和第三方/商店应用任务都必须照常隔离。
@@ -690,7 +739,7 @@ public sealed class StartupSnoozeServiceTests
         Assert.Equal("Registry64", back.Registry[0].ApprovedView);
         Assert.Equal(journal.Registry[0].OriginalBase64, back.Registry[0].OriginalBase64);
         Assert.True(back.Registry[0].Applied);
-        Assert.Equal(3, back.Version);
+        Assert.Equal(4, back.Version);
         Assert.Single(back.Tasks);
         Assert.Equal(journal.Tasks[0].Identity, back.Tasks[0].Identity);
         Assert.True(back.Tasks[0].WriteAttempted);
@@ -736,6 +785,30 @@ public sealed class StartupSnoozeServiceTests
         {
             System.IO.Directory.Delete(directory, recursive: true);
         }
+    }
+
+    [Fact]
+    public void 启动项守卫把厂商服务会拉起的伙伴程序扩展为当前产品下的精确路径()
+    {
+        var productDirectory = Path.GetFullPath(
+            Path.Combine(Path.GetTempPath(), "DesktopTwin-GameViewer-fixture"));
+        var launcher = Path.Combine(productDirectory, "GameViewer.exe");
+
+        var companions = StartupSnoozeService.GetServiceSpawnCompanionExecutables(launcher);
+
+        Assert.Equal(
+            [
+                Path.Combine(productDirectory, "bin", "GameViewerServer.exe"),
+                Path.Combine(productDirectory, "bin", "crashpad_handler.exe")
+            ],
+            companions);
+
+        // 服务本身、同目录其它程序和联想系统协同插件都不是这个启动项的产品组件。
+        Assert.Empty(StartupSnoozeService.GetServiceSpawnCompanionExecutables(
+            Path.Combine(productDirectory, "GameViewerService.exe")));
+        Assert.Empty(StartupSnoozeService.GetServiceSpawnCompanionExecutables(
+            Path.Combine(Path.GetTempPath(), "Udc", "MessagingPlugin.exe")));
+        Assert.Empty(StartupSnoozeService.GetServiceSpawnCompanionExecutables(string.Empty));
     }
 
     [Fact]
@@ -791,6 +864,41 @@ public sealed class StartupSnoozeServiceTests
             7, 7, 1, null, exact));
         Assert.False(StartupGuardService.ShouldTerminate(
             1, 7, 1, null, exact));
+    }
+
+    [Fact]
+    public void 启动项守卫只对守卫启动前的进程放行用户窗口但清理服务注入副本()
+    {
+        // 重连已有会话时，用户先把目标程序打开了：登录阶段也不能补杀。
+        Assert.False(StartupGuardService.ShouldTerminateObservedProcess(
+            existedBeforeGuard: true,
+            allowDirectFallback: true,
+            directFallbackMatch: true,
+            serviceSpawnMatch: false));
+
+        // 但会话 0 厂商服务在守卫启动前注入的精确副本必须补杀，否则接管
+        // 已完成关停日志的会话会永久漏放启动副本。
+        Assert.True(StartupGuardService.ShouldTerminateObservedProcess(
+            existedBeforeGuard: true,
+            allowDirectFallback: false,
+            directFallbackMatch: false,
+            serviceSpawnMatch: true));
+
+        Assert.True(StartupGuardService.ShouldTerminateObservedProcess(
+            existedBeforeGuard: false,
+            allowDirectFallback: true,
+            directFallbackMatch: true,
+            serviceSpawnMatch: false));
+        Assert.False(StartupGuardService.ShouldTerminateObservedProcess(
+            existedBeforeGuard: false,
+            allowDirectFallback: false,
+            directFallbackMatch: false,
+            serviceSpawnMatch: false));
+        Assert.True(StartupGuardService.ShouldTerminateObservedProcess(
+            existedBeforeGuard: false,
+            allowDirectFallback: false,
+            directFallbackMatch: false,
+            serviceSpawnMatch: true));
     }
 
     [Fact]
@@ -971,6 +1079,164 @@ public sealed class StartupSnoozeServiceTests
         Assert.False(StartupGuardService.ShouldTerminateServiceSpawn(
             mainSession, mainSession, mainSession,
             expectedPath, 0, serviceStartedAt, childStartedAt, paths));
+    }
+
+    [Fact]
+    public void 启动项守卫允许精确受管中间进程桥接会话0服务()
+    {
+        const uint mainSession = 1;
+        const uint childSession = 2;
+        const int candidatePid = 100;
+        const int intermediatePid = 200;
+        const int servicePid = 300;
+        var candidatePath = Path.GetFullPath("C:/Apps/Contoso/crashpad_handler.exe");
+        var intermediatePath = Path.GetFullPath("C:/Apps/Contoso/GameViewerServer.exe");
+        var unmanagedPath = Path.GetFullPath("C:/Apps/Other/helper.exe");
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            candidatePath,
+            intermediatePath
+        };
+        var childStartedAt = DateTime.UtcNow;
+        var intermediateStartedAt = childStartedAt.AddSeconds(-5);
+        var serviceStartedAt = childStartedAt.AddMinutes(-1);
+
+        ProcessAncestryInfo? ResolveWith(
+            int processId,
+            uint sessionId,
+            DateTime startedAt,
+            string? path,
+            int parentProcessId)
+        {
+            return processId switch
+            {
+                intermediatePid => new ProcessAncestryInfo(
+                    intermediatePid, servicePid, sessionId, startedAt, path),
+                servicePid => new ProcessAncestryInfo(
+                    servicePid, 0, 0, startedAt, path),
+                _ => null
+            };
+        }
+
+        Assert.True(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            "c:/apps/contoso/CRASHPAD_HANDLER.EXE",
+            intermediatePid,
+            childStartedAt,
+            paths,
+            processId => ResolveWith(
+                processId,
+                processId == intermediatePid ? childSession : 0,
+                processId == intermediatePid ? intermediateStartedAt : serviceStartedAt,
+                processId == intermediatePid ? intermediatePath : null,
+                processId == intermediatePid ? servicePid : 0)));
+
+        // 中间节点不是已登记启动程序时，不能凭“父进程在子会话”扩大拦截。
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            candidatePath,
+            intermediatePid,
+            childStartedAt,
+            paths,
+            processId => ResolveWith(
+                processId,
+                childSession,
+                intermediateStartedAt,
+                unmanagedPath,
+                servicePid)));
+
+        // 中间节点路径不可读、会话不符或启动时间倒序都必须失败关闭。
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            candidatePath,
+            intermediatePid,
+            childStartedAt,
+            paths,
+            processId => ResolveWith(
+                processId,
+                childSession,
+                intermediateStartedAt,
+                null,
+                servicePid)));
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            candidatePath,
+            intermediatePid,
+            childStartedAt,
+            paths,
+            processId => ResolveWith(
+                processId,
+                mainSession,
+                intermediateStartedAt,
+                intermediatePath,
+                servicePid)));
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            candidatePath,
+            intermediatePid,
+            childStartedAt,
+            paths,
+            processId => ResolveWith(
+                processId,
+                childSession,
+                childStartedAt.AddSeconds(1),
+                intermediatePath,
+                servicePid)));
+
+        // 环、深度上限和服务祖先晚于子进程都必须拒绝。
+        var cycle = new Dictionary<int, ProcessAncestryInfo>
+        {
+            [intermediatePid] = new(intermediatePid, candidatePid, childSession, intermediateStartedAt, intermediatePath),
+            [candidatePid] = new(candidatePid, intermediatePid, childSession, childStartedAt, candidatePath)
+        };
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            candidatePath,
+            intermediatePid,
+            childStartedAt,
+            paths,
+            processId => cycle.TryGetValue(processId, out var value) ? value : null));
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            candidatePath,
+            intermediatePid,
+            childStartedAt,
+            paths,
+            processId => ResolveWith(
+                processId,
+                childSession,
+                intermediateStartedAt,
+                intermediatePath,
+                servicePid),
+            maximumDepth: 1));
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            childSession,
+            childSession,
+            mainSession,
+            candidatePath,
+            servicePid,
+            childStartedAt,
+            paths,
+            processId => new ProcessAncestryInfo(
+                servicePid,
+                0,
+                0,
+                childStartedAt.AddSeconds(1),
+                null)));
     }
 
     [Fact]
@@ -1348,7 +1614,7 @@ public sealed class StartupSnoozeServiceTests
         previous.Tasks[0].Identity = null;
         StartupSnoozeService.ValidateJournal(previous);
 
-        AssertInvalidJournal(journal => journal.Version = 4);
+        AssertInvalidJournal(journal => journal.Version = 5);
         AssertInvalidJournal(journal => journal.Tasks[0].Identity = null);
     }
 
@@ -1690,6 +1956,57 @@ public sealed class StartupSnoozeServiceTests
     }
 
     [Fact]
+    public void 已有分身会话接管完成日志时补充只读启动项守卫目标()
+    {
+        WithTestDirectory(directory =>
+        {
+            var managed = Path.GetFullPath(SessionAgentService.DefaultShellGatePath);
+            var shellStore = new FakeCurrentUserShellStore(
+                new CurrentUserShellSnapshot(true, RegistryValueKind.String, managed));
+            var service = new StartupSnoozeService(
+                directory,
+                () => StartupSnoozeService.ChildSessionPresence.Present,
+                TimeSpan.Zero,
+                _ => new List<string>(),
+                () => new StartupSnoozeSnapshot(
+                    new List<StartupSnoozeRegistryEntry>
+                    {
+                        new()
+                        {
+                            Kind = "RunValue",
+                            Hive = "CurrentUser",
+                            CommandLine = "\"C:\\Apps\\GameViewerServer.exe\" --auto-run"
+                        }
+                    },
+                    new List<StartupSnoozeTaskEntry>(),
+                    new List<StartupSnoozeUwpEntry>()),
+                shellStore);
+            var journal = CreateEmptyTestJournal(completed: true);
+            journal.Shell = new StartupSnoozeShellEntry
+            {
+                KeyPath = CurrentUserShellStore.WinlogonKeyPath,
+                ValueName = "Shell",
+                OriginalExists = true,
+                OriginalKind = (int)RegistryValueKind.String,
+                OriginalValue = "explorer.exe",
+                ManagedValue = managed,
+                WriteAttempted = true,
+                WriteConfirmed = true
+            };
+            WriteTestJournal(service, journal);
+
+            var result = service.EnsureSnoozedForExistingChildSession(
+                isolateRegistryStartupEntries: false);
+
+            Assert.True(result.Success, result.Message);
+            var updated = ReadTestJournal(service);
+            Assert.Empty(updated.Registry);
+            Assert.Contains(@"C:\Apps\GameViewerServer.exe", updated.DeferredExecutables);
+            Assert.Contains(@"C:\Apps\GameViewerServer.exe", result.ManagedStartupExecutables);
+        });
+    }
+
+    [Fact]
     public void 已有分身会话时拒绝接管不完整日志()
     {
         WithTestDirectory(directory =>
@@ -1777,7 +2094,7 @@ public sealed class StartupSnoozeServiceTests
                     return presences.Dequeue();
                 },
                 TimeSpan.Zero,
-                () => new List<string>(),
+                _ => new List<string>(),
                 () => new StartupSnoozeSnapshot(
                     new List<StartupSnoozeRegistryEntry>(),
                     new List<StartupSnoozeTaskEntry>(),
@@ -1818,7 +2135,7 @@ public sealed class StartupSnoozeServiceTests
                     return presences.Dequeue();
                 },
                 TimeSpan.Zero,
-                () => new List<string>(),
+                _ => new List<string>(),
                 () => new StartupSnoozeSnapshot(
                     new List<StartupSnoozeRegistryEntry>(),
                     new List<StartupSnoozeTaskEntry>(),
@@ -1854,6 +2171,394 @@ public sealed class StartupSnoozeServiceTests
             Assert.False(result.Success);
             Assert.True(service.HasPendingJournal);
             Assert.True(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 替代外壳接管会记录Shell原本不存在并在恢复时删除()
+    {
+        WithTestDirectory(directory =>
+        {
+            var shellStore = new FakeCurrentUserShellStore();
+            var service = CreateShellTestService(directory, shellStore);
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.True(result.Success, result.Message);
+            var managed = Path.GetFullPath(SessionAgentService.DefaultShellGatePath);
+            Assert.Equal(new[] { managed }, shellStore.Writes);
+            Assert.Equal(new[] { RegistryValueKind.String }, shellStore.WriteKinds);
+
+            var journal = ReadTestJournal(service);
+            Assert.NotNull(journal.Shell);
+            Assert.False(journal.Shell!.OriginalExists);
+            Assert.Equal((int)RegistryValueKind.String, journal.Shell.OriginalKind);
+            Assert.Null(journal.Shell.OriginalValue);
+            Assert.Equal(managed, journal.Shell.ManagedValue);
+            Assert.True(journal.Shell.WriteAttempted);
+            Assert.True(journal.Shell.WriteConfirmed);
+
+            var restored = service.Restore();
+
+            Assert.True(restored.Success, restored.Message);
+            Assert.False(shellStore.Current.Exists);
+            Assert.Equal(1, shellStore.DeleteCalls);
+            Assert.False(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 替代外壳接管会精确保留REG_EXPAND_SZ原值并原样恢复()
+    {
+        WithTestDirectory(directory =>
+        {
+            const string original = @"%windir%\explorer.exe";
+            var shellStore = new FakeCurrentUserShellStore(
+                new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.ExpandString,
+                    original));
+            var service = CreateShellTestService(directory, shellStore);
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.True(result.Success, result.Message);
+            var journal = ReadTestJournal(service);
+            Assert.NotNull(journal.Shell);
+            Assert.True(journal.Shell!.OriginalExists);
+            Assert.Equal((int)RegistryValueKind.ExpandString, journal.Shell.OriginalKind);
+            Assert.Equal(original, journal.Shell.OriginalValue);
+
+            var restored = service.Restore();
+
+            Assert.True(restored.Success, restored.Message);
+            Assert.Equal(
+                new[]
+                {
+                    Path.GetFullPath(SessionAgentService.DefaultShellGatePath),
+                    original
+                },
+                shellStore.Writes);
+            Assert.Equal(
+                new[] { RegistryValueKind.String, RegistryValueKind.ExpandString },
+                shellStore.WriteKinds);
+            Assert.True(shellStore.Current.Exists);
+            Assert.Equal(RegistryValueKind.ExpandString, shellStore.Current.Kind);
+            Assert.Equal(original, shellStore.Current.Value);
+            Assert.Equal(0, shellStore.DeleteCalls);
+        });
+    }
+
+    [Fact]
+    public void 替代外壳拒绝第三方Shell且不做任何写入()
+    {
+        WithTestDirectory(directory =>
+        {
+            const string foreign = @"C:\Program Files\Contoso\shell.exe";
+            var shellStore = new FakeCurrentUserShellStore(
+                new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.String,
+                    foreign));
+            var service = CreateShellTestService(directory, shellStore);
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.False(result.Success);
+            Assert.Contains("拒绝覆盖", result.Message);
+            Assert.Empty(shellStore.Writes);
+            Assert.False(File.Exists(service.JournalPath));
+            Assert.Equal(foreign, shellStore.Current.Value);
+        });
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void 替代外壳在接管前发现外部修改时不覆盖新Shell并保留日志(int readNumber)
+    {
+        WithTestDirectory(directory =>
+        {
+            const string foreign = @"C:\Program Files\Contoso\race-before-write-shell.exe";
+            var shellStore = new FakeCurrentUserShellStore
+            {
+                ReplaceCurrentBeforeReadNumber = readNumber,
+                ReplacementBeforeRead = new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.String,
+                    foreign)
+            };
+            var service = CreateShellTestService(directory, shellStore);
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.False(result.Success);
+            Assert.Contains("外部修改", result.Message);
+            Assert.Contains("未覆盖", result.Message);
+            Assert.Empty(shellStore.Writes);
+            Assert.Equal(0, shellStore.DeleteCalls);
+            Assert.Equal(foreign, shellStore.Current.Value);
+            Assert.True(File.Exists(service.JournalPath));
+            var journal = ReadTestJournal(service);
+            Assert.NotNull(journal.Shell);
+            Assert.Equal(readNumber == 3, journal.Shell!.WriteAttempted);
+            Assert.False(journal.Shell.WriteConfirmed);
+        });
+    }
+
+    [Fact]
+    public void 替代外壳拒绝没有日志证明所有权的门卫残留值()
+    {
+        WithTestDirectory(directory =>
+        {
+            var managed = Path.GetFullPath(SessionAgentService.DefaultShellGatePath);
+            var shellStore = new FakeCurrentUserShellStore(
+                new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.String,
+                    managed));
+            var service = CreateShellTestService(directory, shellStore);
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.False(result.Success);
+            Assert.Contains("拒绝覆盖", result.Message);
+            Assert.Empty(shellStore.Writes);
+            Assert.False(File.Exists(service.JournalPath));
+            Assert.Equal(managed, shellStore.Current.Value);
+        });
+    }
+
+    [Fact]
+    public void 替代外壳写入回读被外部改值时不覆盖新值并保留日志()
+    {
+        WithTestDirectory(directory =>
+        {
+            const string foreign = @"C:\Program Files\Contoso\race-shell.exe";
+            var shellStore = new FakeCurrentUserShellStore
+            {
+                RewriteAfterWrite = foreign
+            };
+            var service = CreateShellTestService(directory, shellStore);
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.False(result.Success);
+            Assert.Contains("回滚", result.Message);
+            Assert.Single(shellStore.Writes);
+            Assert.Equal(0, shellStore.DeleteCalls);
+            Assert.Equal(foreign, shellStore.Current.Value);
+            Assert.True(File.Exists(service.JournalPath));
+            var journal = ReadTestJournal(service);
+            Assert.NotNull(journal.Shell);
+            Assert.True(journal.Shell!.WriteAttempted);
+            Assert.False(journal.Shell.WriteConfirmed);
+        });
+    }
+
+    [Fact]
+    public void 外壳日志已尝试未确认时仍可从未存在的原值恢复()
+    {
+        WithTestDirectory(directory =>
+        {
+            var managed = Path.GetFullPath(SessionAgentService.DefaultShellGatePath);
+            var shellStore = new FakeCurrentUserShellStore(
+                new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.String,
+                    managed));
+            var service = CreateShellTestService(directory, shellStore);
+            var journal = CreateEmptyTestJournal(completed: false);
+            journal.Shell = new StartupSnoozeShellEntry
+            {
+                KeyPath = CurrentUserShellStore.WinlogonKeyPath,
+                ValueName = "Shell",
+                OriginalExists = false,
+                OriginalKind = (int)RegistryValueKind.String,
+                OriginalValue = null,
+                ManagedValue = managed,
+                WriteAttempted = true,
+                WriteConfirmed = false
+            };
+            WriteTestJournal(service, journal);
+
+            var result = service.Restore();
+
+            Assert.True(result.Success, result.Message);
+            Assert.Equal(1, shellStore.DeleteCalls);
+            Assert.False(shellStore.Current.Exists);
+            Assert.False(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 恢复时发现Shell被外部修改会保留新值和日志()
+    {
+        WithTestDirectory(directory =>
+        {
+            const string foreign = @"C:\Program Files\Contoso\new-shell.exe";
+            var managed = Path.GetFullPath(SessionAgentService.DefaultShellGatePath);
+            var shellStore = new FakeCurrentUserShellStore(
+                new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.String,
+                    foreign));
+            var service = CreateShellTestService(directory, shellStore);
+            var journal = CreateEmptyTestJournal(completed: true);
+            journal.Shell = new StartupSnoozeShellEntry
+            {
+                KeyPath = CurrentUserShellStore.WinlogonKeyPath,
+                ValueName = "Shell",
+                OriginalExists = false,
+                OriginalKind = (int)RegistryValueKind.String,
+                OriginalValue = null,
+                ManagedValue = managed,
+                WriteAttempted = true,
+                WriteConfirmed = true
+            };
+            WriteTestJournal(service, journal);
+
+            var result = service.Restore();
+
+            Assert.False(result.Success);
+            Assert.Contains("已被外部修改", result.Message);
+            Assert.Empty(shellStore.Writes);
+            Assert.Equal(0, shellStore.DeleteCalls);
+            Assert.Equal(foreign, shellStore.Current.Value);
+            Assert.True(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 外壳日志拒绝设备前缀原始值且不触碰当前Shell()
+    {
+        WithTestDirectory(directory =>
+        {
+            var managed = Path.GetFullPath(SessionAgentService.DefaultShellGatePath);
+            var shellStore = new FakeCurrentUserShellStore(
+                new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.String,
+                    managed));
+            var service = CreateShellTestService(directory, shellStore);
+            var journal = CreateEmptyTestJournal(completed: true);
+            journal.Shell = new StartupSnoozeShellEntry
+            {
+                KeyPath = CurrentUserShellStore.WinlogonKeyPath,
+                ValueName = "Shell",
+                OriginalExists = true,
+                OriginalKind = (int)RegistryValueKind.String,
+                OriginalValue = @"\\?\C:\Windows\explorer.exe",
+                ManagedValue = managed,
+                WriteAttempted = true,
+                WriteConfirmed = true
+            };
+            WriteTestJournal(service, journal);
+
+            var result = service.Restore();
+
+            Assert.False(result.Success);
+            Assert.Empty(shellStore.Writes);
+            Assert.Equal(0, shellStore.DeleteCalls);
+            Assert.Equal(managed, shellStore.Current.Value);
+            Assert.True(File.Exists(service.JournalPath));
+        });
+    }
+
+    [Fact]
+    public void 替代外壳模式只读记录资源管理器启动项作为守卫目标()
+    {
+        WithTestDirectory(directory =>
+        {
+            var snapshotCalls = 0;
+            var service = new StartupSnoozeService(
+                directory,
+                () => StartupSnoozeService.ChildSessionPresence.Absent,
+                TimeSpan.Zero,
+                _ => new List<string>(),
+                () =>
+                {
+                    snapshotCalls++;
+                    return new StartupSnoozeSnapshot(
+                        new List<StartupSnoozeRegistryEntry>
+                        {
+                            new()
+                            {
+                                Kind = "RunValue",
+                                Hive = "CurrentUser",
+                                CommandLine = "\"C:\\Apps\\GameViewer.exe\" --auto-run"
+                            }
+                        },
+                        new List<StartupSnoozeTaskEntry>(),
+                        new List<StartupSnoozeUwpEntry>());
+                },
+                shellStore: new FakeCurrentUserShellStore());
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.True(result.Success);
+            Assert.Equal(1, snapshotCalls);
+            var journal = JsonSerializer.Deserialize<StartupSnoozeJournal>(
+                File.ReadAllText(service.JournalPath));
+            Assert.NotNull(journal);
+            // 该条目不参与审批值校验、不写 StartupApproved，也不会被恢复逻辑处理。
+            Assert.Empty(journal!.Registry);
+            Assert.Contains(@"C:\Apps\GameViewer.exe", journal.DeferredExecutables);
+            Assert.True(journal.Completed);
+        });
+    }
+
+    [Fact]
+    public void 替代外壳模式只关闭资源管理器启动源拒绝检查()
+    {
+        WithTestDirectory(directory =>
+        {
+            var observed = new List<bool>();
+            var service = new StartupSnoozeService(
+                directory,
+                () => StartupSnoozeService.ChildSessionPresence.Absent,
+                TimeSpan.Zero,
+                ignoreExplorerRunSources =>
+                {
+                    observed.Add(ignoreExplorerRunSources);
+                    return ignoreExplorerRunSources
+                        ? new List<string>()
+                        : new List<string> { "组策略启动项 CurrentUser|Registry64" };
+                },
+                () => new StartupSnoozeSnapshot(
+                    new List<StartupSnoozeRegistryEntry>(),
+                    new List<StartupSnoozeTaskEntry>(),
+                    new List<StartupSnoozeUwpEntry>()),
+                shellStore: new FakeCurrentUserShellStore());
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.True(result.Success);
+            Assert.Equal(new[] { true }, observed);
+        });
+    }
+
+    [Fact]
+    public void 替代外壳模式仍拒绝外壳之前的未知启动源()
+    {
+        WithTestDirectory(directory =>
+        {
+            var service = new StartupSnoozeService(
+                directory,
+                () => StartupSnoozeService.ChildSessionPresence.Absent,
+                TimeSpan.Zero,
+                _ => new List<string> { "Winlogon Userinit 被改动" },
+                () => new StartupSnoozeSnapshot(
+                    new List<StartupSnoozeRegistryEntry>(),
+                    new List<StartupSnoozeTaskEntry>(),
+                    new List<StartupSnoozeUwpEntry>()),
+                shellStore: new FakeCurrentUserShellStore());
+
+            var result = service.EnsureSnoozed(isolateRegistryStartupEntries: false);
+
+            Assert.False(result.Success);
+            Assert.Contains("Winlogon Userinit 被改动", result.Message);
+            Assert.False(service.HasPendingJournal);
         });
     }
 
@@ -1930,6 +2635,93 @@ public sealed class StartupSnoozeServiceTests
         }
 
         File.WriteAllText(service.JournalPath, JsonSerializer.Serialize(journal));
+    }
+
+    private static StartupSnoozeService CreateShellTestService(
+        string directory,
+        FakeCurrentUserShellStore shellStore) =>
+        new(
+            directory,
+            () => StartupSnoozeService.ChildSessionPresence.Absent,
+            TimeSpan.Zero,
+            _ => new List<string>(),
+            () => new StartupSnoozeSnapshot(
+                new List<StartupSnoozeRegistryEntry>(),
+                new List<StartupSnoozeTaskEntry>(),
+                new List<StartupSnoozeUwpEntry>()),
+            shellStore);
+
+    private static StartupSnoozeJournal ReadTestJournal(StartupSnoozeService service)
+    {
+        var journal = JsonSerializer.Deserialize<StartupSnoozeJournal>(
+            File.ReadAllText(service.JournalPath));
+        Assert.NotNull(journal);
+        return journal!;
+    }
+
+    private sealed class FakeCurrentUserShellStore : ICurrentUserShellStore
+    {
+        public FakeCurrentUserShellStore(CurrentUserShellSnapshot? initial = null)
+        {
+            Current = initial ?? new CurrentUserShellSnapshot(
+                false,
+                RegistryValueKind.String,
+                null);
+        }
+
+        public string KeyPath => CurrentUserShellStore.WinlogonKeyPath;
+
+        public string ValueName => "Shell";
+
+        public CurrentUserShellSnapshot Current { get; set; }
+
+        public string? RewriteAfterWrite { get; set; }
+
+        public int ReplaceCurrentBeforeReadNumber { get; set; }
+
+        public CurrentUserShellSnapshot? ReplacementBeforeRead { get; set; }
+
+        private int _readCount;
+
+        public List<string> Writes { get; } = new();
+
+        public List<RegistryValueKind> WriteKinds { get; } = new();
+
+        public int DeleteCalls { get; private set; }
+
+        public CurrentUserShellSnapshot Read()
+        {
+            _readCount++;
+            if (_readCount == ReplaceCurrentBeforeReadNumber && ReplacementBeforeRead is not null)
+            {
+                Current = ReplacementBeforeRead.Value;
+            }
+
+            return Current;
+        }
+
+        public void Write(string value, RegistryValueKind kind)
+        {
+            if (kind is not (RegistryValueKind.String or RegistryValueKind.ExpandString))
+            {
+                throw new ArgumentException("测试 Shell 只允许字符串类型。", nameof(kind));
+            }
+
+            Writes.Add(value);
+            WriteKinds.Add(kind);
+            Current = RewriteAfterWrite is null
+                ? new CurrentUserShellSnapshot(true, kind, value)
+                : new CurrentUserShellSnapshot(
+                    true,
+                    RegistryValueKind.String,
+                    RewriteAfterWrite);
+        }
+
+        public void Delete()
+        {
+            DeleteCalls++;
+            Current = new CurrentUserShellSnapshot(false, RegistryValueKind.String, null);
+        }
     }
 
     private static void WithTestDirectory(Action<string> action)

@@ -727,6 +727,15 @@ namespace DesktopTwinSessionAgent
             for (var i = 0; i < text.Length; i++)
             {
                 var character = text[i];
+                if (Char.IsHighSurrogate(character)
+                    && i + 1 < text.Length
+                    && Char.IsLowSurrogate(text[i + 1]))
+                {
+                    SendUnicodeCharacterPair(character, text[i + 1]);
+                    i++;
+                    continue;
+                }
+
                 if (character == '\r')
                 {
                     if (i + 1 < text.Length && text[i + 1] == '\n')
@@ -1245,7 +1254,26 @@ namespace DesktopTwinSessionAgent
 
         private static void SendUnicodeCharacter(char character)
         {
-            var down = new DesktopNative.Input
+            var down = CreateUnicodeInput(character, false);
+            var up = CreateUnicodeInput(character, true);
+            SendInputs(new[] { down, up });
+        }
+
+        private static void SendUnicodeCharacterPair(char highSurrogate, char lowSurrogate)
+        {
+            // A surrogate pair must be injected as one adjacent four-event sequence.
+            // Splitting the two code units across SendInput calls makes RichEdit/Notepad
+            // commit the high surrogate as U+FFFD before it can consume the low surrogate.
+            var highDown = CreateUnicodeInput(highSurrogate, false);
+            var lowDown = CreateUnicodeInput(lowSurrogate, false);
+            var highUp = CreateUnicodeInput(highSurrogate, true);
+            var lowUp = CreateUnicodeInput(lowSurrogate, true);
+            SendInputs(new[] { highDown, lowDown, highUp, lowUp });
+        }
+
+        private static DesktopNative.Input CreateUnicodeInput(char character, bool keyUp)
+        {
+            return new DesktopNative.Input
             {
                 Type = DesktopNative.InputKeyboard,
                 Union = new DesktopNative.InputUnion
@@ -1255,12 +1283,10 @@ namespace DesktopTwinSessionAgent
                         VirtualKey = 0,
                         ScanCode = character,
                         Flags = DesktopNative.KeyEventUnicode
+                            | (keyUp ? DesktopNative.KeyEventKeyUp : 0)
                     }
                 }
             };
-            var up = down;
-            up.Union.Keyboard.Flags = DesktopNative.KeyEventUnicode | DesktopNative.KeyEventKeyUp;
-            SendInputs(new[] { down, up });
         }
 
         private static void SendVirtualKey(int virtualKey, bool extended)

@@ -35,6 +35,9 @@ namespace DesktopTwinSessionAgent
     internal static class Program
     {
         private const string MutexName = @"Local\DesktopTwin.SessionAgent";
+        private const string ShellGateMutexName = @"Local\DesktopTwin.SessionShellGate";
+        internal const string ShellGateArgument = "--shell-gate";
+        internal const string ShellGateFileName = "DesktopTwin.ShellGate.exe";
         private const int HotkeyId = 1;
         private const int WmHotkey = 0x0312;
         private const uint ModNoRepeat = 0x4000;
@@ -72,9 +75,238 @@ namespace DesktopTwinSessionAgent
                 && actualLogonTimeFileTimeUtc == expectedLogonTimeFileTimeUtc;
         }
 
+        /// <summary>
+        /// 会话外壳门卫。
+        ///
+        /// 子会话中绝不依赖 RDP 的 StartProgram：该设置在
+        /// ConnectToChildSession 路径会被忽略，Explorer 仍可能先启动并把
+        /// Run/RunOnce/启动文件夹/UWP 等用户启动项拉起来。门卫在确认当前
+        /// 会话身份后，只终止“当前会话 + 完整路径精确等于 %WINDIR%\explorer.exe”
+        /// 的进程，然后以隐藏窗口维持会话。
+        ///
+        /// 父会话中不要留下无外壳的桌面：若 HKCU Shell 因崩溃恢复而暂时
+        /// 指向门卫，门卫只启动同一个精确的 Explorer，随后仍保持隐藏。
+        /// 这里不注册热键、不写心跳、不启动控制管道，也不接触主会话输入。
+        /// </summary>
+        private static int RunShellGate()
+        {
+            string sessionName = Native.CurrentSessionName();
+            bool isChildSession = IsChildSessionName(sessionName);
+            LogShellGate("启动；会话=" + (sessionName ?? string.Empty)
+                + "；模式=" + (isChildSession ? "子会话隔离" : "父会话恢复")
+                + "；映像=" + Application.ExecutablePath);
+
+            bool createdNew;
+            using (Mutex mutex = new Mutex(false, ShellGateMutexName, out createdNew))
+            {
+                bool owned = false;
+                try
+                {
+                    owned = mutex.WaitOne(0);
+                }
+                catch (AbandonedMutexException)
+                {
+                    owned = true;
+                    LogShellGate("接管已放弃的旧门卫互斥体。");
+                }
+
+                if (!owned)
+                {
+                    LogShellGate("退出：此会话已有门卫实例。");
+                    return 0;
+                }
+
+                try
+                {
+                    if (isChildSession)
+                    {
+                        int terminated;
+                        string explorerError;
+                        if (!Native.TryTerminateExplorerInCurrentSession(
+                                out terminated,
+                                out explorerError))
+                        {
+                            LogShellGate("拒绝创建门卫：" + explorerError);
+                            return 1;
+                        }
+
+                        LogShellGate("已确认并终止当前子会话中的资源管理器进程数="
+                            + terminated.ToString(CultureInfo.InvariantCulture) + "。");
+                    }
+                    else
+                    {
+                        bool launched;
+                        string explorerError;
+                        if (!Native.EnsureExplorerInCurrentSession(
+                                out launched,
+                                out explorerError))
+                        {
+                            LogShellGate("拒绝创建门卫：" + explorerError);
+                            return 1;
+                        }
+
+                        LogShellGate(launched
+                            ? "父会话没有资源管理器，已启动系统 Explorer。"
+                            : "父会话已有系统 Explorer，未重复启动。");
+                    }
+
+                    using (ShellGateWindow window = new ShellGateWindow())
+                    {
+                        LogShellGate("隐藏门卫窗口已创建，进入消息循环。");
+                        Application.Run(new AgentContext());
+                        LogShellGate("消息循环已退出。");
+                    }
+                }
+                finally
+                {
+                    mutex.ReleaseMutex();
+                }
+            }
+
+            return 0;
+        }
+
+        /// <summary>
+        /// 门卫诊断日志独立于普通代理，且任何日志失败都不能影响隔离。
+        /// </summary>
+        private static void LogShellGate(string message)
+        {
+            try
+            {
+                string directory = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "DesktopTwin",
+                    "logs");
+                Directory.CreateDirectory(directory);
+                string path = Path.Combine(directory, "session-gate.log");
+                File.AppendAllText(
+                    path,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)
+                    + " [" + Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture)
+                    + "] " + message + Environment.NewLine,
+                    Encoding.UTF8);
+            }
+            catch
+            {
+                // 诊断失败不得把门卫变成启动失败。
+            }
+        }
+
+        internal static bool IsChildSessionName(string sessionName)
+        {
+            return Regex.IsMatch(
+                sessionName ?? string.Empty,
+                "^[0-9a-fA-F]{16,}#[0-9]+$");
+        }
+
+        /// <summary>
+        /// 资源管理器的唯一允许命中条件：会话号必须等于当前进程所在会话，
+        /// 且映像完整路径必须等于当前 Windows 目录下的 explorer.exe。
+        /// 路径不合法、无法规范化、仅同名或位于其它目录时一律拒绝。
+        /// </summary>
+        internal static bool IsExactExplorerProcessIdentity(
+            int currentSessionId,
+            int candidateSessionId,
+            string candidateImagePath,
+            string windowsDirectory)
+        {
+            if (currentSessionId <= 0
+                || candidateSessionId != currentSessionId
+                || string.IsNullOrWhiteSpace(candidateImagePath)
+                || string.IsNullOrWhiteSpace(windowsDirectory))
+            {
+                return false;
+            }
+
+            try
+            {
+                string expected = Path.GetFullPath(
+                    Path.Combine(windowsDirectory, "explorer.exe"));
+
+                // 不把候选路径“规范化后”再比较：查询 API 本来就返回规范路径，
+                // 出现 ..\、/、短文件名或其它别名时必须视作身份不可确认。
+                return string.Equals(
+                    candidateImagePath,
+                    expected,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
+            }
+            catch (PathTooLongException)
+            {
+                return false;
+            }
+        }
+
         [STAThread]
         private static int Main(string[] args)
         {
+            // 门卫模式必须在解析普通代理参数、创建数据目录之前分流。
+            // HKCU Winlogon Shell 只能保存一个不带参数的映像路径，因此固定
+            // 文件名就是正常登录时的身份标识；显式参数仅用于本地验证，
+            // 且只允许单独出现。任何夹带参数的调用都拒绝进入普通代理。
+            bool isGateImage = string.Equals(
+                Path.GetFileName(Application.ExecutablePath),
+                ShellGateFileName,
+                StringComparison.OrdinalIgnoreCase);
+            bool containsGateArgument = false;
+            if (args != null)
+            {
+                foreach (string argument in args)
+                {
+                    if (string.Equals(
+                            argument,
+                            ShellGateArgument,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        containsGateArgument = true;
+                        break;
+                    }
+                }
+            }
+
+            if (isGateImage || containsGateArgument)
+            {
+                bool validGateInvocation = isGateImage
+                    ? args == null
+                      || args.Length == 0
+                      || (args.Length == 1
+                          && string.Equals(
+                              args[0],
+                              ShellGateArgument,
+                              StringComparison.OrdinalIgnoreCase))
+                    : args != null
+                      && args.Length == 1
+                      && string.Equals(
+                          args[0],
+                          ShellGateArgument,
+                          StringComparison.OrdinalIgnoreCase);
+                if (validGateInvocation)
+                {
+                    try
+                    {
+                        return RunShellGate();
+                    }
+                    catch (Exception exception)
+                    {
+                        LogShellGate("异常退出：" + exception.GetType().FullName
+                            + "；" + exception.Message);
+                        return 1;
+                    }
+                }
+
+                // 门卫镜像或带门卫参数的调用绝不能退化成普通代理。否则攻击者
+                // 可以借固定门卫路径夹带控制管道、热键等参数，绕过模式边界。
+                LogShellGate("拒绝运行：门卫调用参数无效。");
+                return 2;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Native.SetProcessDPIAware();
@@ -137,7 +369,7 @@ namespace DesktopTwinSessionAgent
             // 子会话的 WinStation 名固定形如 7a78855482a04fa781dc#0；
             // Console 是 console，远程桌面是 rdp-tcp#N，都不会误匹配。
             string sessionName = Native.CurrentSessionName();
-            if (!Regex.IsMatch(sessionName, "^[0-9a-fA-F]{16,}#[0-9]+$"))
+            if (!IsChildSessionName(sessionName))
             {
                 Log("会话名 '" + sessionName + "' 不是分身会话，退出（Console 登录时自启项也会执行本程序，属正常）");
                 return 0;
@@ -661,6 +893,30 @@ namespace DesktopTwinSessionAgent
         }
 
         /// <summary>
+        /// 替代资源管理器时使用的隐藏顶层窗口。没有 WS_VISIBLE，也没有
+        /// WS_EX_APPWINDOW，因此不会出现在任务栏或 Alt+Tab 中。
+        /// </summary>
+        private sealed class ShellGateWindow : NativeWindow, IDisposable
+        {
+            public ShellGateWindow()
+            {
+                CreateParams cp = new CreateParams();
+                cp.Caption = "DesktopTwinSessionShellGate";
+                cp.Style = 0;
+                cp.ExStyle = 0x00000080 | 0x08000000; // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+                CreateHandle(cp);
+            }
+
+            public void Dispose()
+            {
+                if (Handle != IntPtr.Zero)
+                {
+                    DestroyHandle();
+                }
+            }
+        }
+
+        /// <summary>
         /// 无窗体的应用上下文：只维持消息循环。
         /// </summary>
         private sealed class AgentContext : ApplicationContext
@@ -992,6 +1248,13 @@ namespace DesktopTwinSessionAgent
     /// </summary>
     internal static class Native
     {
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const uint ProcessTerminate = 0x0001;
+        private const uint Synchronize = 0x00100000;
+        private const uint WaitObject0 = 0;
+        private const uint WaitTimeout = 0x00000102;
+        private const int MaxProcessImagePath = 32768;
+
         [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool WTSQuerySessionInformationW(
             IntPtr hServer,
@@ -999,6 +1262,33 @@ namespace DesktopTwinSessionAgent
             int infoClass,
             out IntPtr ppBuffer,
             out int pBytesReturned);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(
+            uint desiredAccess,
+            bool inheritHandle,
+            int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool QueryFullProcessImageNameW(
+            IntPtr process,
+            uint flags,
+            StringBuilder imagePath,
+            ref uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ProcessIdToSessionId(
+            int processId,
+            out uint sessionId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
 
         [DllImport("wtsapi32.dll")]
         private static extern void WTSFreeMemory(IntPtr p);
@@ -1080,6 +1370,473 @@ namespace DesktopTwinSessionAgent
             finally
             {
                 WTSFreeMemory(buffer);
+            }
+        }
+
+        /// <summary>
+        /// 在当前子会话里循环清理完整路径精确等于系统 Explorer 的进程。
+        /// 仅凭进程名、窗口类名或会话名绝不终止；无法读取映像路径时跳过，
+        /// 但若进程名明确是 explorer 且身份读不全，则失败关闭，不能带着
+        /// 可能已启动的外壳继续创建门卫。要求连续两轮无命中后才成功，
+        /// 防止 Explorer 在检查与建窗之间重新拉起用户启动项。
+        /// </summary>
+        public static bool TryTerminateExplorerInCurrentSession(
+            out int terminated,
+            out string error)
+        {
+            terminated = 0;
+            error = null;
+
+            int currentProcessId;
+            int currentSessionId;
+            using (Process currentProcess = Process.GetCurrentProcess())
+            {
+                currentProcessId = currentProcess.Id;
+                currentSessionId = currentProcess.SessionId;
+            }
+
+            if (currentSessionId <= 0)
+            {
+                error = "无法确认当前子会话号，拒绝清理资源管理器。";
+                return false;
+            }
+
+            string windowsDirectory = Environment.GetFolderPath(
+                Environment.SpecialFolder.Windows);
+            if (string.IsNullOrWhiteSpace(windowsDirectory))
+            {
+                error = "无法读取 Windows 目录，拒绝清理资源管理器。";
+                return false;
+            }
+
+            DateTime deadline = DateTime.UtcNow.AddSeconds(5);
+            int emptyPasses = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                bool found;
+                int passTerminated;
+                string passError;
+                if (!TryTerminateExplorerPass(
+                        currentProcessId,
+                        currentSessionId,
+                        windowsDirectory,
+                        out found,
+                        out passTerminated,
+                        out passError))
+                {
+                    error = passError;
+                    return false;
+                }
+
+                terminated += passTerminated;
+                if (found)
+                {
+                    emptyPasses = 0;
+                }
+                else
+                {
+                    emptyPasses++;
+                    if (emptyPasses >= 2)
+                    {
+                        error = null;
+                        return true;
+                    }
+                }
+
+                Thread.Sleep(150);
+            }
+
+            error = "资源管理器在清理后仍持续出现，拒绝创建会话门卫。";
+            return false;
+        }
+
+        private static bool TryTerminateExplorerPass(
+            int currentProcessId,
+            int currentSessionId,
+            string windowsDirectory,
+            out bool found,
+            out int terminated,
+            out string error)
+        {
+            found = false;
+            terminated = 0;
+            error = null;
+
+            Process[] processes;
+            try
+            {
+                processes = Process.GetProcesses();
+            }
+            catch (Exception exception)
+            {
+                error = "无法枚举当前会话进程：" + exception.Message;
+                return false;
+            }
+
+            try
+            {
+                foreach (Process process in processes)
+                {
+                    int processId;
+                    try
+                    {
+                        processId = process.Id;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        continue;
+                    }
+
+                    if (processId <= 0 || processId == currentProcessId)
+                    {
+                        continue;
+                    }
+
+                    IntPtr handle = OpenProcess(
+                        ProcessQueryLimitedInformation | ProcessTerminate | Synchronize,
+                        false,
+                        processId);
+                    if (handle == IntPtr.Zero)
+                    {
+                        uint failedSessionId;
+                        if (ProcessIdToSessionId(processId, out failedSessionId)
+                            && failedSessionId == (uint)currentSessionId
+                            && IsNamedExplorer(process))
+                        {
+                            error = "无法打开当前会话中的 explorer 进程 PID="
+                                + processId.ToString(CultureInfo.InvariantCulture)
+                                + "，错误码="
+                                + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture)
+                                + "；拒绝在身份未确认时继续。";
+                            return false;
+                        }
+
+                        continue;
+                    }
+
+                    try
+                    {
+                        uint processSessionId;
+                        if (!ProcessIdToSessionId(processId, out processSessionId)
+                            || processSessionId != (uint)currentSessionId)
+                        {
+                            continue;
+                        }
+
+                        string imagePath;
+                        if (!TryQueryProcessImagePath(handle, out imagePath))
+                        {
+                            if (IsNamedExplorer(process))
+                            {
+                                error = "无法读取当前会话 explorer 进程 PID="
+                                    + processId.ToString(CultureInfo.InvariantCulture)
+                                    + " 的完整映像路径，拒绝终止或继续。";
+                                return false;
+                            }
+
+                            continue;
+                        }
+
+                        if (!Program.IsExactExplorerProcessIdentity(
+                                currentSessionId,
+                                (int)processSessionId,
+                                imagePath,
+                                windowsDirectory))
+                        {
+                            continue;
+                        }
+
+                        found = true;
+                        if (!TerminateProcess(handle, 1))
+                        {
+                            if (WaitForSingleObject(handle, 0) == WaitObject0)
+                            {
+                                continue;
+                            }
+
+                            error = "无法终止当前子会话的系统 Explorer PID="
+                                + processId.ToString(CultureInfo.InvariantCulture)
+                                + "，错误码="
+                                + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture)
+                                + "。";
+                            return false;
+                        }
+
+                        uint waitResult = WaitForSingleObject(handle, 5000);
+                        if (waitResult != WaitObject0)
+                        {
+                            error = "系统 Explorer 已发出终止请求但未退出，PID="
+                                + processId.ToString(CultureInfo.InvariantCulture)
+                                + "，等待结果="
+                                + waitResult.ToString(CultureInfo.InvariantCulture)
+                                + (waitResult == WaitTimeout ? "（超时）。" : "。");
+                            return false;
+                        }
+
+                        terminated++;
+                    }
+                    finally
+                    {
+                        CloseHandle(handle);
+                    }
+                }
+            }
+            finally
+            {
+                foreach (Process process in processes)
+                {
+                    process.Dispose();
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// 父会话兜底：当前会话已有系统 Explorer 时不重复启动；没有时只
+        /// 启动 %WINDIR%\explorer.exe。其它同名文件、其它会话和无法验证
+        /// 的 explorer 进程都不作为“已有外壳”处理。
+        /// </summary>
+        public static bool EnsureExplorerInCurrentSession(
+            out bool launched,
+            out string error)
+        {
+            launched = false;
+            error = null;
+
+            int currentProcessId;
+            int currentSessionId;
+            using (Process currentProcess = Process.GetCurrentProcess())
+            {
+                currentProcessId = currentProcess.Id;
+                currentSessionId = currentProcess.SessionId;
+            }
+
+            if (currentSessionId <= 0)
+            {
+                error = "无法确认当前会话号，拒绝启动资源管理器。";
+                return false;
+            }
+
+            string windowsDirectory = Environment.GetFolderPath(
+                Environment.SpecialFolder.Windows);
+            if (string.IsNullOrWhiteSpace(windowsDirectory))
+            {
+                error = "无法读取 Windows 目录，拒绝启动资源管理器。";
+                return false;
+            }
+
+            string explorerPath;
+            try
+            {
+                explorerPath = Path.GetFullPath(
+                    Path.Combine(windowsDirectory, "explorer.exe"));
+            }
+            catch (Exception exception)
+            {
+                error = "无法构造系统 Explorer 路径：" + exception.Message;
+                return false;
+            }
+
+            bool exists;
+            string probeError;
+            if (!TryFindExplorerInCurrentSession(
+                    currentProcessId,
+                    currentSessionId,
+                    windowsDirectory,
+                    out exists,
+                    out probeError))
+            {
+                error = probeError;
+                return false;
+            }
+
+            if (exists)
+            {
+                return true;
+            }
+
+            if (!File.Exists(explorerPath))
+            {
+                error = "系统 Explorer 不存在：" + explorerPath;
+                return false;
+            }
+
+            try
+            {
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = explorerPath;
+                startInfo.WorkingDirectory = Path.GetDirectoryName(explorerPath);
+                startInfo.UseShellExecute = false;
+                startInfo.CreateNoWindow = false;
+                using (Process started = Process.Start(startInfo))
+                {
+                    if (started == null)
+                    {
+                        error = "系统 Explorer 启动失败：没有返回进程。";
+                        return false;
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                error = "系统 Explorer 启动失败：" + exception.Message;
+                return false;
+            }
+
+            launched = true;
+            return true;
+        }
+
+        private static bool TryFindExplorerInCurrentSession(
+            int currentProcessId,
+            int currentSessionId,
+            string windowsDirectory,
+            out bool exists,
+            out string error)
+        {
+            exists = false;
+            error = null;
+
+            Process[] processes;
+            try
+            {
+                processes = Process.GetProcesses();
+            }
+            catch (Exception exception)
+            {
+                error = "无法枚举当前会话进程：" + exception.Message;
+                return false;
+            }
+
+            try
+            {
+                foreach (Process process in processes)
+                {
+                    int processId;
+                    try
+                    {
+                        processId = process.Id;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        continue;
+                    }
+
+                    if (processId <= 0 || processId == currentProcessId)
+                    {
+                        continue;
+                    }
+
+                    IntPtr handle = OpenProcess(
+                        ProcessQueryLimitedInformation,
+                        false,
+                        processId);
+                    if (handle == IntPtr.Zero)
+                    {
+                        uint failedSessionId;
+                        if (ProcessIdToSessionId(processId, out failedSessionId)
+                            && failedSessionId == (uint)currentSessionId
+                            && IsNamedExplorer(process))
+                        {
+                            error = "无法打开当前会话中的 explorer 进程 PID="
+                                + processId.ToString(CultureInfo.InvariantCulture)
+                                + "，错误码="
+                                + Marshal.GetLastWin32Error().ToString(CultureInfo.InvariantCulture)
+                                + "；拒绝重复启动外壳。";
+                            return false;
+                        }
+
+                        continue;
+                    }
+
+                    try
+                    {
+                        uint processSessionId;
+                        if (!ProcessIdToSessionId(processId, out processSessionId)
+                            || processSessionId != (uint)currentSessionId)
+                        {
+                            continue;
+                        }
+
+                        string imagePath;
+                        if (!TryQueryProcessImagePath(handle, out imagePath))
+                        {
+                            if (IsNamedExplorer(process))
+                            {
+                                error = "无法读取当前会话 explorer 进程 PID="
+                                    + processId.ToString(CultureInfo.InvariantCulture)
+                                    + " 的完整映像路径，拒绝重复启动外壳。";
+                                return false;
+                            }
+
+                            continue;
+                        }
+
+                        if (Program.IsExactExplorerProcessIdentity(
+                                currentSessionId,
+                                (int)processSessionId,
+                                imagePath,
+                                windowsDirectory))
+                        {
+                            exists = true;
+                            return true;
+                        }
+                    }
+                    finally
+                    {
+                        CloseHandle(handle);
+                    }
+                }
+            }
+            finally
+            {
+                foreach (Process process in processes)
+                {
+                    process.Dispose();
+                }
+            }
+
+            return true;
+        }
+
+        private static bool TryQueryProcessImagePath(
+            IntPtr process,
+            out string imagePath)
+        {
+            imagePath = null;
+            StringBuilder buffer = new StringBuilder(MaxProcessImagePath);
+            uint size = (uint)buffer.Capacity;
+            if (!QueryFullProcessImageNameW(process, 0, buffer, ref size))
+            {
+                return false;
+            }
+
+            if (size == 0 || size >= (uint)buffer.Capacity)
+            {
+                return false;
+            }
+
+            imagePath = buffer.ToString(0, (int)size);
+            return imagePath.Length > 0;
+        }
+
+        private static bool IsNamedExplorer(Process process)
+        {
+            try
+            {
+                return string.Equals(
+                    process.ProcessName,
+                    "explorer",
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                return false;
             }
         }
     }

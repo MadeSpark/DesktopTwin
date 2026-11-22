@@ -713,60 +713,239 @@ public sealed class SessionAgentServiceTests
     }
 
     [Fact]
-    public void 隔离期间只迁移已存在的旧版代理启动命令()
+    public void Run值只有精确指向当前或旧版代理才允许删除()
     {
-        const string newCommand = "\"C:\\ProgramData\\DesktopTwin\\Agent\\DesktopTwin.Agent.exe\" --hotkey Alt+Q";
-        const string legacyCommand = "\"C:\\Users\\Test\\AppData\\Roaming\\DesktopTwin\\DesktopTwin.Agent.exe\" --hotkey Alt+Q";
+        const string current = @"C:\ProgramData\DesktopTwin\Agent\DesktopTwin.Agent.exe";
+        const string legacy = @"C:\Users\Test\AppData\Roaming\DesktopTwin\DesktopTwin.Agent.exe";
 
-        var legacy = SessionAgentService.PlanRunSynchronization(
-            legacyCommand,
-            newCommand,
-            updateStartupEntry: false,
-            isLegacyRun: true,
-            manageLegacyDefaultInstallation: true);
-        Assert.True(legacy.WriteRunValue);
-        Assert.True(legacy.DeleteLegacyAgentFile);
-
-        var absent = SessionAgentService.PlanRunSynchronization(
-            currentRun: null,
-            newCommand,
-            updateStartupEntry: false,
-            isLegacyRun: false,
-            manageLegacyDefaultInstallation: true);
-        Assert.False(absent.WriteRunValue);
-        Assert.False(absent.DeleteLegacyAgentFile);
-
-        var unrecognized = SessionAgentService.PlanRunSynchronization(
-            "\"C:\\Users\\Test\\AppData\\Roaming\\DesktopTwin\\DesktopTwin.Agent.exe.bak\"",
-            newCommand,
-            updateStartupEntry: false,
-            isLegacyRun: false,
-            manageLegacyDefaultInstallation: true);
-        Assert.False(unrecognized.WriteRunValue);
-        Assert.False(unrecognized.DeleteLegacyAgentFile);
-
-        var alreadyMigrated = SessionAgentService.PlanRunSynchronization(
-            newCommand,
-            newCommand,
-            updateStartupEntry: true,
-            isLegacyRun: false,
-            manageLegacyDefaultInstallation: true);
-        Assert.False(alreadyMigrated.WriteRunValue);
-        Assert.True(alreadyMigrated.DeleteLegacyAgentFile);
+        Assert.True(SessionAgentService.IsManagedAgentRunValue(
+            $"\"{current}\" --hotkey Alt+Q",
+            current,
+            legacy));
+        Assert.True(SessionAgentService.IsManagedAgentRunValue(
+            $"\"{legacy}\" --hotkey Alt+Q",
+            current,
+            legacy));
+        Assert.True(SessionAgentService.IsManagedAgentRunValue(current, current, legacy));
+        Assert.False(SessionAgentService.IsManagedAgentRunValue(
+            "\"C:\\Other\\DesktopTwin.Agent.exe\" --hotkey Alt+Q",
+            current,
+            legacy));
+        Assert.False(SessionAgentService.IsManagedAgentRunValue(
+            $"\"{current}.bak\" --hotkey Alt+Q",
+            current,
+            legacy));
+        Assert.False(SessionAgentService.IsManagedAgentRunValue(
+            $"\"{current}\"suffix",
+            current,
+            legacy));
+        Assert.False(SessionAgentService.IsManagedAgentRunValue(
+            $"powershell.exe -File \"{current}\"",
+            current,
+            legacy));
+        Assert.False(SessionAgentService.IsManagedAgentRunValue(
+            $"\"{current}",
+            current,
+            legacy));
     }
 
     [Fact]
-    public void 正常安装允许新建启动项但测试布局绝不清理旧文件()
+    public void 卸载删除登录任务失败时保留代理文件()
     {
-        const string newCommand = "\"C:\\ProgramData\\DesktopTwin\\Agent\\DesktopTwin.Agent.exe\" --hotkey Alt+Q";
-        var plan = SessionAgentService.PlanRunSynchronization(
-            currentRun: null,
-            newCommand,
+        var fixture = CreateUninstallFixture();
+        fixture.Registration.LoginTaskDeleted = false;
+        using var service = fixture.Service;
+
+        Assert.False(service.Uninstall());
+
+        Assert.Equal(1, fixture.Registration.LoginTaskDeleteCalls);
+        Assert.Equal(0, fixture.Registration.RunDeleteCalls);
+        Assert.True(File.Exists(fixture.AgentPath));
+        Assert.True(File.Exists(fixture.LegacyAgentPath));
+        Assert.True(File.Exists(fixture.RequestPath));
+        Assert.True(File.Exists(fixture.HeartbeatPath));
+        Assert.True(File.Exists(fixture.LogPath));
+    }
+
+    [Fact]
+    public void 卸载遇到无法证明归属的Run值时失败关闭并保留代理文件()
+    {
+        var fixture = CreateUninstallFixture();
+        fixture.Registration.RunDeleteException =
+            new InvalidDataException("拒绝删除不属于本产品的 Run 值");
+        using var service = fixture.Service;
+
+        Assert.False(service.Uninstall());
+
+        Assert.Equal(1, fixture.Registration.LoginTaskDeleteCalls);
+        Assert.Equal(1, fixture.Registration.RunDeleteCalls);
+        Assert.True(File.Exists(fixture.AgentPath));
+        Assert.True(File.Exists(fixture.LegacyAgentPath));
+        Assert.True(File.Exists(fixture.RequestPath));
+        Assert.True(File.Exists(fixture.HeartbeatPath));
+        Assert.True(File.Exists(fixture.LogPath));
+    }
+
+    [Fact]
+    public void 卸载删除Run失败时保留代理文件()
+    {
+        var fixture = CreateUninstallFixture();
+        fixture.Registration.RunDeleteException = new UnauthorizedAccessException("拒绝访问");
+        using var service = fixture.Service;
+
+        Assert.False(service.Uninstall());
+
+        Assert.Equal(1, fixture.Registration.LoginTaskDeleteCalls);
+        Assert.Equal(1, fixture.Registration.RunDeleteCalls);
+        Assert.True(File.Exists(fixture.AgentPath));
+        Assert.True(File.Exists(fixture.LegacyAgentPath));
+        Assert.True(File.Exists(fixture.RequestPath));
+        Assert.True(File.Exists(fixture.HeartbeatPath));
+        Assert.True(File.Exists(fixture.LogPath));
+    }
+
+    [Fact]
+    public void 卸载成功删除任务和Run后才清理代理文件()
+    {
+        var fixture = CreateUninstallFixture();
+        using var service = fixture.Service;
+
+        Assert.True(service.Uninstall());
+
+        Assert.Equal(0, fixture.StopCalls());
+        Assert.Equal(1, fixture.Registration.LoginTaskDeleteCalls);
+        Assert.Equal(1, fixture.Registration.RunDeleteCalls);
+        Assert.Null(fixture.Registration.ExpectedCommandLine);
+        Assert.False(File.Exists(fixture.AgentPath));
+        Assert.False(File.Exists(fixture.LegacyAgentPath));
+        Assert.False(File.Exists(fixture.RequestPath));
+        Assert.False(File.Exists(fixture.HeartbeatPath));
+        Assert.False(File.Exists(fixture.LogPath));
+        Assert.False(File.Exists(fixture.ShellGatePath));
+        Assert.False(File.Exists(fixture.OldShellGatePath));
+    }
+
+    [Fact]
+    public void 保留门卫参数可删除代理但不删除外壳门卫()
+    {
+        var fixture = CreateUninstallFixture();
+        using var service = fixture.Service;
+
+        Assert.True(service.Uninstall(removeShellGate: false));
+
+        Assert.False(File.Exists(fixture.AgentPath));
+        Assert.True(File.Exists(fixture.ShellGatePath));
+        Assert.True(File.Exists(fixture.OldShellGatePath));
+    }
+
+    [Fact]
+    public void 卸载删除代理文件失败时返回失败且不清理剩余状态()
+    {
+        var fixture = CreateUninstallFixture();
+        File.Delete(fixture.AgentPath);
+        Directory.CreateDirectory(fixture.AgentPath);
+        using var service = fixture.Service;
+
+        Assert.False(service.Uninstall());
+
+        Assert.Equal(1, fixture.Registration.LoginTaskDeleteCalls);
+        Assert.Equal(1, fixture.Registration.RunDeleteCalls);
+        Assert.True(Directory.Exists(fixture.AgentPath));
+        Assert.False(File.Exists(fixture.LegacyAgentPath));
+        Assert.True(File.Exists(fixture.RequestPath));
+        Assert.True(File.Exists(fixture.HeartbeatPath));
+        Assert.True(File.Exists(fixture.LogPath));
+    }
+
+    [Fact]
+    public void 隔离期间卸载停止旧代理但不得触碰启动项或代理文件()
+    {
+        var fixture = CreateUninstallFixture();
+        using var service = fixture.Service;
+
+        Assert.True(service.Uninstall(removeStartupEntry: false));
+
+        Assert.Equal(1, fixture.StopCalls());
+        Assert.Equal(0, fixture.Registration.LoginTaskDeleteCalls);
+        Assert.Equal(0, fixture.Registration.RunDeleteCalls);
+        Assert.True(File.Exists(fixture.AgentPath));
+        Assert.True(File.Exists(fixture.LegacyAgentPath));
+        Assert.True(File.Exists(fixture.RequestPath));
+        Assert.True(File.Exists(fixture.HeartbeatPath));
+        Assert.True(File.Exists(fixture.LogPath));
+        Assert.True(File.Exists(fixture.ShellGatePath));
+        Assert.True(File.Exists(fixture.OldShellGatePath));
+    }
+
+    [Fact]
+    public void 隔离期间停止旧代理失败时保留启动项代理文件和待重试状态()
+    {
+        var fixture = CreateUninstallFixture(
+            new SessionAgentService.AgentStopResult(false, "无法证明会话身份"));
+        using var service = fixture.Service;
+
+        Assert.False(service.Uninstall(removeStartupEntry: false));
+
+        Assert.Equal(1, fixture.StopCalls());
+        Assert.Equal(0, fixture.Registration.LoginTaskDeleteCalls);
+        Assert.Equal(0, fixture.Registration.RunDeleteCalls);
+        Assert.True(File.Exists(fixture.AgentPath));
+        Assert.True(File.Exists(fixture.LegacyAgentPath));
+        Assert.True(File.Exists(fixture.RequestPath));
+        Assert.True(File.Exists(fixture.HeartbeatPath));
+        Assert.True(File.Exists(fixture.LogPath));
+    }
+
+    [Fact]
+    public void 隔离期间完全冻结代理自启态()
+    {
+        var managedRun = SessionAgentService.PlanStartupSynchronization(
+            updateStartupEntry: false,
+            isManagedRun: true,
+            manageLegacyDefaultInstallation: true);
+        Assert.False(managedRun.CreateOrUpdateLoginTask);
+        Assert.False(managedRun.RemoveRunValue);
+        Assert.False(managedRun.DeleteLegacyAgentFile);
+
+        var unrecognizedRun = SessionAgentService.PlanStartupSynchronization(
+            updateStartupEntry: false,
+            isManagedRun: false,
+            manageLegacyDefaultInstallation: true);
+        Assert.False(unrecognizedRun.CreateOrUpdateLoginTask);
+        Assert.False(unrecognizedRun.RemoveRunValue);
+        Assert.False(unrecognizedRun.DeleteLegacyAgentFile);
+    }
+
+    [Fact]
+    public void 正常安装先注册登录任务并删除旧版Run()
+    {
+        var existingRun = SessionAgentService.PlanStartupSynchronization(
             updateStartupEntry: true,
-            isLegacyRun: false,
+            isManagedRun: true,
+            manageLegacyDefaultInstallation: true);
+        Assert.True(existingRun.CreateOrUpdateLoginTask);
+        Assert.True(existingRun.RemoveRunValue);
+        Assert.True(existingRun.DeleteLegacyAgentFile);
+
+        var absent = SessionAgentService.PlanStartupSynchronization(
+            updateStartupEntry: true,
+            isManagedRun: false,
+            manageLegacyDefaultInstallation: true);
+        Assert.True(absent.CreateOrUpdateLoginTask);
+        Assert.False(absent.RemoveRunValue);
+        Assert.True(absent.DeleteLegacyAgentFile);
+    }
+
+    [Fact]
+    public void 测试布局绝不创建计划任务或清理真实旧文件()
+    {
+        var plan = SessionAgentService.PlanStartupSynchronization(
+            updateStartupEntry: true,
+            isManagedRun: false,
             manageLegacyDefaultInstallation: false);
 
-        Assert.True(plan.WriteRunValue);
+        Assert.False(plan.CreateOrUpdateLoginTask);
+        Assert.False(plan.RemoveRunValue);
         Assert.False(plan.DeleteLegacyAgentFile);
     }
 
@@ -787,6 +966,109 @@ public sealed class SessionAgentServiceTests
             () => SessionAgentService.ValidateAccessRules(rules));
 
         Assert.Contains("继承", exception.Message);
+    }
+
+    private static UninstallFixture CreateUninstallFixture(
+        SessionAgentService.AgentStopResult? stopResult = null)
+    {
+        var stopCalls = 0;
+        var root = CreateTempDirectory();
+        Directory.CreateDirectory(root);
+        var legacyDirectory = Path.Combine(root, "legacy");
+        Directory.CreateDirectory(legacyDirectory);
+
+        var agentPath = Path.Combine(root, SessionAgentService.AgentFileName);
+        var legacyAgentPath = Path.Combine(
+            legacyDirectory,
+            SessionAgentService.AgentFileName);
+        var requestPath = Path.Combine(root, "uu-switch-request.json");
+        var heartbeatPath = Path.Combine(root, "session-agent-heartbeat.txt");
+        var logPath = Path.Combine(root, "session-agent.log");
+        var shellGatePath = Path.Combine(root, SessionAgentService.ShellGateFileName);
+        var oldShellGatePath = shellGatePath + ".old";
+        foreach (var path in new[]
+                 {
+                     agentPath,
+                     legacyAgentPath,
+                     requestPath,
+                     heartbeatPath,
+                     logPath,
+                     shellGatePath,
+                     oldShellGatePath
+                 })
+        {
+            File.WriteAllText(path, "fixture");
+        }
+
+        var registration = new FakeStartupRegistration();
+        var service = new SessionAgentService(
+            Dispatcher.CurrentDispatcher,
+            dataDirectory: root,
+            agentDirectory: root,
+            protectAgentDirectory: false,
+            manageLegacyDefaultInstallation: true,
+            legacyAgentPath: legacyAgentPath,
+            startupRegistration: registration,
+            stopIsolatedAgent: () =>
+            {
+                stopCalls++;
+                return stopResult ?? new SessionAgentService.AgentStopResult(true, string.Empty);
+            },
+            shellGatePath: shellGatePath);
+        return new UninstallFixture(
+            service,
+            registration,
+            agentPath,
+            legacyAgentPath,
+            requestPath,
+            heartbeatPath,
+            logPath,
+            shellGatePath,
+            oldShellGatePath,
+            () => stopCalls);
+    }
+
+    private readonly record struct UninstallFixture(
+        SessionAgentService Service,
+        FakeStartupRegistration Registration,
+        string AgentPath,
+        string LegacyAgentPath,
+        string RequestPath,
+        string HeartbeatPath,
+        string LogPath,
+        string ShellGatePath,
+        string OldShellGatePath,
+        Func<int> StopCalls);
+
+    private sealed class FakeStartupRegistration
+        : SessionAgentService.ISessionAgentStartupRegistration
+    {
+        public bool LoginTaskDeleted { get; set; } = true;
+
+        public Exception? RunDeleteException { get; set; }
+
+        public int LoginTaskDeleteCalls { get; private set; }
+
+        public int RunDeleteCalls { get; private set; }
+
+        public string? ExpectedCommandLine { get; private set; }
+
+        public bool TryDeleteLogonTask(out string error)
+        {
+            LoginTaskDeleteCalls++;
+            error = LoginTaskDeleted ? string.Empty : "模拟任务删除失败";
+            return LoginTaskDeleted;
+        }
+
+        public void DeleteRunValue(string? expectedCommandLine)
+        {
+            RunDeleteCalls++;
+            ExpectedCommandLine = expectedCommandLine;
+            if (RunDeleteException is not null)
+            {
+                throw RunDeleteException;
+            }
+        }
     }
 
     private static bool IsElevated()

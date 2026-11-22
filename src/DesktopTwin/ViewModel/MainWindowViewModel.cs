@@ -27,6 +27,7 @@ public partial class MainWindowViewModel : ObservableObject
 {
     private const double DefaultWindowWidth = 1280d;
     private const double SmallWindowWidth = 500d;
+    private const long SessionAgentStartupReconcileIntervalMs = 10_000;
 
     private readonly ChildSessionService _childSessionService;
     private readonly SettingsService _settings;
@@ -35,6 +36,8 @@ public partial class MainWindowViewModel : ObservableObject
     private readonly SessionAgentService _sessionAgent;
     private readonly McpEnablementCoordinator _mcpEnablementCoordinator;
     private long _lastAgentStartTicks;
+    private long _lastSessionAgentStartupReconcileTicks;
+    private bool _sessionAgentStartupNeedsReconcile;
     private GlobalHotkeyService? _globalHotkey;
     private McpLoopbackServer? _mcpServer;
     private Window? _hotkeyWindow;
@@ -1134,7 +1137,14 @@ public partial class MainWindowViewModel : ObservableObject
             return;
         }
 
-        _globalHotkey?.Unregister();
+        // 关闭热键不只是注销主窗口的 RegisterHotKey，还必须把禁用状态同步到
+        // 分身端代理。否则已经运行在子会话里的代理仍会接住 UU 热键并请求切换，
+        // 表现为“菜单明明显示已关闭，热键却还能用”。
+        if (!ApplyUuHotkey(notifySuccess: false))
+        {
+            AppLog.Warn("UU 视角切换已关闭，但分身端热键代理未能同步禁用；将忽略迟到的代理切换请求。");
+        }
+
         ShowNotification(
                 Locale.Get("Notify.UuDisabled.Title"),
                 Locale.Get("Notify.UuDisabled.Message"),
@@ -1489,11 +1499,6 @@ public partial class MainWindowViewModel : ObservableObject
     /// <param name="notifySuccess">注册成功时是否提示用户。</param>
     private bool ApplyUuHotkey(bool notifySuccess)
     {
-        if (_hotkeyWindow is null)
-        {
-            return false;
-        }
-
         _globalHotkey ??= new GlobalHotkeyService();
         _globalHotkey.Pressed -= OnUuHotkeyPressed;
         _globalHotkey.Pressed += OnUuHotkeyPressed;
@@ -1502,6 +1507,11 @@ public partial class MainWindowViewModel : ObservableObject
         if (!UuViewSwitchEnabled)
         {
             return SyncSessionAgent();
+        }
+
+        if (_hotkeyWindow is null)
+        {
+            return false;
         }
 
         var combination = _settings.Current.Automation.UuViewSwitchHotkey;
@@ -1559,9 +1569,26 @@ public partial class MainWindowViewModel : ObservableObject
             // 这时只更新内存参数；若 Run 仍精确指向旧版 AppData 代理，可安全
             // 原地改成新路径，但绝不新建 Run 值或重新启用被隔离的启动项。
             var deferStartupMutation = _childSessionService.ShouldDeferSessionAgentStartupMutation();
+            if (deferStartupMutation)
+            {
+                // 子会话结束或隔离日志恢复后必须再同步一次。Uninstall(false)
+                // 会刻意保留登录任务和代理文件，否则隔离恢复会失去原启动项。
+                _sessionAgentStartupNeedsReconcile = true;
+            }
+
             if (string.IsNullOrWhiteSpace(hotkey) && string.IsNullOrWhiteSpace(controlPipe))
             {
-                _sessionAgent.Uninstall(removeStartupEntry: !deferStartupMutation);
+                if (!_sessionAgent.Uninstall(removeStartupEntry: !deferStartupMutation))
+                {
+                    AppLog.Warn("分身端卸载未完成，登录任务或旧版自启项仍然存在。");
+                    return false;
+                }
+
+                if (!deferStartupMutation)
+                {
+                    _sessionAgentStartupNeedsReconcile = false;
+                }
+
                 return true;
             }
 
@@ -1573,6 +1600,11 @@ public partial class MainWindowViewModel : ObservableObject
             {
                 AppLog.Warn($"分身端安装失败：{error}");
                 return false;
+            }
+
+            if (!deferStartupMutation)
+            {
+                _sessionAgentStartupNeedsReconcile = false;
             }
 
             // 自启项只在下次登录时生效；当前分身已经在运行时立刻补拉一份。
@@ -1773,11 +1805,21 @@ public partial class MainWindowViewModel : ObservableObject
     /// </summary>
     private void OnSessionAgentSwitchRequested(object? sender, EventArgs e)
     {
+        if (!ShouldAcceptUuSwitchInput(UuViewSwitchEnabled))
+        {
+            return;
+        }
+
         _ = TriggerUuViewSwitchAsync();
     }
 
     private void OnUuHotkeyPressed(object? sender, EventArgs e)
     {
+        if (!ShouldAcceptUuSwitchInput(UuViewSwitchEnabled))
+        {
+            return;
+        }
+
         _ = TriggerUuViewSwitchAsync();
     }
 
@@ -2150,6 +2192,7 @@ public partial class MainWindowViewModel : ObservableObject
         if (Application.Current.Dispatcher.CheckAccess())
         {
             UpdateConnectionStatus();
+            ReconcileDeferredSessionAgentStartup();
             EnsureSessionAgentRunning();
             return;
         }
@@ -2157,8 +2200,68 @@ public partial class MainWindowViewModel : ObservableObject
         _ = Application.Current.Dispatcher.BeginInvoke(() =>
         {
             UpdateConnectionStatus();
+            ReconcileDeferredSessionAgentStartup();
             EnsureSessionAgentRunning();
         });
+    }
+
+    /// <summary>
+    /// 子会话结束后补做隔离期间推迟的登录任务或 Run 自启项同步。
+    ///
+    /// 子会话存在或启动项隔离日志尚未恢复时，<see cref="SyncSessionAgent"/> 只更新
+    /// 当前代理，不会新建、改写或删除登录任务和 Run 值。状态轮询会持续触发本方法，
+    /// 但只有 WTS 明确确认没有子会话且日志已清空后才重试，并限制失败重试频率。
+    /// </summary>
+    private void ReconcileDeferredSessionAgentStartup()
+    {
+        if (_hotkeyWindow is null)
+        {
+            return;
+        }
+
+        var deferStartupMutation = _childSessionService.ShouldDeferSessionAgentStartupMutation();
+        var now = Environment.TickCount64;
+        if (!ShouldAttemptDeferredSessionAgentStartupReconcile(
+                _sessionAgentStartupNeedsReconcile,
+                deferStartupMutation,
+                now,
+                _lastSessionAgentStartupReconcileTicks,
+                SessionAgentStartupReconcileIntervalMs))
+        {
+            return;
+        }
+
+        _lastSessionAgentStartupReconcileTicks = now;
+        if (SyncSessionAgent(startInChildSession: false))
+        {
+            AppLog.Info("分身会话已结束，已补做登录自启项同步。");
+        }
+        else
+        {
+            AppLog.Warn("分身会话已结束，但补做登录自启项同步失败；稍后重试。");
+        }
+    }
+
+    /// <summary>
+    /// 外部热键输入（主窗口和分身端代理）只有在功能开启时才允许发起切换。
+    /// 关闭动作与代理同步之间可能存在短暂竞态，迟到的消息必须直接丢弃。
+    /// </summary>
+    internal static bool ShouldAcceptUuSwitchInput(bool enabled) => enabled;
+
+    internal static bool ShouldAttemptDeferredSessionAgentStartupReconcile(
+        bool needsReconcile,
+        bool deferStartupMutation,
+        long nowTicks,
+        long lastAttemptTicks,
+        long retryIntervalMs)
+    {
+        if (!needsReconcile || deferStartupMutation)
+        {
+            return false;
+        }
+
+        return lastAttemptTicks == 0
+               || nowTicks - lastAttemptTicks >= retryIntervalMs;
     }
 
     /// <summary>

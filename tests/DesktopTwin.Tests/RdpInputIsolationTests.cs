@@ -1,4 +1,6 @@
+using System.IO;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DesktopTwin.Interop;
 
@@ -381,5 +383,218 @@ public sealed class RdpInputIsolationTests
             connect: () => connected++);
 
         Assert.Equal(1, connected);
+    }
+
+    [Fact]
+    public void 连接前外壳门卫程序不匹配时不得读取工作目录或调用连接()
+    {
+        var workDirectoryRead = false;
+        var connected = false;
+
+        var exception = Assert.Throws<COMException>(() =>
+            RdpActiveXHost.RunShellGatePreflightBeforeConnect(
+                @"C:\ProgramData\DesktopTwin\Agent\DesktopTwin.ShellGate.exe",
+                @"C:\ProgramData\DesktopTwin\Agent",
+                readStartProgram: () => @"C:\Windows\explorer.exe",
+                readWorkingDirectory: () =>
+                {
+                    workDirectoryRead = true;
+                    return @"C:\ProgramData\DesktopTwin\Agent";
+                },
+                connect: () => connected = true));
+
+        Assert.Contains("StartProgram", exception.Message);
+        Assert.False(workDirectoryRead);
+        Assert.False(connected);
+    }
+
+    [Fact]
+    public void 连接前外壳门卫工作目录不匹配时不得调用连接()
+    {
+        var connected = false;
+
+        var exception = Assert.Throws<COMException>(() =>
+            RdpActiveXHost.RunShellGatePreflightBeforeConnect(
+                @"C:\ProgramData\DesktopTwin\Agent\DesktopTwin.ShellGate.exe",
+                @"C:\ProgramData\DesktopTwin\Agent",
+                readStartProgram: () =>
+                    @"""C:\ProgramData\DesktopTwin\Agent\DesktopTwin.ShellGate.exe""",
+                readWorkingDirectory: () => @"C:\Windows",
+                connect: () => connected = true));
+
+        Assert.Contains("WorkDir", exception.Message);
+        Assert.False(connected);
+    }
+
+    [Fact]
+    public void 连接前外壳门卫程序与工作目录一致后才允许调用连接()
+    {
+        var connected = 0;
+
+        RdpActiveXHost.RunShellGatePreflightBeforeConnect(
+            @"C:\ProgramData\DesktopTwin\Agent\DesktopTwin.ShellGate.exe",
+            @"C:\ProgramData\DesktopTwin\Agent",
+            readStartProgram: () =>
+                @"""C:\PROGRAMDATA\DesktopTwin\Agent\DesktopTwin.ShellGate.exe""",
+            readWorkingDirectory: () => @"C:\ProgramData\DesktopTwin\Agent\",
+            connect: () => connected++);
+
+        Assert.Equal(1, connected);
+    }
+
+    [Fact]
+    public void 连接前外壳门卫禁止接受带命令行参数的读回()
+    {
+        var connected = false;
+
+        var exception = Assert.Throws<COMException>(() =>
+            RdpActiveXHost.RunShellGatePreflightBeforeConnect(
+                @"C:\ProgramData\DesktopTwin\Agent\DesktopTwin.ShellGate.exe",
+                @"C:\ProgramData\DesktopTwin\Agent",
+                readStartProgram: () =>
+                    @"""C:\ProgramData\DesktopTwin\Agent\DesktopTwin.ShellGate.exe"" --shell-gate",
+                readWorkingDirectory: () => @"C:\ProgramData\DesktopTwin\Agent",
+                connect: () => connected = true));
+
+        Assert.Contains("StartProgram", exception.Message);
+        Assert.False(connected);
+    }
+
+    [Fact]
+    public void 启动项模式连接前残留启动程序时不得读取工作目录或调用连接()
+    {
+        var workDirectoryRead = false;
+        var connected = false;
+
+        var exception = Assert.Throws<COMException>(() =>
+            RdpActiveXHost.RunExplorerShellPreflightBeforeConnect(
+                readStartProgram: () => @"C:\Windows\explorer.exe",
+                readWorkingDirectory: () =>
+                {
+                    workDirectoryRead = true;
+                    return null;
+                },
+                connect: () => connected = true));
+
+        Assert.Contains("StartProgram", exception.Message);
+        Assert.False(workDirectoryRead);
+        Assert.False(connected);
+    }
+
+    [Fact]
+    public void 启动项模式连接前残留工作目录时不得调用连接()
+    {
+        var connected = false;
+
+        var exception = Assert.Throws<COMException>(() =>
+            RdpActiveXHost.RunExplorerShellPreflightBeforeConnect(
+                readStartProgram: () => null,
+                readWorkingDirectory: () => @"C:\ProgramData\DesktopTwin\Agent",
+                connect: () => connected = true));
+
+        Assert.Contains("WorkDir", exception.Message);
+        Assert.False(connected);
+    }
+
+    [Fact]
+    public void 启动项模式连接前两个外壳值都为空后才允许调用连接()
+    {
+        var connected = 0;
+
+        RdpActiveXHost.RunExplorerShellPreflightBeforeConnect(
+            readStartProgram: () => null,
+            readWorkingDirectory: () => "  ",
+            connect: () => connected++);
+
+        Assert.Equal(1, connected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void 启动项模式把空值和纯空白都视为未配置外壳(string? value)
+    {
+        Assert.True(RdpActiveXHost.IsUnsetConfiguredPath(value));
+    }
+
+    [Fact]
+    public void 启动项模式不接受非空外壳值()
+    {
+        Assert.False(RdpActiveXHost.IsUnsetConfiguredPath(@"C:\Windows\explorer.exe"));
+        Assert.False(RdpActiveXHost.IsUnsetConfiguredPath(0));
+    }
+
+    [Fact]
+    public void 外壳模式可在门卫和资源管理器之间显式切换()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-ShellMode-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var gatePath = Path.Combine(directory, "DesktopTwin.ShellGate.exe");
+            File.WriteAllText(gatePath, "test");
+            var host = (RdpActiveXHost)RuntimeHelpers.GetUninitializedObject(
+                typeof(RdpActiveXHost));
+
+            host.ClearShellGate();
+            Assert.True(GetPrivateField<bool>(host, "_shellGateSelectionConfigured"));
+            Assert.False(GetPrivateField<bool>(host, "_useAlternateShell"));
+            Assert.Null(GetPrivateField<string?>(host, "_shellGateProgramPath"));
+            Assert.Null(GetPrivateField<string?>(host, "_shellGateWorkingDirectory"));
+
+            host.SetShellGate(gatePath, directory);
+            Assert.True(GetPrivateField<bool>(host, "_shellGateSelectionConfigured"));
+            Assert.True(GetPrivateField<bool>(host, "_useAlternateShell"));
+            Assert.Equal(gatePath, GetPrivateField<string>(host, "_shellGateProgramPath"));
+            Assert.Equal(directory, GetPrivateField<string>(host, "_shellGateWorkingDirectory"));
+
+            host.ClearShellGate();
+            Assert.True(GetPrivateField<bool>(host, "_shellGateSelectionConfigured"));
+            Assert.False(GetPrivateField<bool>(host, "_useAlternateShell"));
+            Assert.Null(GetPrivateField<string?>(host, "_shellGateProgramPath"));
+            Assert.Null(GetPrivateField<string?>(host, "_shellGateWorkingDirectory"));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void 门卫模式拒绝任意文件名()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-ShellMode-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var wrongPath = Path.Combine(directory, "not-the-gate.exe");
+            File.WriteAllText(wrongPath, "test");
+            var host = (RdpActiveXHost)RuntimeHelpers.GetUninitializedObject(
+                typeof(RdpActiveXHost));
+
+            var exception = Assert.Throws<ArgumentException>(
+                () => host.SetShellGate(wrongPath, directory));
+
+            Assert.Contains("固定安装约定", exception.Message);
+            Assert.False(GetPrivateField<bool>(host, "_shellGateSelectionConfigured"));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static T GetPrivateField<T>(object instance, string name)
+    {
+        var field = typeof(RdpActiveXHost).GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return (T)field!.GetValue(instance)!;
     }
 }

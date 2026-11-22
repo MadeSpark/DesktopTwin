@@ -29,6 +29,8 @@ internal sealed class McpLoopbackServer : IDisposable
     private const int MaxRequestBodyReadTimeoutSeconds = 30;
     private const int RequestLifetimeSeconds = 60;
     private const int ShutdownWaitSeconds = 2;
+    private const int ErrorResponseDrainSeconds = 5;
+    private const int ErrorResponseDrainIdleMilliseconds = 500;
 
     private readonly object _gate = new();
     private readonly SemaphoreSlim _connectionSlots = new(16, 16);
@@ -268,19 +270,21 @@ internal sealed class McpLoopbackServer : IDisposable
         {
             using (client)
             {
+                var drainPlan = new ResponseDrainPlan();
                 try
                 {
                     client.NoDelay = true;
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(serverCancellation);
                     timeout.CancelAfter(TimeSpan.FromSeconds(RequestLifetimeSeconds));
-                    await HandleClientAsync(client, timeout.Token).ConfigureAwait(false);
+                    await HandleClientAsync(client, timeout.Token, drainPlan).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (!serverCancellation.IsCancellationRequested)
                 {
                     await TryWriteErrorAsync(client.GetStream(), 408, "Request Timeout").ConfigureAwait(false);
                 }
-                catch (RequestTooLargeException)
+                catch (RequestTooLargeException exception)
                 {
+                    drainPlan.RemainingBodyBytes = exception.RemainingBodyBytes;
                     await TryWriteErrorAsync(client.GetStream(), 413, "Request body too large.").ConfigureAwait(false);
                 }
                 catch (Exception exception) when (exception is MalformedChunkedRequestException
@@ -302,10 +306,10 @@ internal sealed class McpLoopbackServer : IDisposable
                 }
                 finally
                 {
-                    // 响应已经写出后先半关闭发送方向，并把客户端已发送的剩余数据读空。
-                    // 否则未读请求体会让 Windows 在 Dispose 时发送 RST，客户端可能完全看不到
-                    // 401/404/415 等本应返回的 HTTP 错误。
-                    await TryDrainBeforeCloseAsync(client).ConfigureAwait(false);
+                    // 响应已经写出后把客户端已发送的剩余请求体读空，再半关闭发送
+                    // 方向。否则未读请求体会让 Windows 在 Dispose 时发送 RST，客
+                    // 户端可能看不到 401/404/413/415 等本应返回的 HTTP 错误。
+                    await TryDrainBeforeCloseAsync(client, drainPlan.RemainingBodyBytes).ConfigureAwait(false);
                 }
             }
         }
@@ -315,7 +319,10 @@ internal sealed class McpLoopbackServer : IDisposable
         }
     }
 
-    private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task HandleClientAsync(
+        TcpClient client,
+        CancellationToken cancellationToken,
+        ResponseDrainPlan drainPlan)
     {
         var stream = client.GetStream();
         using var readTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -328,6 +335,10 @@ internal sealed class McpLoopbackServer : IDisposable
         }
 
         var requestHead = head.Value;
+        drainPlan.RemainingBodyBytes = requestHead.Chunked
+            ? null
+            : Math.Max(0, requestHead.ContentLength - requestHead.BodyPrefix.Length);
+
         if (!IsExpectedHost(requestHead.Headers, out var hostError))
         {
             await WriteResponseAsync(stream, 403, ErrorBody(hostError), cancellationToken).ConfigureAwait(false);
@@ -379,6 +390,7 @@ internal sealed class McpLoopbackServer : IDisposable
         }
 
         var body = await ReadRequestBodyAsync(stream, requestHead, readTimeout.Token).ConfigureAwait(false);
+        drainPlan.RemainingBodyBytes = 0;
 
         JsonNode? message;
         try
@@ -704,7 +716,7 @@ internal sealed class McpLoopbackServer : IDisposable
         if (!chunked && contentLength > MaxRequestBytes)
         {
             // 认证前只读取请求头；超限请求体不会进入内存。
-            throw new RequestTooLargeException();
+            throw new RequestTooLargeException(Math.Max(0, contentLength - bodyPrefix.Length));
         }
 
         return new HttpRequestHead(
@@ -929,7 +941,9 @@ internal sealed class McpLoopbackServer : IDisposable
         }
     }
 
-    private static async Task TryDrainBeforeCloseAsync(TcpClient client)
+    private static async Task TryDrainBeforeCloseAsync(
+        TcpClient client,
+        int? remainingBodyBytes)
     {
         try
         {
@@ -938,15 +952,49 @@ internal sealed class McpLoopbackServer : IDisposable
                 return;
             }
 
-            client.Client.Shutdown(SocketShutdown.Send);
-            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+            // 提前返回 413/401 时，客户端可能仍在发送已声明的大请求体。
+            // 先保留接收方向并丢弃剩余请求体，避免对端上传尚未结束时收到
+            // FIN 而中止传输；全部收完后再半关闭发送方向，让已排队的错误
+            // 响应完整送达。恶意慢速连接仍受固定时限约束。
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(ErrorResponseDrainSeconds));
             var buffer = ArrayPool<byte>.Shared.Rent(8192);
             try
             {
                 var stream = client.GetStream();
-                while (await stream.ReadAsync(buffer.AsMemory(), timeout.Token).ConfigureAwait(false) > 0)
+                while (remainingBodyBytes is not 0)
                 {
+                    var count = remainingBodyBytes is > 0
+                        ? Math.Min(buffer.Length, remainingBodyBytes.Value)
+                        : buffer.Length;
+                    using var idleTimeout = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+                    idleTimeout.CancelAfter(TimeSpan.FromMilliseconds(ErrorResponseDrainIdleMilliseconds));
+                    int read;
+                    try
+                    {
+                        read = await stream.ReadAsync(
+                            buffer.AsMemory(0, count),
+                            idleTimeout.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Error responses must not park a connection slot for a client
+                        // that declares a body but never sends it. Stop after a short
+                        // idle interval; an actively uploading client keeps draining.
+                        break;
+                    }
+
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    if (remainingBodyBytes is > 0)
+                    {
+                        remainingBodyBytes -= read;
+                    }
                 }
+
+                client.Client.Shutdown(SocketShutdown.Send);
             }
             finally
             {
@@ -968,6 +1016,21 @@ internal sealed class McpLoopbackServer : IDisposable
 
     private sealed class RequestTooLargeException : IOException
     {
+        public RequestTooLargeException()
+        {
+        }
+
+        public RequestTooLargeException(int remainingBodyBytes)
+        {
+            RemainingBodyBytes = remainingBodyBytes;
+        }
+
+        public int? RemainingBodyBytes { get; }
+    }
+
+    private sealed class ResponseDrainPlan
+    {
+        public int? RemainingBodyBytes { get; set; }
     }
 
     private sealed class MalformedRequestHeadException : IOException

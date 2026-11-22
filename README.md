@@ -132,17 +132,29 @@ DesktopTwin 做的事情就是：
 
 ### 从源码构建
 
-需要 .NET SDK 10.0 或更高版本。
+需要 .NET SDK 10.0（含 Windows Desktop 组件）。直接在仓库根目录运行打包脚本：
 
 ```powershell
-git clone https://github.com/batvbs/DesktopTwin.git desktop-twin
-cd desktop-twin
-dotnet build -c Release
-dotnet publish src/DesktopTwin -c Release -r win-x64 --self-contained false -o publish
+powershell -NoProfile -ExecutionPolicy Bypass -File build/build.ps1
 ```
 
-产物在 `publish\DesktopTwin.exe`（框架依赖，需要目标机安装 .NET 10 桌面运行时）。
-如需免安装运行时，把 `--self-contained false` 换成 `--self-contained true`。
+脚本会做 WPF 单文件发布，并在 `artifacts/dist` 生成两个版本和不含压缩包的
+`README.txt`：`DesktopTwin-<版本>.exe` 自带运行时，`DesktopTwin-<版本>-NET10.exe`
+是框架依赖版（目标机需安装 .NET 10 桌面运行时），两者都会写入各自的 SHA256。
+
+手动发布时必须保留 WPF 单文件参数，否则 XAML 和原生依赖可能缺失：
+
+```powershell
+# 框架依赖
+dotnet publish src/DesktopTwin -c Release -r win-x64 --self-contained false `
+  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:DebugType=none -o publish/framework
+
+# 自带运行时（框架依赖版不能开启此压缩选项）
+dotnet publish src/DesktopTwin -c Release -r win-x64 --self-contained true `
+  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:EnableCompressionInSingleFile=true -p:DebugType=none -o publish/standalone
+```
 
 ---
 
