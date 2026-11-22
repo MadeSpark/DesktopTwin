@@ -37,16 +37,19 @@ internal sealed class McpLoopbackServer : IDisposable
     private readonly string _expectedPath;
     private readonly Func<string?> _pipeNameProvider;
     private readonly McpProtocolHandler _handler;
+    private readonly Action<TcpListener> _stopListener;
     private TcpListener? _listener;
     private CancellationTokenSource? _cancellation;
     private Task? _acceptLoop;
     private bool _disposed;
+    private bool _disposeAttemptInProgress;
 
     public McpLoopbackServer(
         string accessToken,
         int preferredPort,
         Func<string?> pipeNameProvider,
-        IMcpAgentBridge? agentBridge = null)
+        IMcpAgentBridge? agentBridge = null,
+        Action<TcpListener>? stopListener = null)
     {
         if (!McpSecretStore.IsSafeToken(accessToken))
         {
@@ -57,6 +60,7 @@ internal sealed class McpLoopbackServer : IDisposable
         _expectedPath = "/mcp/" + accessToken;
         _pipeNameProvider = pipeNameProvider;
         _handler = new McpProtocolHandler(agentBridge ?? new SessionAgentControlClient(), pipeNameProvider);
+        _stopListener = stopListener ?? (static listener => listener.Stop());
         PreferredPort = preferredPort;
     }
 
@@ -109,30 +113,48 @@ internal sealed class McpLoopbackServer : IDisposable
         Task[] handlers;
         lock (_gate)
         {
-            if (_disposed)
+            if (_disposed || _disposeAttemptInProgress)
             {
                 return;
             }
 
-            _disposed = true;
+            // 只有底层监听器真正停止、活跃请求收尾完成后才能提交 disposed。
+            // 任一步抛异常都保留字段和同一 TcpListener，让下一次 Dispose 能真正重试。
+            _disposeAttemptInProgress = true;
             cancellation = _cancellation;
             listener = _listener;
-            _listener = null;
             acceptLoop = _acceptLoop;
-            _acceptLoop = null;
             handlers = new Task[_activeHandlers.Count];
             _activeHandlers.CopyTo(handlers);
         }
 
-        cancellation?.Cancel();
-        listener?.Stop();
-        WaitForActiveRequests(acceptLoop, handlers);
-
-        lock (_gate)
+        try
         {
-            _cancellation?.Dispose();
-            _cancellation = null;
-            _activeHandlers.Clear();
+            cancellation?.Cancel();
+            if (listener is not null)
+            {
+                _stopListener(listener);
+            }
+
+            WaitForActiveRequests(acceptLoop, handlers);
+
+            lock (_gate)
+            {
+                _disposed = true;
+                _cancellation = null;
+                _listener = null;
+                _acceptLoop = null;
+                _activeHandlers.Clear();
+            }
+
+            cancellation?.Dispose();
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _disposeAttemptInProgress = false;
+            }
         }
     }
 
@@ -210,7 +232,7 @@ internal sealed class McpLoopbackServer : IDisposable
             Task? handler = null;
             lock (_gate)
             {
-                if (!_disposed)
+                if (!_disposed && !_disposeAttemptInProgress)
                 {
                     handler = HandleClientSafelyAsync(client, cancellationToken);
                     _activeHandlers.Add(handler);

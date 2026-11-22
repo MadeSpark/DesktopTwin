@@ -130,6 +130,87 @@ public sealed class McpProtocolHandlerTests
         Assert.Null(bridge.LastOperation);
     }
 
+    [Theory]
+    [InlineData("desktop_mouse_click", """{"x":1,"y":1,"clicks":0}""", "不能小于 1")]
+    [InlineData("desktop_mouse_drag", """{"fromX":1,"fromY":1,"toX":2,"toY":2,"durationMs":10001}""", "不能大于 10000")]
+    [InlineData("desktop_keyboard_key", """{"key":"A","repeat":101}""", "不能大于 100")]
+    [InlineData("desktop_keyboard_hotkey", """{"keys":[]}""", "至少需要 1")]
+    [InlineData("desktop_keyboard_hotkey", """{"keys":["A","B","C","D","E","F","G","H","I"]}""", "最多只能包含 8")]
+    [InlineData("desktop_screenshot", """{"width":0,"height":10}""", "不能小于 1")]
+    [InlineData("desktop_launch_process", """{"target":""}""", "长度不能小于 1")]
+    [InlineData("desktop_kill_process", """{"processId":0}""", "不能小于 1")]
+    public async Task 工具参数执行声明中的数值长度和数组边界(string toolName, string argumentsJson, string expectedText)
+    {
+        var bridge = new RecordingBridge();
+        var handler = new McpProtocolHandler(bridge, () => "DesktopTwin.AgentControl.test");
+        var request = new JsonObject
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = 1,
+            ["method"] = "tools/call",
+            ["params"] = new JsonObject
+            {
+                ["name"] = toolName,
+                ["arguments"] = JsonNode.Parse(argumentsJson)
+            }
+        };
+
+        var response = await handler.HandleAsync(request, CancellationToken.None);
+
+        Assert.True(response!["result"]!["isError"]!.GetValue<bool>());
+        Assert.Contains(expectedText, response["result"]!["content"]![0]!["text"]!.GetValue<string>());
+        Assert.Null(bridge.LastOperation);
+    }
+
+    [Fact]
+    public async Task 工具参数字符串长度上限在分发前执行()
+    {
+        var bridge = new RecordingBridge();
+        var handler = new McpProtocolHandler(bridge, () => "DesktopTwin.AgentControl.test");
+
+        var keyboardResponse = await handler.HandleAsync(CreateToolCall(
+            "desktop_keyboard_text",
+            new JsonObject { ["text"] = new string('x', 100001) }), CancellationToken.None);
+        var clipboardResponse = await handler.HandleAsync(CreateToolCall(
+            "desktop_clipboard_write",
+            new JsonObject { ["text"] = new string('x', 1000001) }), CancellationToken.None);
+
+        Assert.True(keyboardResponse!["result"]!["isError"]!.GetValue<bool>());
+        Assert.True(clipboardResponse!["result"]!["isError"]!.GetValue<bool>());
+        Assert.Contains("100000", keyboardResponse["result"]!["content"]![0]!["text"]!.GetValue<string>());
+        Assert.Contains("1000000", clipboardResponse["result"]!["content"]![0]!["text"]!.GetValue<string>());
+        Assert.Null(bridge.LastOperation);
+    }
+
+    [Fact]
+    public async Task 工具参数边界上的合法值仍会分发()
+    {
+        var bridge = new RecordingBridge();
+        var handler = new McpProtocolHandler(bridge, () => "DesktopTwin.AgentControl.test");
+
+        var response = await handler.HandleAsync(CreateToolCall(
+            "desktop_keyboard_hotkey",
+            new JsonObject
+            {
+                ["keys"] = new JsonArray("A", "B", "C", "D", "E", "F", "G", "H")
+            }), CancellationToken.None);
+
+        Assert.False(response!["result"]!["isError"]!.GetValue<bool>());
+        Assert.Equal("desktop_keyboard_hotkey", bridge.LastOperation);
+    }
+
+    private static JsonObject CreateToolCall(string toolName, JsonObject arguments) => new()
+    {
+        ["jsonrpc"] = "2.0",
+        ["id"] = 1,
+        ["method"] = "tools/call",
+        ["params"] = new JsonObject
+        {
+            ["name"] = toolName,
+            ["arguments"] = arguments
+        }
+    };
+
     [Fact]
     public async Task 批量请求超过上限时整体拒绝()
     {
@@ -238,6 +319,41 @@ public sealed class McpSecretStoreTests
         Assert.Equal(
             "--no-hotkey --control-pipe \"DesktopTwin.AgentControl.0123456789abcdef0123456789abcdef\" --host-session 1",
             arguments);
+    }
+
+    [Fact]
+    public void 显式拉起的代理参数携带会话登录身份()
+    {
+        var logonTime = new DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc);
+        var arguments = SessionAgentService.BuildAgentArguments(
+            null,
+            "DesktopTwin.AgentControl.0123456789abcdef0123456789abcdef",
+            1,
+            expectedSessionId: 2,
+            expectedLogonTimeUtc: logonTime);
+
+        Assert.Equal(
+            @"--no-hotkey --control-pipe ""DesktopTwin.AgentControl.0123456789abcdef0123456789abcdef"""
+            + " --host-session 1 --expected-session 2 --expected-logon-time "
+            + logonTime.ToFileTimeUtc().ToString(System.Globalization.CultureInfo.InvariantCulture),
+            arguments);
+    }
+
+    [Fact]
+    public void 会话登录身份参数必须成对提供()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            SessionAgentService.BuildAgentArguments(
+                null,
+                "pipe",
+                1,
+                expectedSessionId: 2));
+        Assert.Throws<ArgumentException>(() =>
+            SessionAgentService.BuildAgentArguments(
+                null,
+                "pipe",
+                1,
+                expectedLogonTimeUtc: DateTime.UtcNow));
     }
 
     [Theory]

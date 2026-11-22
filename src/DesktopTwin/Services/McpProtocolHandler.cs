@@ -277,14 +277,64 @@ internal sealed class McpProtocolHandler
             return $"参数 {path} 的值不在允许范围内。";
         }
 
-        if (value is JsonArray array && schema["items"] is JsonObject itemSchema)
+        if (expectedType is "integer" or "number")
         {
-            for (var index = 0; index < array.Count; index++)
+            var numericValue = ReadInteger(value);
+            if (ReadInteger(schema["minimum"]) is { } minimum
+                && numericValue is { } belowCandidate
+                && belowCandidate < minimum)
             {
-                var error = ValidateValue(array[index], itemSchema, $"{path}[{index}]");
-                if (error is not null)
+                return $"参数 {path} 不能小于 {minimum}。";
+            }
+
+            if (ReadInteger(schema["maximum"]) is { } maximum
+                && numericValue is { } aboveCandidate
+                && aboveCandidate > maximum)
+            {
+                return $"参数 {path} 不能大于 {maximum}。";
+            }
+        }
+
+        if (expectedType == "string"
+            && value is JsonValue stringValue
+            && stringValue.TryGetValue<string>(out var text))
+        {
+            if (ReadInteger(schema["minLength"]) is { } minimumLength
+                && text.Length < minimumLength)
+            {
+                return $"参数 {path} 的长度不能小于 {minimumLength}。";
+            }
+
+            if (ReadInteger(schema["maxLength"]) is { } maximumLength
+                && text.Length > maximumLength)
+            {
+                return $"参数 {path} 的长度不能超过 {maximumLength}。";
+            }
+        }
+
+        if (value is JsonArray array)
+        {
+            if (ReadInteger(schema["minItems"]) is { } minimumItems
+                && array.Count < minimumItems)
+            {
+                return $"参数 {path} 至少需要 {minimumItems} 项。";
+            }
+
+            if (ReadInteger(schema["maxItems"]) is { } maximumItems
+                && array.Count > maximumItems)
+            {
+                return $"参数 {path} 最多只能包含 {maximumItems} 项。";
+            }
+
+            if (schema["items"] is JsonObject itemSchema)
+            {
+                for (var index = 0; index < array.Count; index++)
                 {
-                    return error;
+                    var error = ValidateValue(array[index], itemSchema, $"{path}[{index}]");
+                    if (error is not null)
+                    {
+                        return error;
+                    }
                 }
             }
         }
@@ -307,21 +357,26 @@ internal sealed class McpProtocolHandler
         };
     }
 
-    private static bool IsInteger(JsonNode value)
+    private static bool IsInteger(JsonNode value) => ReadInteger(value) is not null;
+
+    private static long? ReadInteger(JsonNode? node)
     {
-        if (value.GetValueKind() != JsonValueKind.Number || value is not JsonValue jsonValue)
+        if (node is not JsonValue jsonValue
+            || jsonValue.GetValueKind() != JsonValueKind.Number)
         {
-            return false;
+            return null;
         }
 
-        if (jsonValue.TryGetValue<long>(out _))
+        if (jsonValue.TryGetValue<long>(out var direct))
         {
-            return true;
+            return direct;
         }
 
         return jsonValue.TryGetValue<JsonElement>(out var element)
-            && element.ValueKind == JsonValueKind.Number
-            && element.TryGetInt64(out _);
+               && element.ValueKind == JsonValueKind.Number
+               && element.TryGetInt64(out var parsed)
+            ? parsed
+            : null;
     }
 
     private static JsonObject BuildScreenshotResult(JsonElement result)

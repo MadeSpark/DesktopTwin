@@ -627,6 +627,7 @@ public static class ChildSessionProcessLauncher
     /// <returns>是否已成功下发启动任务。</returns>
     internal static bool RunInSession(
         uint sessionId,
+        DateTime expectedLogonTimeUtc,
         string executablePath,
         string arguments,
         string taskNamePrefix)
@@ -639,7 +640,8 @@ public static class ChildSessionProcessLauncher
                 arguments,
                 Path.GetDirectoryName(executablePath) ?? string.Empty,
                 runAsAdministrator: false,
-                taskNamePrefix: taskNamePrefix);
+                taskNamePrefix: taskNamePrefix,
+                expectedLogonTimeUtc: expectedLogonTimeUtc);
             return true;
         }
         catch (Exception exception) when (exception is InvalidOperationException
@@ -659,7 +661,8 @@ public static class ChildSessionProcessLauncher
         string arguments,
         string workingDirectory,
         bool runAsAdministrator,
-        string? taskNamePrefix = null)
+        string? taskNamePrefix = null,
+        DateTime? expectedLogonTimeUtc = null)
     {
         // 会话可能在用户点击后被重建，启动前必须确认目标会话号仍然有效，
         // 否则会把程序启动到一个已经注销的会话里（表现为「点了没反应」）。
@@ -670,6 +673,21 @@ public static class ChildSessionProcessLauncher
                 $"目标分身会话已发生变化。请求会话为 {childSessionId}，当前会话为 "
                 + (actualChildSessionId?.ToString(CultureInfo.InvariantCulture) ?? "无")
                 + "。");
+        }
+
+        if (expectedLogonTimeUtc is { } expectedLogonTime)
+        {
+            var actualLogonTime = ChildSessionNativeMethods.TryGetSessionLogonTime(childSessionId);
+            if (actualLogonTime is not { } actual
+                || expectedLogonTime == default
+                || actual.Ticks != expectedLogonTime.Ticks)
+            {
+                throw new InvalidOperationException(
+                    $"目标分身会话的登录身份已发生变化。请求登录时间 "
+                    + $"{expectedLogonTime:O}，当前登录时间 "
+                    + (actualLogonTime?.ToString("O", CultureInfo.InvariantCulture) ?? "未知")
+                    + "。");
+            }
         }
 
         EnsureTaskSchedulerIsTrusted();

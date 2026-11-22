@@ -231,6 +231,7 @@ internal sealed class StartupGuardService : IDisposable
             if (!string.Equals(Path.GetExtension(fullPath), ".exe", StringComparison.OrdinalIgnoreCase)
                 || fullPath.StartsWith(windowsDirectory, StringComparison.OrdinalIgnoreCase)
                 || BlockedFileNames.Contains(Path.GetFileName(fullPath), StringComparer.OrdinalIgnoreCase)
+                || SessionAgentService.IsDefaultAgentPath(fullPath)
                 || (currentExecutable is not null
                     && string.Equals(fullPath, currentExecutable, StringComparison.OrdinalIgnoreCase)))
             {

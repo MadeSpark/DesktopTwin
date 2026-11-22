@@ -359,10 +359,10 @@ internal sealed class RdpActiveXHost : AxHost
     }
 
     /// <summary>
-    /// 键盘钩子模式应用失败时仍要尝试禁用 RDP 的原生 Input Capture Window。
-    /// 钩子失败只说明远程键盘范围未确认，不能因此跳过本机输入窗口阻断；
-    /// 合并结果始终是 <see cref="RdpInputWindowApplyResult.Failed"/>，因为隔离
-    /// 前置条件已经失败，调用方不得据此继续连接。
+    /// 输入隔离应用失败时仍要尝试禁用 RDP 的原生 Input Capture Window。
+    /// 无论失败发生在键盘钩子、控件句柄还是原生窗口回调上，都不能因此跳过
+    /// 本机输入窗口阻断；合并结果始终是 <see cref="RdpInputWindowApplyResult.Failed"/>，
+    /// 因为隔离前置条件已经失败，调用方不得据此继续连接。
     /// </summary>
     internal static RdpInputWindowApplyResult ContainKeyboardHookFailure(
         IntPtr hostWindow,
@@ -378,13 +378,13 @@ internal sealed class RdpActiveXHost : AxHost
         {
             var result = applyInputWindowState(hostWindow, false);
             AppLog.Warn(
-                "KeyboardHookMode 未能确认隔离，已同步尝试禁用 Input Capture Window："
+                "输入隔离未能确认，已同步尝试禁用 Input Capture Window："
                 + $"applyResult={result}，host=0x{hostWindow:X}。");
         }
         catch (Exception exception)
         {
             AppLog.Warn(
-                "KeyboardHookMode 未能确认隔离，且禁用 Input Capture Window 失败。",
+                "输入隔离未能确认，且禁用 Input Capture Window 失败。",
                 exception);
         }
 
@@ -402,14 +402,14 @@ internal sealed class RdpActiveXHost : AxHost
     /// </summary>
     private bool TryApplyKeyboardHookMode(bool inputBlocked)
     {
-        if (!IsHandleCreated)
-        {
-            return true;
-        }
-
-        var hookMode = GetSafeKeyboardHookMode(_sendSystemShortcutsToRemote, inputBlocked);
         try
         {
+            if (!IsHandleCreated)
+            {
+                return true;
+            }
+
+            var hookMode = GetSafeKeyboardHookMode(_sendSystemShortcutsToRemote, inputBlocked);
             var client = GetRequiredOcx();
             var securedSettings = GetComProperty(client, "SecuredSettings2")
                                  ?? throw new COMException(
@@ -426,11 +426,12 @@ internal sealed class RdpActiveXHost : AxHost
             AppLog.Info($"KeyboardHookMode 已即时写入 {hookMode}，读回 {actual}。");
             return true;
         }
-        catch (Exception exception) when (exception is COMException
-                                              or MissingMemberException
-                                              or InvalidCastException
-                                              or InvalidOperationException)
+        catch (Exception exception)
         {
+            // GetRequiredOcx 内部会读取 Handle，InvokeMember 也可能抛
+            // TargetInvocationException 或其它未被具体 COM 异常类型覆盖的异常。
+            // 这里一律按“未确认隔离”返回，让 SetInputBlocked 继续执行原生
+            // Input Capture Window 禁用，绝不能把异常带到窗口状态处理之外。
             AppLog.Warn("KeyboardHookMode 即时应用失败，拒绝建立输入隔离。", exception);
             return false;
         }
@@ -439,77 +440,253 @@ internal sealed class RdpActiveXHost : AxHost
     /// <summary>
     /// 屏蔽或恢复本机进入桌面分身的鼠标键盘输入。期望状态会被记住，
     /// 每次连接登录后由 ChildSessionService 重新施加。
+    ///
+    /// 实际流程由 <see cref="ApplyInputBlocked"/> 完成；这里只绑定生产依赖，
+    /// 并通过可注入 helper 保证测试覆盖真实的 SetInputBlocked 调用链。
     /// </summary>
     internal RdpInputWindowApplyResult SetInputBlocked(bool blocked)
     {
-        if (!TryApplyKeyboardHookMode(blocked))
-        {
-            // 未确认键盘钩子范围时只能维持更严格的阻断状态。这里不能提前返回：
-            // 键盘钩子失败并不代表原生 Input Capture Window 已经禁用，必须仍尝试
-            // 关掉窗口层输入，否则观看/MCP 模式可能继续把本机键鼠送进子会话。
-            _inputBlocked = true;
-            _ = ContainKeyboardHookFailure(
-                Handle,
-                ChildSessionNativeMethods.SetRdpInputWindowEnabled);
-            return RdpInputWindowApplyResult.Failed;
-        }
+        var result = ApplyInputBlocked(
+            blocked,
+            TryApplyKeyboardHookMode,
+            () => IsHandleCreated,
+            () => Handle,
+            ChildSessionNativeMethods.SetRdpInputWindowEnabled,
+            () => ConnectedState,
+            ChildSessionNativeMethods.TryFocusRdpInputWindow,
+            out var inputBlocked);
+        _inputBlocked = inputBlocked;
+        return result;
+    }
 
-        if (!IsHandleCreated)
-        {
-            _inputBlocked = blocked;
-            AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄未创建，仅记录期望状态。");
-            return blocked
-                ? RdpInputWindowApplyResult.WindowMissing
-                : RdpInputWindowApplyResult.Applied;
-        }
+    /// <summary>
+    /// SetInputBlocked 的异常安全实现。任何依赖（键盘钩子、OCX/InvokeMember、
+    /// Handle、原生窗口或焦点回调）抛异常时，都会维持最严格的屏蔽期望，尽力
+    /// 禁用原生 Input Capture Window，并返回 <see cref="RdpInputWindowApplyResult.Failed"/>。
+    /// </summary>
+    internal static RdpInputWindowApplyResult ApplyInputBlocked(
+        bool blocked,
+        Func<bool, bool> tryApplyKeyboardHookMode,
+        Func<bool> isHandleCreated,
+        Func<IntPtr> getHostWindow,
+        Func<IntPtr, bool, RdpInputWindowApplyResult> applyInputWindowState,
+        Func<int> getConnectedState,
+        Func<IntPtr, bool> tryFocusInputWindow,
+        out bool inputBlocked)
+    {
+        ArgumentNullException.ThrowIfNull(tryApplyKeyboardHookMode);
+        ArgumentNullException.ThrowIfNull(isHandleCreated);
+        ArgumentNullException.ThrowIfNull(getHostWindow);
+        ArgumentNullException.ThrowIfNull(applyInputWindowState);
+        ArgumentNullException.ThrowIfNull(getConnectedState);
+        ArgumentNullException.ThrowIfNull(tryFocusInputWindow);
 
-        var result = ChildSessionNativeMethods.SetRdpInputWindowEnabled(Handle, !blocked);
-        if (result == RdpInputWindowApplyResult.WindowMissing)
+        inputBlocked = true;
+        try
         {
-            // 未登录或新连接尚未创建输入窗口时没有可接收本机输入的 RDP 子窗口。
-            // 记录期望状态，登录完成后再强制施加并读回。
-            _inputBlocked = blocked;
-            AppLog.Info(
-                $"SetInputBlocked: blocked={blocked}，Input Capture Window 尚未创建，"
-                + $"仅记录期望状态（控件句柄 0x{Handle:X}）。");
-            return result;
-        }
-
-        if (result != RdpInputWindowApplyResult.Applied)
-        {
-            // 找到了窗口却无法读回目标状态时按最安全的解释处理：认为输入窗口仍被屏蔽。
-            // 若这次原本要解除屏蔽，刚才可能已把 KeyboardHookMode 写成 1；
-            // 因此必须立即把钩子模式压回 0，不能留下一个失败的半解除状态。
-            _inputBlocked = true;
-            if (!blocked && !TryApplyKeyboardHookMode(inputBlocked: true))
+            if (!tryApplyKeyboardHookMode(blocked))
             {
-                AppLog.Warn("解除输入屏蔽失败后，KeyboardHookMode 也未能回滚为 0。");
+                // 未确认键盘钩子范围时只能维持更严格的阻断状态。这里不能提前返回：
+                // 键盘钩子失败并不代表原生 Input Capture Window 已经禁用，必须仍尝试
+                // 关掉窗口层输入，否则观看/MCP 模式可能继续把本机键鼠送进子会话。
+                TryDisableInputWindowBestEffort(
+                    getHostWindow,
+                    applyInputWindowState,
+                    "KeyboardHookMode 未能确认隔离");
+
+                // 解除屏蔽时钩子写入可能已部分生效才失败。无论读回失败发生在哪一步，
+                // 都必须再次尝试把 KeyboardHookMode 压回 0，避免只剩原生窗口阻断
+                // 而系统快捷键仍被送进子会话。
+                if (!blocked)
+                {
+                    try
+                    {
+                        if (!tryApplyKeyboardHookMode(true))
+                        {
+                            AppLog.Warn("KeyboardHookMode 应用失败后，未能回滚为 0。");
+                        }
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        AppLog.Warn("KeyboardHookMode 应用失败后，回滚也失败。", rollbackException);
+                    }
+                }
+
+                return RdpInputWindowApplyResult.Failed;
             }
 
+            if (!isHandleCreated())
+            {
+                inputBlocked = blocked;
+                AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄未创建，仅记录期望状态。");
+                return blocked
+                    ? RdpInputWindowApplyResult.WindowMissing
+                    : RdpInputWindowApplyResult.Applied;
+            }
+
+            var hostWindow = getHostWindow();
+            var result = applyInputWindowState(hostWindow, !blocked);
+            if (result == RdpInputWindowApplyResult.WindowMissing)
+            {
+                // 未登录或新连接尚未创建输入窗口时没有可接收本机输入的 RDP 子窗口。
+                // 记录期望状态，登录完成后再强制施加并读回。
+                inputBlocked = blocked;
+                AppLog.Info(
+                    $"SetInputBlocked: blocked={blocked}，Input Capture Window 尚未创建，"
+                    + $"仅记录期望状态（控件句柄 0x{hostWindow:X}）。");
+                return result;
+            }
+
+            if (result != RdpInputWindowApplyResult.Applied)
+            {
+                // 找到了窗口却无法读回目标状态时按最安全的解释处理：认为输入窗口仍被屏蔽。
+                // 原生回调返回 Failed 时，目标状态可能已经部分生效；尤其解除屏蔽失败时，
+                // 不能只回滚 KeyboardHookMode 就返回，必须先尽力再次禁用 Input Capture Window。
+                inputBlocked = true;
+                TryDisableInputWindowBestEffort(
+                    getHostWindow,
+                    applyInputWindowState,
+                    $"SetInputBlocked 未能验证目标状态（result={result}）");
+
+                // 若这次原本要解除屏蔽，刚才可能已把 KeyboardHookMode 写成 1；
+                // 因此还要立即把钩子模式压回 0，不能留下一个失败的半解除状态。
+                if (!blocked && !tryApplyKeyboardHookMode(true))
+                {
+                    AppLog.Warn("解除输入屏蔽失败后，KeyboardHookMode 也未能回滚为 0。");
+                }
+
+                AppLog.Warn(
+                    $"SetInputBlocked 未能验证目标状态：blocked={blocked}，result={result}，"
+                    + $"控件句柄 0x{hostWindow:X}。");
+                return RdpInputWindowApplyResult.Failed;
+            }
+
+            inputBlocked = blocked;
+
+            // 解除阻止后把焦点交还给输入窗口：被禁用期间 Windows 已把焦点移走，
+            // 仅重新启用输入窗口不会让 RDP 自动恢复输入转发，必须让它重新持有焦点，
+            // 否则表现为「按钮已切回控制模式，画面却始终像观看模式一样没反应」。
+            if (!blocked && getConnectedState() == 1)
+            {
+                var focused = tryFocusInputWindow(hostWindow);
+                if (!focused)
+                {
+                    // 解除屏蔽后必须把焦点交还 RDP 输入窗口，否则界面看似已回到
+                    // 控制模式，实际键鼠仍不会进入子会话。不能把这种半成功报告为
+                    // Applied；立即重新阻断原生窗口和键盘钩子，回到 fail-closed 终态。
+                    inputBlocked = true;
+                    TryDisableInputWindowBestEffort(
+                        getHostWindow,
+                        applyInputWindowState,
+                        "解除输入屏蔽后焦点归还失败");
+                    try
+                    {
+                        if (!tryApplyKeyboardHookMode(true))
+                        {
+                            AppLog.Warn("解除输入屏蔽后焦点归还失败，KeyboardHookMode 也未能回滚为 0。");
+                        }
+                    }
+                    catch (Exception rollbackException)
+                    {
+                        AppLog.Warn("解除输入屏蔽后焦点归还失败，KeyboardHookMode 回滚失败。", rollbackException);
+                    }
+
+                    AppLog.Warn(
+                        $"SetInputBlocked: blocked={blocked}，解除后焦点归还输入窗口失败，"
+                        + $"已回退屏蔽；前台窗口 0x{ChildSessionNativeMethods.GetForegroundWindow():X}。");
+                    return RdpInputWindowApplyResult.Failed;
+                }
+
+                AppLog.Info(
+                    $"SetInputBlocked: blocked={blocked}，解除后焦点归还输入窗口成功，"
+                    + $"前台窗口 0x{ChildSessionNativeMethods.GetForegroundWindow():X}。");
+            }
+            else
+            {
+                AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄 0x{hostWindow:X}。");
+            }
+
+            return RdpInputWindowApplyResult.Applied;
+        }
+        catch (Exception exception)
+        {
+            // Handle、ConnectedState 与原生/焦点回调都可能在保护范围外抛错。
+            // 任何一处异常都要先把内存状态压回屏蔽，再同时回滚键盘钩子并重试
+            // 原生窗口禁用，最后向调用方报告失败，不能把异常或半解除状态泄漏出去。
+            inputBlocked = true;
+            AppLog.Warn("SetInputBlocked 在确认输入隔离时发生异常，按失败处理。", exception);
+
+            // 若这次原本要解除屏蔽，KeyboardHookMode 可能已经写成 1，随后才在
+            // 窗口句柄、原生回调或焦点归还处失败。只禁用 Input Capture Window
+            // 仍不够，键盘钩子也必须压回 0，否则半解除状态仍可能把本机系统
+            // 快捷键送进子会话。这里是最后的保护范围，回滚本身也绝不能抛出去。
+            if (!blocked)
+            {
+                try
+                {
+                    if (!tryApplyKeyboardHookMode(true))
+                    {
+                        AppLog.Warn("SetInputBlocked 异常后，KeyboardHookMode 未能回滚为 0。");
+                    }
+                }
+                catch (Exception rollbackException)
+                {
+                    AppLog.Warn("SetInputBlocked 异常后，KeyboardHookMode 回滚失败。", rollbackException);
+                }
+            }
+
+            TryDisableInputWindowBestEffort(
+                getHostWindow,
+                applyInputWindowState,
+                "SetInputBlocked 异常");
+            return RdpInputWindowApplyResult.Failed;
+        }
+    }
+
+    private static void TryDisableInputWindowBestEffort(
+        Func<IntPtr> getHostWindow,
+        Func<IntPtr, bool, RdpInputWindowApplyResult> applyInputWindowState,
+        string failureContext)
+    {
+        try
+        {
+            // Handle 求值本身也可能抛错。失败路径上再读一次句柄，避免一次
+            // 瞬时的句柄读取异常就直接跳过原生 Input Capture Window 禁用。
+            IntPtr hostWindow;
+            try
+            {
+                hostWindow = getHostWindow();
+            }
+            catch (Exception firstException)
+            {
+                try
+                {
+                    hostWindow = getHostWindow();
+                }
+                catch (Exception secondException)
+                {
+                    throw new AggregateException(
+                        "读取 RDP 控件 Handle 连续失败。",
+                        firstException,
+                        secondException);
+                }
+            }
+
+            if (hostWindow == IntPtr.Zero)
+            {
+                AppLog.Warn(
+                    $"{failureContext}，控件句柄不可用，未能禁用 Input Capture Window。");
+                return;
+            }
+
+            _ = ContainKeyboardHookFailure(hostWindow, applyInputWindowState);
+        }
+        catch (Exception exception)
+        {
             AppLog.Warn(
-                $"SetInputBlocked 未能验证目标状态：blocked={blocked}，result={result}，"
-                + $"控件句柄 0x{Handle:X}。");
-            return result;
+                $"{failureContext}，读取控件句柄或禁用 Input Capture Window 失败。",
+                exception);
         }
-
-        _inputBlocked = blocked;
-
-        // 解除阻止后把焦点交还给输入窗口：被禁用期间 Windows 已把焦点移走，
-        // 仅重新启用输入窗口不会让 RDP 自动恢复输入转发，必须让它重新持有焦点，
-        // 否则表现为「按钮已切回控制模式，画面却始终像观看模式一样没反应」。
-        if (!blocked && ConnectedState == 1)
-        {
-            var focused = ChildSessionNativeMethods.TryFocusRdpInputWindow(Handle);
-            AppLog.Info(
-                $"SetInputBlocked: blocked={blocked}，解除后焦点归还输入窗口 {(focused ? "成功" : "失败")}，"
-                + $"前台窗口 0x{ChildSessionNativeMethods.GetForegroundWindow():X}。");
-        }
-        else
-        {
-            AppLog.Info($"SetInputBlocked: blocked={blocked}，控件句柄 0x{Handle:X}。");
-        }
-
-        return RdpInputWindowApplyResult.Applied;
     }
 
     /// <summary>

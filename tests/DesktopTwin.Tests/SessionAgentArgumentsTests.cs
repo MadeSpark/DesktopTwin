@@ -1,6 +1,10 @@
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Text;
+using DesktopTwin.Services;
 using Xunit;
 
 namespace DesktopTwin.Tests;
@@ -16,20 +20,13 @@ public sealed class SessionAgentArgumentsTests
 {
     private static Assembly LoadAgentAssembly()
     {
-        // 先试 obj 中间产物:DesktopTwin.Tests.dll 位于
-        // <root>\tests\DesktopTwin.Tests\bin\<cfg>\<tfm>\,上溯 5 级到仓库根。
-        var twinAssembly = typeof(RdpInputIsolationTests).Assembly;
-        var repoRoot = Path.GetFullPath(Path.Combine(
-            Path.GetDirectoryName(twinAssembly.Location)!,
-            "..", "..", "..", "..", ".."));
-        var candidate = Path.Combine(
-            repoRoot, "src", "SessionAgent", "obj", "Release", "DesktopTwin.Agent.exe");
-        if (File.Exists(candidate))
-        {
-            return Assembly.Load(File.ReadAllBytes(candidate));
-        }
+        // Agent.exe 是 DesktopTwin.dll 的嵌入资源，不是测试程序集的资源。
+        // 之前误用测试程序集，永远读不到新资源，随后悄悄回退到旧中间产物。
+        var twinAssembly = typeof(SessionAgentService).Assembly;
 
-        // 回退:DesktopTwin 嵌入资源 DesktopTwin.Agent.exe(LogicalName)。
+        // 只能读取本次构建嵌入 DesktopTwin.dll 的代理。绝不能回退到
+        // src/SessionAgent/obj 下的历史产物，否则测试会悄悄验证旧 exe，
+        // 与当前 SessionAgent 源码脱节。
         foreach (var name in twinAssembly.GetManifestResourceNames())
         {
             if (name.EndsWith("DesktopTwin.Agent.exe", StringComparison.Ordinal))
@@ -42,12 +39,67 @@ public sealed class SessionAgentArgumentsTests
             }
         }
 
-        // 都没找到:同时报告两条路径便于诊断。
         Assert.Fail(
-            "DesktopTwin.Agent.exe not found at " + candidate
-            + " nor embedded in DesktopTwin.dll (resources: "
-            + string.Join(", ", twinAssembly.GetManifestResourceNames()) + ")");
+            "DesktopTwin.Agent.exe 未嵌入当前 DesktopTwin.dll；资源："
+            + string.Join(", ", twinAssembly.GetManifestResourceNames()));
         return null!;
+    }
+
+    [Fact]
+    public void 托管代理参数经构建器与解析器往返仍保留精确身份()
+    {
+        var logonTime = new DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc);
+        var commandLine = SessionAgentService.BuildAgentArguments(
+            hotkey: null,
+            controlPipe: null,
+            hostSessionId: 0,
+            expectedSessionId: 7u,
+            expectedLogonTimeUtc: logonTime);
+
+        var parsed = Read(ParseArguments(SplitCommandLine(commandLine)));
+
+        Assert.True(parsed.IsValid);
+        Assert.True(parsed.NoHotkey);
+        Assert.True(parsed.HasExpectedSessionIdentity);
+        Assert.Equal(7, parsed.ExpectedSessionId);
+        Assert.Equal(logonTime.ToFileTimeUtc(), parsed.ExpectedLogonTimeFileTimeUtc);
+        Assert.Null(parsed.ControlPipe);
+    }
+
+    private static string[] SplitCommandLine(string commandLine)
+    {
+        var result = new List<string>();
+        var current = new StringBuilder();
+        var quoted = false;
+        foreach (var character in commandLine)
+        {
+            if (character == '"')
+            {
+                quoted = !quoted;
+                continue;
+            }
+
+            if (char.IsWhiteSpace(character) && !quoted)
+            {
+                if (current.Length > 0)
+                {
+                    result.Add(current.ToString());
+                    current.Clear();
+                }
+
+                continue;
+            }
+
+            current.Append(character);
+        }
+
+        Assert.False(quoted, "测试命令行引号必须闭合");
+        if (current.Length > 0)
+        {
+            result.Add(current.ToString());
+        }
+
+        return result.ToArray();
     }
 
     private static object ParseArguments(string[] args)
@@ -61,6 +113,31 @@ public sealed class SessionAgentArgumentsTests
         return parse.Invoke(null, new object[] { args })!;
     }
 
+    private static bool IsExpectedSessionIdentity(
+        int expectedSessionId,
+        long expectedLogonTime,
+        int actualSessionId,
+        bool hasActualLogonTime,
+        long actualLogonTime)
+    {
+        var agent = LoadAgentAssembly();
+        var programType = agent.GetType("DesktopTwinSessionAgent.Program")
+            ?? throw new InvalidOperationException(
+                "DesktopTwinSessionAgent.Program not found in agent assembly");
+        var method = programType.GetMethod(
+                "IsExpectedSessionIdentity",
+                BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("IsExpectedSessionIdentity method not found");
+        return (bool)method.Invoke(null, new object[]
+        {
+            expectedSessionId,
+            expectedLogonTime,
+            actualSessionId,
+            hasActualLogonTime,
+            actualLogonTime
+        })!;
+    }
+
     private static ParsedArgs Read(object parsed)
     {
         // SessionAgentArguments 与其字段均为 internal,跨程序集反射要用 NonPublic。
@@ -72,6 +149,11 @@ public sealed class SessionAgentArgumentsTests
             ErrorMessage = (string?)t.GetField("ErrorMessage", Fields)!.GetValue(parsed),
             ControlPipe = (string?)t.GetField("ControlPipe", Fields)!.GetValue(parsed),
             HostSessionId = (int)t.GetField("HostSessionId", Fields)!.GetValue(parsed)!,
+            ExpectedSessionId = (int)t.GetField("ExpectedSessionId", Fields)!.GetValue(parsed)!,
+            ExpectedLogonTimeFileTimeUtc =
+                (long)t.GetField("ExpectedLogonTimeFileTimeUtc", Fields)!.GetValue(parsed)!,
+            HasExpectedSessionIdentity =
+                (bool)t.GetField("HasExpectedSessionIdentity", Fields)!.GetValue(parsed)!,
             NoHotkey = (bool)t.GetField("NoHotkey", Fields)!.GetValue(parsed)!,
             Hotkey = (string?)t.GetField("Hotkey", Fields)!.GetValue(parsed),
             TestMode = (bool)t.GetField("TestMode", Fields)!.GetValue(parsed)!,
@@ -84,6 +166,9 @@ public sealed class SessionAgentArgumentsTests
         public string? ErrorMessage;
         public string? ControlPipe;
         public int HostSessionId;
+        public int ExpectedSessionId;
+        public long ExpectedLogonTimeFileTimeUtc;
+        public bool HasExpectedSessionIdentity;
         public bool NoHotkey;
         public string? Hotkey;
         public bool TestMode;
@@ -113,6 +198,139 @@ public sealed class SessionAgentArgumentsTests
         Assert.Equal("desktop-twin-session-2", r.ControlPipe);
         Assert.Equal(2, r.HostSessionId);
         Assert.True(r.NoHotkey);
+        Assert.False(r.HasExpectedSessionIdentity);
+    }
+
+    [Fact]
+    public void 显式启动的预期会话身份成对解析()
+    {
+        var r = Read(ParseArguments(new[]
+        {
+            "--no-hotkey",
+            "--control-pipe", "desktop-twin-session-2",
+            "--host-session", "1",
+            "--expected-session", "2",
+            "--expected-logon-time", "133500000000000000"
+        }));
+
+        Assert.True(r.IsValid);
+        Assert.True(r.HasExpectedSessionIdentity);
+        Assert.Equal(2, r.ExpectedSessionId);
+        Assert.Equal(133500000000000000L, r.ExpectedLogonTimeFileTimeUtc);
+    }
+
+    [Fact]
+    public void 代理只接受会话号和登录时间精确匹配()
+    {
+        Assert.True(IsExpectedSessionIdentity(
+            7, 133500000000000000L, 7, true, 133500000000000000L));
+        Assert.False(IsExpectedSessionIdentity(
+            7, 133500000000000000L, 8, true, 133500000000000000L));
+        Assert.False(IsExpectedSessionIdentity(
+            7, 133500000000000000L, 7, false, 0));
+        Assert.False(IsExpectedSessionIdentity(
+            7, 133500000000000000L, 7, true, 133500000000000001L));
+        Assert.False(IsExpectedSessionIdentity(
+            0, 133500000000000000L, 0, true, 133500000000000000L));
+    }
+
+    [Fact]
+    public void 预期会话身份必须成对且为正数()
+    {
+        var missingLogonTime = Read(ParseArguments(new[]
+        {
+            "--control-pipe", "pipe", "--host-session", "1",
+            "--expected-session", "2"
+        }));
+        Assert.False(missingLogonTime.IsValid);
+        Assert.Contains("同时提供", missingLogonTime.ErrorMessage);
+
+        foreach (var malformed in new[]
+                 {
+                     new[] { "0", "133500000000000000" },
+                     new[] { "2", "0" },
+                     new[] { "2", "not-a-filetime" }
+                 })
+        {
+            var r = Read(ParseArguments(new[]
+            {
+                "--control-pipe", "pipe", "--host-session", "1",
+                "--expected-session", malformed[0],
+                "--expected-logon-time", malformed[1]
+            }));
+            Assert.False(r.IsValid);
+            Assert.Contains("预期会话身份", r.ErrorMessage);
+        }
+    }
+
+    [Fact]
+    public void 热键only的托管启动允许携带预期会话身份()
+    {
+        var r = Read(ParseArguments(new[]
+        {
+            "--no-hotkey",
+            "--expected-session", "2",
+            "--expected-logon-time", "133500000000000000"
+        }));
+        Assert.True(r.IsValid);
+        Assert.True(r.HasExpectedSessionIdentity);
+        Assert.Equal(2, r.ExpectedSessionId);
+        Assert.Equal(133500000000000000L, r.ExpectedLogonTimeFileTimeUtc);
+        Assert.Null(r.ControlPipe);
+    }
+
+    [Fact]
+    public void 所有选项必须严格数字且拒绝空白与正号()
+    {
+        foreach (var badHost in new[] { " 1", "1 ", "+1", "0x2" })
+        {
+            var r = Read(ParseArguments(new[] { "--host-session", badHost }));
+            Assert.False(r.IsValid);
+            Assert.Contains("--host-session", r.ErrorMessage);
+        }
+
+        foreach (var badIdentity in new[]
+                 {
+                     new[] { " 2", "133500000000000000" },
+                     new[] { "2", "+133500000000000000" },
+                     new[] { "2", "133500000000000000 " }
+                 })
+        {
+            var r = Read(ParseArguments(new[]
+            {
+                "--no-hotkey",
+                "--expected-session", badIdentity[0],
+                "--expected-logon-time", badIdentity[1]
+            }));
+            Assert.False(r.IsValid);
+            Assert.Contains("预期会话身份", r.ErrorMessage);
+        }
+    }
+
+    [Fact]
+    public void 裸位置参数和空白选项值必须拒绝()
+    {
+        var positional = Read(ParseArguments(new[] { "--no-hotkey", "not-an-option" }));
+        Assert.False(positional.IsValid);
+        Assert.Contains("位置参数", positional.ErrorMessage);
+
+        var whitespacePipe = Read(ParseArguments(new[]
+        {
+            "--control-pipe", "   ", "--host-session", "1"
+        }));
+        Assert.False(whitespacePipe.IsValid);
+        Assert.Contains("--control-pipe", whitespacePipe.ErrorMessage);
+    }
+
+    [Fact]
+    public void 互斥热键选项同时出现必须拒绝()
+    {
+        var r = Read(ParseArguments(new[]
+        {
+            "--hotkey", "Ctrl+Q", "--no-hotkey"
+        }));
+        Assert.False(r.IsValid);
+        Assert.Contains("不能同时", r.ErrorMessage);
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -34,8 +35,8 @@ namespace DesktopTwin.Services;
 internal sealed class SessionAgentService : IDisposable
 {
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    private const string RunValueName = "DesktopTwinSessionAgent";
-    private const string AgentFileName = "DesktopTwin.Agent.exe";
+    internal const string RunValueName = "DesktopTwinSessionAgent";
+    internal const string AgentFileName = "DesktopTwin.Agent.exe";
     private const string AgentResourceName = "DesktopTwin.Agent.exe";
     private const string RequestFileName = "uu-switch-request.json";
     private const string HeartbeatFileName = "session-agent-heartbeat.txt";
@@ -93,6 +94,17 @@ internal sealed class SessionAgentService : IDisposable
         Unknown
     }
 
+    /// <summary>
+    /// 一次启动/复用/终止周期内唯一可信的子会话身份：会话号 + 该次登录时间。
+    ///
+    /// 会话号会在旧会话退出后被系统复用，只比会话号会把新会话当成旧会话。
+    /// 登录时间读不到时身份不完整，调用方必须失败关闭，不能退化成「按会话号操作」。
+    /// </summary>
+    internal readonly record struct ChildSessionIdentity(uint SessionId, DateTime LogonTimeUtc)
+    {
+        internal bool IsComplete => SessionId > 0 && LogonTimeUtc != default;
+    }
+
     private readonly string _dataDirectory;
 
     /// <summary>
@@ -137,6 +149,41 @@ internal sealed class SessionAgentService : IDisposable
     /// 分身端 exe 的落地路径。
     /// </summary>
     public string AgentPath => Path.Combine(_dataDirectory, AgentFileName);
+
+    /// <summary>
+    /// 默认安装位置下的分身端路径。启动项扫描与启动项守卫都必须精确排除它，
+    /// 否则守卫会把显式拉起的控制通道当成用户启动程序终止。
+    /// </summary>
+    internal static string DefaultAgentPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "DesktopTwin",
+        AgentFileName);
+
+    /// <summary>
+    /// 判断一个路径是否正是指向默认安装位置的分身端。只做完整路径比较，
+    /// 不接受仅文件名相同或位于相邻目录的程序。
+    /// </summary>
+    internal static bool IsDefaultAgentPath(string? candidate)
+    {
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return false;
+        }
+
+        try
+        {
+            var expanded = Environment.ExpandEnvironmentVariables(candidate.Trim().Trim('"'));
+            return string.Equals(
+                Path.GetFullPath(expanded),
+                Path.GetFullPath(DefaultAgentPath),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException
+                                              or PathTooLongException or System.Security.SecurityException)
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// 请求文件路径。
@@ -260,24 +307,29 @@ internal sealed class SessionAgentService : IDisposable
         // 否则轮询在等待旧进程退出时重入，会再下发一个抢不到互斥体的进程。
         lock (_agentStartSync)
         {
-            if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
+            // 整个周期只认这一次捕获的 sessionId + logonTime。会话号可能被系统
+            // 复用，任何后续探测、终止和启动都必须基于同一身份；身份变化立即失败关闭。
+            if (!TryCaptureChildSessionIdentity(out var identity, out var identityError))
             {
-                AppLog.Warn("无法确认 RDP Child Session 状态，本次不下发分身端启动任务。");
-                return false;
-            }
-
-            if (sessionId is null)
-            {
-                AppLog.Info("分身会话尚未创建，分身端会在下次登录时由自启项拉起。");
+                AppLog.Warn(identityError);
                 return false;
             }
 
             // 只往「已经登录完成」的会话里拉：RDP 刚连上、桌面还没起来时下发任务，
             // 任务计划程序会把进程起在一个没有交互桌面的会话里，进程活不下来，
             // 却会让主程序以为「已经拉起过」。
-            if (!ChildSessionNativeMethods.IsSessionActive(sessionId.Value))
+            if (!ChildSessionNativeMethods.TryGetSessionState(identity.SessionId, out var sessionState))
             {
-                AppLog.Info($"分身会话 {sessionId} 还没进入 Active 状态，等登录完成后再拉起分身端。");
+                AppLog.Warn(
+                    $"无法确认分身会话 {DescribeIdentity(identity)} 的连接状态，本次不下发分身端启动任务。");
+                return false;
+            }
+
+            if (sessionState != 0)
+            {
+                AppLog.Info(
+                    $"分身会话 {DescribeIdentity(identity)} 还没进入 Active 状态"
+                    + $"（当前状态 {sessionState}），等登录完成后再拉起分身端。");
                 return false;
             }
 
@@ -292,7 +344,7 @@ internal sealed class SessionAgentService : IDisposable
                 // 参数或代理文件变过：不能相信 HasLiveAgentProcess 的缓存，必须重新
                 // 枚举当前子会话。只有精确匹配 AgentPath 的旧进程才允许被终止；
                 // 任何身份/路径不可读或不匹配都失败关闭，不能再拉起重复进程。
-                if (!TryStopExistingAgentProcess(sessionId.Value, out var foundExisting))
+                if (!TryStopExistingAgentProcess(identity, out var foundExisting))
                 {
                     return false;
                 }
@@ -304,10 +356,18 @@ internal sealed class SessionAgentService : IDisposable
             }
             else
             {
+                // 探测前先确认身份：不能拿旧快照去枚举一个已经被重建的同号会话，
+                // 否则会把新会话里的代理当成旧会话的代理复用或跳过。
+                if (!TryConfirmChildSessionIdentity(identity, out var probeIdentityError))
+                {
+                    AppLog.Warn(probeIdentityError + " 本次不下发分身端启动任务。");
+                    return false;
+                }
+
                 // 不能复用 HasLiveAgentProcess 的 3 秒缓存：缓存里的 true 可能来自
                 // 同会话中路径相同的旧进程，而缓存过期前进程可能已经被替换。这里重新
-                // 枚举一次，并且只有「会话 + 完整镜像路径」都匹配才算已在运行。
-                var presence = ProbeAgentProcess();
+                // 枚举一次，并且只有「已捕获的会话 + 完整镜像路径」都匹配才算已在运行。
+                var presence = ProbeAgentProcess(identity);
                 if (presence == AgentProcessPresence.Matching)
                 {
                     // 同参数代理已在运行，继续复用；只有 NeedsRestart 才进入替换流程。
@@ -332,15 +392,37 @@ internal sealed class SessionAgentService : IDisposable
                 }
             }
 
+            // 启动前最后一次确认：捕获身份之后会话可能已经重建或复用。
+            // 不确认就下发任务，可能把代理起进已经消失的旧会话。
+            if (!TryConfirmChildSessionIdentity(identity, out var launchIdentityError))
+            {
+                AppLog.Warn(launchIdentityError + " 本次不下发分身端启动任务。");
+                return false;
+            }
+
             var ok = ChildSessionProcessLauncher.RunInSession(
-                sessionId.Value,
+                identity.SessionId,
+                identity.LogonTimeUtc,
                 AgentPath,
-                BuildAgentArguments(),
+                BuildManagedAgentArguments(identity),
                 taskNamePrefix: "DesktopTwin-SessionAgent-");
 
+            // 启动器在登记任务前复核会话号与登录时间；分身端进程启动后还会
+            // 自校验一次身份，避免会话号在两次检查之间被系统复用。这里再复核
+            // 一次，确保本次启动结果确实属于最初捕获的会话。
+            // 身份已经变化时不能把结果当作成功：清掉 NeedsRestart 或进入启动宽限期
+            // 会让下一次轮询漏掉新会话，从而漏启动。
+            if (ok && !TryConfirmChildSessionIdentity(identity, out var postLaunchIdentityError))
+            {
+                AppLog.Warn(
+                    "分身端启动任务已下发，但完成后无法再次确认原会话身份："
+                    + postLaunchIdentityError);
+                return false;
+            }
+
             AppLog.Info(ok
-                ? Locale.Format("Agent.Started", sessionId)
-                : Locale.Format("Agent.StartFailed", sessionId));
+                ? Locale.Format("Agent.Started", identity.SessionId)
+                : Locale.Format("Agent.StartFailed", identity.SessionId));
 
             if (ok)
             {
@@ -414,21 +496,27 @@ internal sealed class SessionAgentService : IDisposable
         }
 
         _lastAgentProbeTicks = now;
-        _lastAgentProbeResult = ProbeAgentProcess() == AgentProcessPresence.Matching;
+        if (!TryCaptureChildSessionIdentity(out var identity, out _)
+            || !TryConfirmChildSessionIdentity(identity, out _))
+        {
+            // 身份不完整或已变化时既不能假定在线，也不能让上一次缓存的 true 继续生效。
+            _lastAgentProbeResult = false;
+            return false;
+        }
+
+        _lastAgentProbeResult = ProbeAgentProcess(identity) == AgentProcessPresence.Matching;
         return _lastAgentProbeResult;
     }
 
-    private AgentProcessPresence ProbeAgentProcess()
+    /// <summary>
+    /// 只使用调用方捕获并确认过的会话身份枚举候选进程，绝不自行查询 WTS、
+    /// 也绝不把目标换成「当前查到」的另一个会话。身份不完整时返回 Unknown 失败关闭。
+    /// </summary>
+    private AgentProcessPresence ProbeAgentProcess(ChildSessionIdentity identity)
     {
-        if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
+        if (!identity.IsComplete)
         {
-            // WTS 查询失败与「确认没有子会话」必须区分：前者不能触发一次盲目启动。
             return AgentProcessPresence.Unknown;
-        }
-
-        if (sessionId is null)
-        {
-            return AgentProcessPresence.Absent;
         }
 
         var processName = Path.GetFileNameWithoutExtension(AgentFileName);
@@ -472,7 +560,7 @@ internal sealed class SessionAgentService : IDisposable
                     continue;
                 }
 
-                if ((uint)processSessionId.Value != sessionId.Value)
+                if ((uint)processSessionId.Value != identity.SessionId)
                 {
                     continue;
                 }
@@ -501,7 +589,7 @@ internal sealed class SessionAgentService : IDisposable
             }
         }
 
-        return ClassifyAgentProcessPresence(AgentPath, sessionId.Value, identities);
+        return ClassifyAgentProcessPresence(AgentPath, identity, identities);
     }
 
     /// <summary>
@@ -511,11 +599,27 @@ internal sealed class SessionAgentService : IDisposable
     /// 或代理文件时，决策必须基于本次重新枚举。任何会阻止安全判断的情况都返回
     /// false，让调用方失败关闭，而不是再拉起一个抢不到单实例互斥体的进程。
     /// </summary>
-    /// <param name="sessionId">目标 WTS 子会话。</param>
+    /// <param name="identity">本次周期已捕获、且每次关键操作前都会复核的会话身份。</param>
     /// <param name="foundExisting">是否发现并尝试终止了至少一个精确匹配的旧代理。</param>
-    private bool TryStopExistingAgentProcess(uint sessionId, out bool foundExisting)
+    private bool TryStopExistingAgentProcess(
+        ChildSessionIdentity identity,
+        out bool foundExisting)
     {
         foundExisting = false;
+
+        if (!identity.IsComplete)
+        {
+            AppLog.Warn(
+                "已捕获的分身会话身份不完整，无法安全识别旧分身端；本次不下发启动任务。");
+            return false;
+        }
+
+        // 进入枚举前先确认：拿旧快照去枚举同号的新会话，可能误杀新会话里的代理。
+        if (!TryConfirmChildSessionIdentity(identity, out var stopIdentityError))
+        {
+            AppLog.Warn(stopIdentityError + " 本次不终止旧分身端，也不下发启动任务。");
+            return false;
+        }
 
         Process[] candidates;
         try
@@ -531,7 +635,7 @@ internal sealed class SessionAgentService : IDisposable
             return false;
         }
 
-        var matching = new List<Process>();
+        var matching = new List<(Process Process, long CreationTimeUtc)>();
         try
         {
             foreach (var process in candidates)
@@ -554,7 +658,7 @@ internal sealed class SessionAgentService : IDisposable
 
                 // 主会话（或任何其他会话）里的同名进程都不是本次替换目标，
                 // 也绝不允许被终止。只有目标子会话内的候选才继续读取镜像路径。
-                if ((uint)processSessionId != sessionId)
+                if ((uint)processSessionId != identity.SessionId)
                 {
                     continue;
                 }
@@ -570,22 +674,41 @@ internal sealed class SessionAgentService : IDisposable
                                                       or System.Security.SecurityException)
                 {
                     AppLog.Warn(
-                        $"无法读取子会话 {sessionId} 内分身端候选进程 {process.Id} 的完整路径，为避免误杀或重复启动，本次不下发启动任务。",
+                        $"无法读取分身会话 {DescribeIdentity(identity)} 内候选进程 {process.Id} 的完整路径，"
+                        + "为避免误杀或重复启动，本次不下发启动任务。",
                         exception);
                     return false;
                 }
 
-                if (!IsMatchingAgentProcess(AgentPath, sessionId, processSessionId, processPath))
+                if (!IsMatchingAgentProcess(AgentPath, identity, processSessionId, processPath))
                 {
                     // 同名但不是 AgentPath（例如 .old 退役文件或另一个目录的副本）
                     // 仍可能持有同名单实例互斥体。不杀它，但也绝不并发拉起新代理。
                     AppLog.Warn(
-                        $"子会话 {sessionId} 内的同名进程 {process.Id} 不匹配代理完整路径："
-                        + $"期望 {AgentPath}，实际 {processPath ?? "<无法读取>"}。本次不下发启动任务。");
+                        $"分身会话 {DescribeIdentity(identity)} 内的同名进程 {process.Id} "
+                        + $"不匹配代理完整路径：期望 {AgentPath}，实际 {processPath ?? "<无法读取>"}。"
+                        + "本次不下发启动任务。");
                     return false;
                 }
 
-                matching.Add(process);
+                long creationTimeUtc;
+                try
+                {
+                    creationTimeUtc = process.StartTime.ToUniversalTime().ToFileTimeUtc();
+                }
+                catch (Exception exception) when (exception is InvalidOperationException
+                                                      or System.ComponentModel.Win32Exception
+                                                      or NotSupportedException
+                                                      or System.Security.SecurityException)
+                {
+                    AppLog.Warn(
+                        $"无法读取分身会话 {DescribeIdentity(identity)} 内候选进程 {process.Id} 的创建时间，"
+                        + "无法在 PID 复用时保证只终止原进程，本次不下发启动任务。",
+                        exception);
+                    return false;
+                }
+
+                matching.Add((process, creationTimeUtc));
             }
 
             if (matching.Count == 0)
@@ -593,34 +716,17 @@ internal sealed class SessionAgentService : IDisposable
                 return true;
             }
 
-            foundExisting = true;
-            foreach (var process in matching)
+            // 枚举进程和读镜像路径都可能耗时；真正动刀前再复核一次身份。
+            // 旧会话已经注销、同号会话已经重建时，绝不终止新会话里的代理。
+            if (!TryConfirmChildSessionIdentity(identity, out var killIdentityError))
             {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        // 只结束精确匹配的代理本身，不能顺带结束它的子进程。
-                        process.Kill(entireProcessTree: false);
-                    }
-                }
-                catch (Exception exception) when (exception is InvalidOperationException
-                                                      or System.ComponentModel.Win32Exception
-                                                      or NotSupportedException
-                                                      or System.Security.SecurityException)
-                {
-                    if (!IsProcessExited(process))
-                    {
-                        AppLog.Warn(
-                            $"终止旧分身端进程 {process.Id} 失败，本次不下发启动任务。",
-                            exception);
-                        return false;
-                    }
-                }
+                AppLog.Warn(killIdentityError + " 本次不终止旧分身端，也不下发启动任务。");
+                return false;
             }
 
+            foundExisting = true;
             var started = Environment.TickCount64;
-            foreach (var process in matching)
+            foreach (var target in matching)
             {
                 var remaining = AgentExitTimeoutMilliseconds
                     - (int)Math.Min(
@@ -629,37 +735,31 @@ internal sealed class SessionAgentService : IDisposable
                 if (remaining <= 0)
                 {
                     AppLog.Warn(
-                        $"等待旧分身端进程 {process.Id} 退出超时（{AgentExitTimeoutMilliseconds} 毫秒），"
+                        $"等待旧分身端进程 {target.Process.Id} 退出超时（{AgentExitTimeoutMilliseconds} 毫秒），"
                         + "本次不下发启动任务。");
                     return false;
                 }
 
-                bool exited;
-                try
-                {
-                    exited = process.WaitForExit(remaining);
-                }
-                catch (Exception exception) when (exception is InvalidOperationException
-                                                      or System.ComponentModel.Win32Exception
-                                                      or NotSupportedException
-                                                      or System.Security.SecurityException)
-                {
-                    AppLog.Warn(
-                        $"等待旧分身端进程 {process.Id} 退出失败，本次不下发启动任务。",
-                        exception);
-                    return false;
-                }
-
-                if (!exited)
+                // 在同一个进程句柄上复核创建时间、镜像路径和会话号，再终止并等待。
+                // 这样即使 PID 在两次检查之间被复用，也绝不会向新进程发出终止请求。
+                if (!ProcessNativeMethods.TryTerminateProcessExact(
+                        target.Process.Id,
+                        identity.SessionId,
+                        target.CreationTimeUtc,
+                        AgentPath,
+                        remaining,
+                        out _,
+                        out var errorCode))
                 {
                     AppLog.Warn(
-                        $"等待旧分身端进程 {process.Id} 退出超时（{AgentExitTimeoutMilliseconds} 毫秒），"
+                        $"终止或等待旧分身端进程 {target.Process.Id} 失败（Win32 {errorCode}），"
                         + "本次不下发启动任务。");
                     return false;
                 }
             }
 
-            AppLog.Info($"已终止 {matching.Count} 个旧分身端进程，并确认其退出。");
+            AppLog.Info(
+                $"已在 {DescribeIdentity(identity)} 终止 {matching.Count} 个旧分身端进程，并确认其退出。");
             return true;
         }
         finally
@@ -671,46 +771,32 @@ internal sealed class SessionAgentService : IDisposable
         }
     }
 
-    private static bool IsProcessExited(Process process)
-    {
-        try
-        {
-            return process.HasExited;
-        }
-        catch (Exception exception) when (exception is InvalidOperationException
-                                              or System.ComponentModel.Win32Exception
-                                              or NotSupportedException
-                                              or System.Security.SecurityException)
-        {
-            return false;
-        }
-    }
-
     /// <summary>
     /// 判断一个进程是否是本次可替换的分身端。
     ///
     /// 纯函数，不枚举进程、不访问文件。只有同时满足以下不变量才返回 true：
-    /// 目标会话与进程会话都为正数且相同；期望路径和实际镜像路径都是规范化后的
-    /// 完整路径；两者按 Windows 大小写不敏感语义完全相等。任何空/无效路径都拒绝。
+    /// 捕获的会话身份完整且会话号为正数；进程会话与捕获会话号相同；期望路径和
+    /// 实际镜像路径都是规范化后的完整路径；两者按 Windows 大小写不敏感语义完全相等。
+    /// 任何空/无效路径或身份都拒绝。
     /// </summary>
     internal static bool IsMatchingAgentProcess(
         string? expectedAgentPath,
-        uint childSessionId,
+        ChildSessionIdentity identity,
         int? processSessionId,
         string? processImagePath)
     {
-        if (childSessionId == 0 || processSessionId is null || processSessionId <= 0)
+        if (!identity.IsComplete || processSessionId is null || processSessionId <= 0)
         {
             return false;
         }
 
-        if ((uint)processSessionId.Value != childSessionId)
+        if ((uint)processSessionId.Value != identity.SessionId)
         {
             return false;
         }
 
-        return TryNormalizeFullPath(expectedAgentPath, out var expectedPath)
-               && TryNormalizeFullPath(processImagePath, out var actualPath)
+        return ProcessNativeMethods.TryNormalizeImagePath(expectedAgentPath, out var expectedPath)
+               && ProcessNativeMethods.TryNormalizeImagePath(processImagePath, out var actualPath)
                && string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -722,12 +808,12 @@ internal sealed class SessionAgentService : IDisposable
     /// </summary>
     internal static AgentProcessPresence ClassifyAgentProcessPresence(
         string? expectedAgentPath,
-        uint childSessionId,
+        ChildSessionIdentity identity,
         IEnumerable<(int? SessionId, string? ImagePath)> candidates)
     {
         ArgumentNullException.ThrowIfNull(candidates);
-        if (childSessionId == 0
-            || !TryNormalizeFullPath(expectedAgentPath, out var expectedPath))
+        if (!identity.IsComplete
+            || !ProcessNativeMethods.TryNormalizeImagePath(expectedAgentPath, out var expectedPath))
         {
             return AgentProcessPresence.Unknown;
         }
@@ -742,12 +828,12 @@ internal sealed class SessionAgentService : IDisposable
                 continue;
             }
 
-            if ((uint)candidate.SessionId.Value != childSessionId)
+            if ((uint)candidate.SessionId.Value != identity.SessionId)
             {
                 continue;
             }
 
-            if (!TryNormalizeFullPath(candidate.ImagePath, out var actualPath))
+            if (!ProcessNativeMethods.TryNormalizeImagePath(candidate.ImagePath, out var actualPath))
             {
                 hasUnknown = true;
                 continue;
@@ -769,32 +855,171 @@ internal sealed class SessionAgentService : IDisposable
         return hasConflict ? AgentProcessPresence.Conflict : AgentProcessPresence.Absent;
     }
 
-    private static bool TryNormalizeFullPath(string? path, out string normalizedPath)
+    /// <summary>
+    /// 捕获本次周期唯一可信的子会话身份。会话不存在、WTS 查询失败或读不到登录时间
+    /// 都返回 false；拿不到完整身份时必须失败关闭，不能退化成「只按会话号启动」。
+    /// </summary>
+    private static bool TryCaptureChildSessionIdentity(
+        out ChildSessionIdentity identity,
+        out string error)
     {
-        normalizedPath = string.Empty;
-        if (string.IsNullOrWhiteSpace(path))
+        if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
         {
-            return false;
+            return TryBindChildSessionIdentity(
+                querySucceeded: false,
+                queriedSessionId: null,
+                logonTimeUtc: null,
+                out identity,
+                out error);
         }
 
-        try
-        {
-            if (!Path.IsPathFullyQualified(path))
-            {
-                return false;
-            }
-
-            normalizedPath = Path.GetFullPath(path);
-            return Path.IsPathFullyQualified(normalizedPath);
-        }
-        catch (Exception exception) when (exception is ArgumentException
-                                              or NotSupportedException
-                                              or PathTooLongException
-                                              or System.Security.SecurityException)
-        {
-            return false;
-        }
+        var logonTime = sessionId is { } id
+            ? ChildSessionNativeMethods.TryGetSessionLogonTime(id)
+            : null;
+        return TryBindChildSessionIdentity(
+            querySucceeded: true,
+            queriedSessionId: sessionId,
+            logonTimeUtc: logonTime,
+            out identity,
+            out error);
     }
+
+    /// <summary>
+    /// 把一次 WTS 三态查询结果绑定成会话身份。纯函数，不访问 WTS，
+    /// 便于普通单元测试覆盖「查询失败 / 没有会话 / 登录时间不可读」边界。
+    /// </summary>
+    internal static bool TryBindChildSessionIdentity(
+        bool querySucceeded,
+        uint? queriedSessionId,
+        DateTime? logonTimeUtc,
+        out ChildSessionIdentity identity,
+        out string error)
+    {
+        identity = default;
+
+        if (!querySucceeded)
+        {
+            error = "无法查询 RDP Child Session 身份，无法建立稳定的会话身份；"
+                    + "本次不下发分身端启动任务。";
+            return false;
+        }
+
+        if (queriedSessionId is not { } sessionId)
+        {
+            error = "分身会话尚未创建，分身端会在下次登录时由自启项拉起。";
+            return false;
+        }
+
+        if (sessionId == 0)
+        {
+            error = $"WTS 返回了无效的分身会话号 {sessionId}，无法建立稳定的会话身份；"
+                    + "本次不下发分身端启动任务。";
+            return false;
+        }
+
+        if (logonTimeUtc is not { } logonTime || logonTime == default)
+        {
+            error = $"无法确认分身会话 {sessionId} 的登录时间，无法区分会话重建或会话号复用；"
+                    + "本次不下发分身端启动任务。";
+            return false;
+        }
+
+        identity = new ChildSessionIdentity(sessionId, logonTime);
+        error = string.Empty;
+        return true;
+    }
+
+    /// <summary>
+    /// 重新确认当前子会话仍是捕获时的那一个。任何查询失败、会话消失、会话号变化
+    /// 或登录时间不可读/变化都返回 false，由调用方失败关闭。
+    /// </summary>
+    private static bool TryConfirmChildSessionIdentity(
+        ChildSessionIdentity expected,
+        out string error)
+    {
+        if (!ChildSessionNativeMethods.TryQueryChildSessionId(out var sessionId))
+        {
+            return TryValidateChildSessionIdentity(
+                expected,
+                currentQuerySucceeded: false,
+                currentSessionId: null,
+                currentLogonTimeUtc: null,
+                out error);
+        }
+
+        var currentLogonTime = sessionId is { } id
+            ? ChildSessionNativeMethods.TryGetSessionLogonTime(id)
+            : null;
+        return TryValidateChildSessionIdentity(
+            expected,
+            currentQuerySucceeded: true,
+            currentSessionId: sessionId,
+            currentLogonTimeUtc: currentLogonTime,
+            out error);
+    }
+
+    /// <summary>
+    /// 纯身份校验边界：只比较已捕获身份与重新查询到的结果，不访问 WTS。
+    /// 登录时间不可读时失败关闭；绝不在会话号相同但登录时间不同的情况下继续。
+    /// </summary>
+    internal static bool TryValidateChildSessionIdentity(
+        ChildSessionIdentity expected,
+        bool currentQuerySucceeded,
+        uint? currentSessionId,
+        DateTime? currentLogonTimeUtc,
+        out string error)
+    {
+        if (!expected.IsComplete)
+        {
+            error = "已捕获的分身会话身份不完整（会话 "
+                    + $"{expected.SessionId}，登录时间 {FormatLogonTime(expected.LogonTimeUtc)}），"
+                    + "本次操作失败关闭。";
+            return false;
+        }
+
+        if (!currentQuerySucceeded)
+        {
+            error = "无法重新确认分身会话身份（WTS Child Session 查询失败），本次操作失败关闭。";
+            return false;
+        }
+
+        if (currentSessionId is not { } sessionId)
+        {
+            error = $"分身会话已消失（捕获时 {DescribeIdentity(expected)}），本次操作失败关闭。";
+            return false;
+        }
+
+        if (sessionId != expected.SessionId)
+        {
+            error = $"分身会话已从 {DescribeIdentity(expected)} 变为会话 {sessionId}，"
+                    + "本次操作失败关闭。";
+            return false;
+        }
+
+        if (currentLogonTimeUtc is not { } logonTime || logonTime == default)
+        {
+            error = $"无法确认分身会话 {sessionId} 的登录时间，无法排除会话重建或会话号复用；"
+                    + "本次操作失败关闭。";
+            return false;
+        }
+
+        if (logonTime.Ticks != expected.LogonTimeUtc.Ticks)
+        {
+            error = $"分身会话 {sessionId} 已重建或会话号被复用（登录时间从 "
+                    + $"{FormatLogonTime(expected.LogonTimeUtc)} 变为 {FormatLogonTime(logonTime)}），"
+                    + "本次操作失败关闭。";
+            return false;
+        }
+
+        error = string.Empty;
+        return true;
+    }
+
+    private static string DescribeIdentity(ChildSessionIdentity identity) =>
+        $"会话 {identity.SessionId}（登录时间 {FormatLogonTime(identity.LogonTimeUtc)}）";
+
+    private static string FormatLogonTime(DateTime logonTimeUtc) =>
+        logonTimeUtc == default ? "<未知>" : logonTimeUtc.ToString("O");
 
     /// <summary>
     /// 只看心跳文件判断分身端是否还在写心跳（不含启动宽限）。
@@ -973,14 +1198,54 @@ internal sealed class SessionAgentService : IDisposable
             process.SessionId);
     }
 
+    /// <summary>
+    /// 显式下发启动任务时，把宿主捕获的会话身份一并交给分身端。
+    /// 自启项不携带这组参数，因为它必须能在下一次登录时启动；只有宿主主动
+    /// 拉起的代理才需要证明自己仍运行在预期的那个会话里。
+    /// </summary>
+    private string BuildManagedAgentArguments(ChildSessionIdentity identity)
+    {
+        if (!identity.IsComplete)
+        {
+            throw new ArgumentException("显式启动分身端需要完整的会话登录身份。", nameof(identity));
+        }
+
+        var process = Process.GetCurrentProcess();
+        return BuildAgentArguments(
+            _hotkeyArgument,
+            _controlPipeArgument,
+            process.SessionId,
+            identity.SessionId,
+            identity.LogonTimeUtc);
+    }
+
     internal static string BuildAgentArguments(
         string? hotkey,
         string? controlPipe,
-        int hostSessionId = 0)
+        int hostSessionId = 0,
+        uint? expectedSessionId = null,
+        DateTime? expectedLogonTimeUtc = null)
     {
         if (!string.IsNullOrWhiteSpace(controlPipe) && hostSessionId <= 0)
         {
             throw new ArgumentException("控制通道必须携带正整数宿主会话身份。", nameof(hostSessionId));
+        }
+
+        if (expectedSessionId.HasValue != expectedLogonTimeUtc.HasValue)
+        {
+            throw new ArgumentException("会话身份必须同时包含会话号与登录时间。");
+        }
+
+        if (expectedSessionId is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(expectedSessionId), "会话号必须为正整数。");
+        }
+
+        if (expectedLogonTimeUtc is { } logonTime && logonTime == default)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(expectedLogonTimeUtc),
+                "登录时间必须为有效的 UTC 时间。");
         }
 
         var builder = new StringBuilder();
@@ -997,6 +1262,14 @@ internal sealed class SessionAgentService : IDisposable
         {
             builder.Append(" --control-pipe \"").Append(controlPipe).Append('"');
             builder.Append(" --host-session ").Append(hostSessionId);
+        }
+
+        if (expectedSessionId is { } sessionId && expectedLogonTimeUtc is { } expectedLogon)
+        {
+            builder.Append(" --expected-session ").Append(
+                sessionId.ToString(CultureInfo.InvariantCulture));
+            builder.Append(" --expected-logon-time ").Append(
+                expectedLogon.ToFileTimeUtc().ToString(CultureInfo.InvariantCulture));
         }
 
         return builder.ToString();

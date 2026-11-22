@@ -739,6 +739,37 @@ public sealed class StartupSnoozeServiceTests
     }
 
     [Fact]
+    public void 启动项守卫不把分身端控制通道当作用户启动项()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-guard-agent-" + Guid.NewGuid().ToString("N"));
+        System.IO.Directory.CreateDirectory(directory);
+        try
+        {
+            var nearMatch = Path.Combine(directory, SessionAgentService.AgentFileName);
+            var targets = StartupGuardService.NormalizeTargets(
+            [
+                SessionAgentService.DefaultAgentPath,
+                nearMatch
+            ]);
+
+            Assert.DoesNotContain(SessionAgentService.DefaultAgentPath, targets);
+            Assert.Contains(nearMatch, targets);
+
+            // 控制通道的 Run 值本身仍必须进入启动项关停日志：只有枚举阶段统一过滤
+            // null，不能为 DesktopTwinSessionAgent 开特例，否则分身后随机启动它会
+            // 在启动隔离期间形成未受控的控制端副本。
+            Assert.Equal("DesktopTwinSessionAgent", SessionAgentService.RunValueName);
+            Assert.True(StartupSnoozeService.IsCollectableRunValueName(SessionAgentService.RunValueName));
+        }
+        finally
+        {
+            System.IO.Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void 启动项守卫只终止目标会话且路径必须精确匹配()
     {
         var exact = new HashSet<string>(StringComparer.OrdinalIgnoreCase)

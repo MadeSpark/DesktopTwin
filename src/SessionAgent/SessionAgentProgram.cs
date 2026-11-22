@@ -54,6 +54,24 @@ namespace DesktopTwinSessionAgent
         private static System.Windows.Forms.Timer _hudTimer;
         private static bool _registered;
 
+        /// <summary>
+        /// 代理端会话身份的唯一匹配规则：会话号必须相等，登录时间必须成功
+        /// 读取且 FILETIME 精确相等。任何未知状态都返回 false。
+        /// </summary>
+        internal static bool IsExpectedSessionIdentity(
+            int expectedSessionId,
+            long expectedLogonTimeFileTimeUtc,
+            int actualSessionId,
+            bool hasActualLogonTime,
+            long actualLogonTimeFileTimeUtc)
+        {
+            return expectedSessionId > 0
+                && expectedLogonTimeFileTimeUtc > 0
+                && actualSessionId == expectedSessionId
+                && hasActualLogonTime
+                && actualLogonTimeFileTimeUtc == expectedLogonTimeFileTimeUtc;
+        }
+
         [STAThread]
         private static int Main(string[] args)
         {
@@ -82,6 +100,38 @@ namespace DesktopTwinSessionAgent
             bool testMode = parsed.TestMode;
 
             Log("代理启动 pid=" + Process.GetCurrentProcess().Id + " 版本=" + typeof(Program).Assembly.GetName().Version);
+
+            // 宿主主动拉起代理时会携带预期的会话身份。计划任务只负责把进程
+            // 放进会话，无法原子地把「会话号 + 登录时间」绑定到 RunEx；如果目标
+            // 会话恰在检查后被系统复用，进程可能落进新会话。这里在代理初始化前
+            // 自校验，身份不符立即退出，绝不写心跳、不启动控制服务或热键。
+            if (parsed.HasExpectedSessionIdentity)
+            {
+                int actualSessionId = Process.GetCurrentProcess().SessionId;
+                long actualLogonTime = 0;
+                bool hasActualLogonTime = actualSessionId == parsed.ExpectedSessionId
+                    && Native.TryGetCurrentSessionLogonTime(out actualLogonTime);
+                if (!IsExpectedSessionIdentity(
+                        parsed.ExpectedSessionId,
+                        parsed.ExpectedLogonTimeFileTimeUtc,
+                        actualSessionId,
+                        hasActualLogonTime,
+                        actualLogonTime))
+                {
+                    Log(
+                        "代理所在会话与宿主预期身份不符，拒绝启动。预期会话="
+                        + parsed.ExpectedSessionId
+                        + "，预期登录时间="
+                        + parsed.ExpectedLogonTimeFileTimeUtc.ToString(CultureInfo.InvariantCulture)
+                        + "，实际会话="
+                        + Process.GetCurrentProcess().SessionId
+                        + "，实际登录时间="
+                        + (actualLogonTime > 0
+                            ? actualLogonTime.ToString(CultureInfo.InvariantCulture)
+                            : "未知"));
+                    return 3;
+                }
+            }
 
             // 只在分身会话里工作。自启项是 HKCU 的，Console 登录时也会执行本程序。
             // 子会话的 WinStation 名固定形如 7a78855482a04fa781dc#0；
@@ -626,6 +676,8 @@ namespace DesktopTwinSessionAgent
     {
         internal const string ControlPipeFlag = "--control-pipe";
         internal const string HostSessionFlag = "--host-session";
+        internal const string ExpectedSessionFlag = "--expected-session";
+        internal const string ExpectedLogonTimeFlag = "--expected-logon-time";
         internal const string DefaultHotkey = "Ctrl+Alt+U";
 
         private static readonly string[] KnownFlags = new string[]
@@ -638,7 +690,9 @@ namespace DesktopTwinSessionAgent
         {
             "--hotkey",
             ControlPipeFlag,
-            HostSessionFlag
+            HostSessionFlag,
+            ExpectedSessionFlag,
+            ExpectedLogonTimeFlag
         };
 
         internal bool IsValid;
@@ -647,6 +701,9 @@ namespace DesktopTwinSessionAgent
         internal string Hotkey;
         internal string ControlPipe;
         internal int HostSessionId;
+        internal int ExpectedSessionId;
+        internal long ExpectedLogonTimeFileTimeUtc;
+        internal bool HasExpectedSessionIdentity;
         internal bool TestMode;
 
         public static SessionAgentArguments Parse(string[] args)
@@ -664,6 +721,13 @@ namespace DesktopTwinSessionAgent
 
             result.NoHotkey = ContainsFlag(args, "--no-hotkey");
             result.TestMode = ContainsFlag(args, "--test");
+            if (result.NoHotkey && ContainsFlag(args, "--hotkey"))
+            {
+                result.IsValid = false;
+                result.ErrorMessage = "--no-hotkey 与 --hotkey 不能同时提供";
+                return result;
+            }
+
             if (!result.NoHotkey)
             {
                 string hotkeyText;
@@ -684,7 +748,7 @@ namespace DesktopTwinSessionAgent
             int hostSessionId = 0;
             bool parsedHostSession = hasHostSession && hostSessionText != null && Int32.TryParse(
                 hostSessionText,
-                NumberStyles.Integer,
+                NumberStyles.None,
                 CultureInfo.InvariantCulture,
                 out hostSessionId);
 
@@ -717,30 +781,90 @@ namespace DesktopTwinSessionAgent
                 return result;
             }
 
+            string expectedSessionText;
+            bool hasExpectedSession = TryReadOptionValue(
+                args,
+                ExpectedSessionFlag,
+                out expectedSessionText);
+            int expectedSessionId = 0;
+            bool parsedExpectedSession = hasExpectedSession
+                && expectedSessionText != null
+                && Int32.TryParse(
+                    expectedSessionText,
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out expectedSessionId);
+
+            string expectedLogonTimeText;
+            bool hasExpectedLogonTime = TryReadOptionValue(
+                args,
+                ExpectedLogonTimeFlag,
+                out expectedLogonTimeText);
+            long expectedLogonTimeFileTimeUtc = 0;
+            bool parsedExpectedLogonTime = hasExpectedLogonTime
+                && expectedLogonTimeText != null
+                && Int64.TryParse(
+                    expectedLogonTimeText,
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out expectedLogonTimeFileTimeUtc);
+
+            // 契约四：预期会话身份必须成对出现。
+            // 两个值都必须是正数；任一缺失或无法解析都拒绝启动，避免把一次
+            // 身份校验误降级成「未提供校验」。热键-only 的显式托管启动同样
+            // 需要这组身份；HKCU 自启项不会携带它。
+            if (hasExpectedSession != hasExpectedLogonTime)
+            {
+                result.IsValid = false;
+                result.ErrorMessage = "预期会话身份必须同时提供会话号和登录时间";
+                return result;
+            }
+
+            if (hasExpectedSession
+                && (!parsedExpectedSession
+                    || expectedSessionId <= 0
+                    || !parsedExpectedLogonTime
+                    || expectedLogonTimeFileTimeUtc <= 0))
+            {
+                result.IsValid = false;
+                result.ErrorMessage = "预期会话身份必须是正整数会话号和有效登录时间";
+                return result;
+            }
+
             result.HostSessionId = parsedHostSession ? hostSessionId : 0;
+            result.ExpectedSessionId = parsedExpectedSession ? expectedSessionId : 0;
+            result.ExpectedLogonTimeFileTimeUtc = parsedExpectedLogonTime
+                ? expectedLogonTimeFileTimeUtc
+                : 0;
+            result.HasExpectedSessionIdentity = hasExpectedSession;
             result.IsValid = true;
             result.ErrorMessage = null;
             return result;
         }
 
-        // 词法校验：每个 '-' 开头的 token 必须是已知选项；已知选项不得重复；
-        // 带值选项的值必须存在、非空、且不是另一个选项。
+        // 词法校验：只接受完整、非重复、带有效值的已知选项。
+        // 命令行是宿主与提权服务之间的安全边界，不能静默跳过任何裸参数：
+        // 支持的位置参数会让拼错、注入或旧版参数悄悄改变进程行为。
         private static bool ValidateLexical(string[] args, out string error)
         {
             error = null;
             for (int i = 0; i < args.Length; i++)
             {
                 string token = args[i];
-                if (!IsOptionLike(token))
-                {
-                    continue;
-                }
-
                 bool knownFlag = ContainsName(KnownFlags, token);
                 bool knownValueOption = ContainsName(KnownValueOptions, token);
+
                 if (!knownFlag && !knownValueOption)
                 {
-                    error = "未知参数 " + token;
+                    if (IsOptionLike(token))
+                    {
+                        error = "未知参数 " + token;
+                    }
+                    else
+                    {
+                        error = "不支持位置参数 " + (token ?? "<null>");
+                    }
+
                     return false;
                 }
 
@@ -750,20 +874,25 @@ namespace DesktopTwinSessionAgent
                     return false;
                 }
 
-                if (knownValueOption)
+                if (knownFlag)
                 {
-                    if (i + 1 >= args.Length)
-                    {
-                        error = token + " 缺少参数值";
-                        return false;
-                    }
+                    continue;
+                }
 
-                    string value = args[i + 1];
-                    if (value.Length == 0 || IsOptionLike(value))
-                    {
-                        error = token + " 缺少有效参数值";
-                        return false;
-                    }
+                // 带值选项必须紧跟一个非空、非选项的值；先推进索引，
+                // 确保该值不会被下一轮再次当成裸参数或选项解析。
+                i++;
+                if (i >= args.Length)
+                {
+                    error = token + " 缺少参数值";
+                    return false;
+                }
+
+                string value = args[i];
+                if (String.IsNullOrWhiteSpace(value) || IsOptionLike(value))
+                {
+                    error = token + " 缺少有效参数值";
+                    return false;
                 }
             }
 
@@ -882,6 +1011,55 @@ namespace DesktopTwinSessionAgent
 
         [DllImport("user32.dll")]
         public static extern bool SetProcessDPIAware();
+
+        /// <summary>
+        /// 读取当前会话的 WTSINFOEX 登录时间（FILETIME）。取不到或结构层级
+        /// 不是 1 时返回 false；调用方必须在身份校验上失败关闭。
+        /// </summary>
+        public static bool TryGetCurrentSessionLogonTime(out long fileTimeUtc)
+        {
+            const int sessionInfoExClass = 25;
+            const int logonTimeOffset = 168;
+            const int logonTimeEndOffset = 176;
+
+            fileTimeUtc = 0;
+            IntPtr buffer;
+            int bytes;
+            if (!WTSQuerySessionInformationW(
+                    IntPtr.Zero,
+                    -1,
+                    sessionInfoExClass,
+                    out buffer,
+                    out bytes)
+                || buffer == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (bytes < logonTimeEndOffset)
+                {
+                    return false;
+                }
+
+                byte[] data = new byte[logonTimeEndOffset];
+                Marshal.Copy(buffer, data, 0, data.Length);
+                uint level = BitConverter.ToUInt32(data, 0);
+                long value = BitConverter.ToInt64(data, logonTimeOffset);
+                if (level != 1 || value <= 0)
+                {
+                    return false;
+                }
+
+                fileTimeUtc = value;
+                return true;
+            }
+            finally
+            {
+                WTSFreeMemory(buffer);
+            }
+        }
 
         public static string CurrentSessionName()
         {

@@ -859,11 +859,19 @@ public partial class MainWindowViewModel : ObservableObject
 
         if (!enabling)
         {
-            _settings.Current.Mcp.Enabled = false;
-            _settings.SaveSoon();
-            McpEnabled = false;
-            ApplyMcpService(notifyUser: true);
-            SyncSessionAgent();
+            // 关闭同样必须走统一安全路径：stop 抛错时仍要落盘 false、刷新 UI，
+            // 并重新同步分身代理，不能因为一次 Dispose 异常跳过后续清理。
+            if (_mcpEnablementCoordinator.Disable(
+                    Locale.Get("Notify.McpDisableFailed.Title"),
+                    Locale.Get("Notify.McpDisableFailed.Message"),
+                    notifyUser: true))
+            {
+                ShowNotification(
+                    Locale.Get("Notify.McpDisabled.Title"),
+                    Locale.Get("Notify.McpDisabled.Message"),
+                    InfoBarSeverity.Informational);
+            }
+
             return;
         }
 
@@ -981,7 +989,17 @@ public partial class MainWindowViewModel : ObservableObject
     internal void Detach()
     {
         _childSessionService.DesktopSizeChanged -= OnDesktopSizeChanged;
-        StopMcpService();
+        try
+        {
+            StopMcpService();
+        }
+        catch (Exception exception)
+        {
+            // 关闭流程已无法再向 UI 回滚；记录后继续释放代理和热键，
+            // 不能因一个 listener 的 Dispose 异常漏掉其余进程内资源。
+            AppLog.Error("关闭窗口时停止 MCP 监听器失败。", exception);
+        }
+
         _globalHotkey?.Dispose();
         _globalHotkey = null;
         _sessionAgent.SwitchRequested -= OnSessionAgentSwitchRequested;
@@ -1557,8 +1575,9 @@ public partial class MainWindowViewModel : ObservableObject
     /// 启动或停止 MCP 环回监听。
     /// </summary>
     /// <param name="rollbackOnFailure">
-    /// 为 false 时失败只停止 MCP 并返回 false，由 <see cref="McpEnablementCoordinator"/>
-    /// 统一执行回滚与通知，避免用户看到两次回滚提示。默认保留内部回滚语义。
+    /// 为 false 时失败只记录并返回 false，停止、回滚和通知全部由
+    /// <see cref="McpEnablementCoordinator"/> 统一执行，避免递归和重复提示。
+    /// 默认保留内部回滚语义。
     /// </param>
     private bool ApplyMcpService(bool notifyUser, bool notifySuccess = true, bool rollbackOnFailure = true)
     {
@@ -1624,48 +1643,29 @@ public partial class MainWindowViewModel : ObservableObject
                 RollbackMcpEnablement(
                     Locale.Get("Notify.McpFailed.Title"),
                     exception.GetBaseException().Message,
-                    notifyUser: true);
+                    notifyUser: true,
+                    failureException: exception);
                 return false;
             }
 
-            // 协调器路径：只保证失败后服务不再监听，回滚状态与通知由协调器统一完成。
-            // 原始异常只在这里落日志，避免统一回滚提示掩盖真实原因。
+            // 协调器路径：停止、状态回滚、同步和唯一通知全部由协调器统一执行。
+            // 这里不得再次回滚或通知，否则会递归并产生双通知。
             AppLog.Error("MCP 控制服务启动失败，将由协调器回滚。", exception);
-            StopMcpService();
             return false;
         }
     }
 
-    private void RollbackMcpEnablement(string title, string message, bool notifyUser)
+    private void RollbackMcpEnablement(
+        string title,
+        string message,
+        bool notifyUser,
+        Exception? failureException = null)
     {
-        StopMcpService();
-        McpEnabled = false;
-        _settings.Current.Mcp.Enabled = false;
-        _settings.SaveSoon();
-        UpdateMcpStatus();
-        AppLog.Error("MCP 启用失败，已回滚。", new InvalidOperationException(message));
-
-        // 第二次同步在回滚路径上不能让异常逃出 Toggle 命令；失败只记录，MCP 保持关闭。
-        try
-        {
-            if (!SyncSessionAgent())
-            {
-                AppLog.Warn("MCP 回滚后未能重新同步分身代理；MCP 仍保持关闭。");
-            }
-        }
-        catch (Exception exception)
-        {
-            AppLog.Warn("MCP 回滚后同步分身代理失败；MCP 仍保持关闭。", exception);
-        }
-
-        if (notifyUser)
-        {
-            ShowNotification(
-                title,
-                message,
-                InfoBarSeverity.Error,
-                TimeSpan.FromSeconds(10));
-        }
+        _mcpEnablementCoordinator.RollbackAfterFailure(
+            title,
+            message,
+            notifyUser,
+            failureException);
     }
 
     /// <summary>
@@ -1692,13 +1692,31 @@ public partial class MainWindowViewModel : ObservableObject
 
     private void StopMcpService()
     {
-        // 先摘掉引用并清状态，再执行可能抛异常的 Dispose：即使释放过程中有异常，
-        // 后续 UI/持久化回滚也不会继续看到“仍在监听”的旧对象。Dispose 自身已在
-        // 内部先停止监听器，再由协调器重试一次。
         var server = _mcpServer;
-        _mcpServer = null;
-        IsMcpListening = false;
-        server?.Dispose();
+        if (server is null)
+        {
+            IsMcpListening = false;
+            return;
+        }
+
+        try
+        {
+            server.Dispose();
+
+            // 只有底层停止成功后才摘掉引用；第一次 Dispose 失败时保留同一个服务，
+            // 协调器的第二次 stop 才能继续尝试停止同一个 TcpListener。
+            if (ReferenceEquals(_mcpServer, server))
+            {
+                _mcpServer = null;
+            }
+
+            IsMcpListening = false;
+        }
+        catch
+        {
+            IsMcpListening = server.IsListening;
+            throw;
+        }
     }
 
     /// <summary>
@@ -2180,21 +2198,18 @@ public partial class MainWindowViewModel : ObservableObject
                 IsWatchModeEnabled = _childSessionService.WatchModeEnabled;
                 UpdateConnectionStatus();
 
-                if (McpEnabled)
-                {
-                    StopMcpService();
-                    McpEnabled = false;
-                    _settings.Current.Mcp.Enabled = false;
-                    _settings.SaveSoon();
-                    UpdateMcpStatus();
-                }
+                var isolationMessage = string.IsNullOrWhiteSpace(e.Message)
+                    ? "输入或启动项隔离失败。"
+                    : e.Message;
+                AppLog.Error("输入或启动项隔离失败，开始关闭 MCP 并注销子会话：" + isolationMessage);
 
-                AppLog.Error("输入或启动项隔离失败，已停止 MCP 并注销子会话：" + e.Message);
-                ShowNotification(
+                // 不按 McpEnabled 门控：开关可能已被写成 false，但 listener 引用或监听
+                // 仍因上一次 stop 失败而残留。统一路径会尽力 stop 两次，并无条件
+                // 持久化 false、关闭 UI、刷新状态，且只发一条含端口残留告警的通知。
+                _mcpEnablementCoordinator.DisableForIsolationFailure(
                     Locale.Get("Notify.IsolationFailed.Title"),
-                    e.Message,
-                    InfoBarSeverity.Error,
-                    TimeSpan.FromSeconds(15));
+                    isolationMessage,
+                    notifyUser: true);
             }));
     }
 
