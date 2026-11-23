@@ -186,4 +186,64 @@ public sealed class ChildSessionNativeTests
             connectionAttemptPending,
             settingsReconnectPending));
     }
+
+    [Fact]
+    public void 可见桌面只接受目标子会话中绝对路径的_explorer()
+    {
+        Assert.True(ChildSessionService.IsExactExplorerCandidate(
+            processSessionId: 7,
+            processImagePath: @"C:\Windows\explorer.exe",
+            expectedSessionId: 7,
+            expectedExplorerPath: @"C:\Windows\explorer.exe"));
+        Assert.True(ChildSessionService.IsExactExplorerCandidate(
+            processSessionId: 7,
+            processImagePath: @"c:\windows\EXPLORER.EXE",
+            expectedSessionId: 7,
+            expectedExplorerPath: @"C:\Windows\explorer.exe"));
+    }
+
+    [Theory]
+    [InlineData(1u, 7u, @"C:\Windows\explorer.exe")]
+    [InlineData(0u, 7u, @"C:\Windows\explorer.exe")]
+    [InlineData(7u, 0u, @"C:\Windows\explorer.exe")]
+    [InlineData(7u, 7u, @"C:\Windows\System32\cmd.exe")]
+    [InlineData(7u, 7u, @"explorer.exe")]
+    [InlineData(7u, 7u, @"..\Windows\explorer.exe")]
+    public void 可见桌面拒绝会话一_零_错误路径和相对路径(
+        uint processSessionId,
+        uint expectedSessionId,
+        string processImagePath)
+    {
+        Assert.False(ChildSessionService.IsExactExplorerCandidate(
+            processSessionId,
+            processImagePath,
+            expectedSessionId,
+            @"C:\Windows\explorer.exe"));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData(null)]
+    public void 可见桌面拒绝缺失的进程路径(string? processImagePath)
+    {
+        Assert.False(ChildSessionService.IsExactExplorerCandidate(
+            7,
+            processImagePath!,
+            7,
+            @"C:\Windows\explorer.exe"));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData(null)]
+    public void 可见桌面拒绝缺失的_explorer_预期路径(string? expectedExplorerPath)
+    {
+        Assert.False(ChildSessionService.IsExactExplorerCandidate(
+            7,
+            @"C:\Windows\explorer.exe",
+            7,
+            expectedExplorerPath!));
+    }
 }

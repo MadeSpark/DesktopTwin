@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -620,17 +621,9 @@ public sealed class ChildSessionService : IDisposable
                 // 单实例软件收到协议 / IPC 调用后还会把窗口拉回主桌面，于是「分身里启动」
                 // 变成「主桌面又冒出来一堆窗口」。连接前先按日志把这些启动源临时关掉。
                 //
-                // 门卫必须在外壳日志落盘之前就存在且校验通过：一旦 Winlogon Shell
-                // 已改向门卫而文件缺失，下一次父会话登录将没有可用外壳。
-                if (!startupAppsEnabled
-                    && !SessionAgentService.TryEnsureShellGateInstalled(
-                        out _,
-                        out var shellGateError))
-                {
-                    throw new InvalidOperationException(
-                        "外壳门卫准备失败，已取消连接：" + shellGateError);
-                }
-
+                // 可见 Explorer 路径不再安装或改写成隐藏外壳门卫。启动项隔离由
+                // Explorer Run/RunOnce 策略完成；连接成功后还必须证明真实的
+                // %WINDIR%\explorer.exe 在本次子会话中运行，否则失败关闭。
                 startupIsolation = await PrepareStartupIsolationAsync(startupAppsEnabled)
                     .ConfigureAwait(true);
                 if (_disposed || startGeneration != _startGeneration)
@@ -677,7 +670,7 @@ public sealed class ChildSessionService : IDisposable
                 StartStartupGuard(
                     startupIsolation.StartupExecutables,
                     startupIsolation.ManagedStartupExecutables);
-                ConnectCore(Locale.Get("Svc.Status.Starting"), startupAppsEnabled);
+                ConnectCore(Locale.Get("Svc.Status.Starting"));
             }
             catch
             {
@@ -1466,14 +1459,15 @@ public sealed class ChildSessionService : IDisposable
                     }
 
                     var existingSessionId = ChildSessionNativeMethods.GetChildSessionIdStrict();
-                    // 替代 shell 已屏蔽 Explorer，注册表 Run/RunOnce/Startup 文件夹
-                    // 不会在分身上执行。这样既不碰火绒等自保护启动项，也仍隔离
-                    // 计划任务和 UWP。已有旧日志中的注册表项继续由恢复路径处理。
+                    // 保留默认可见 Explorer，只用四个精确的 Explorer Run/RunOnce
+                    // 策略跳过注册表与启动文件夹；计划任务和 UWP 仍逐项隔离。
+                    // 这样既不会再出现隐藏门卫造成的黑屏，也不会直接改写
+                    // 火绒等受保护启动项的原始值。
                     return existingSessionId.HasValue
                         ? service.EnsureSnoozedForExistingChildSession(
-                            isolateRegistryStartupEntries: false)
+                            StartupIsolationMode.ExplorerRunPolicies)
                         : service.EnsureSnoozed(
-                            isolateRegistryStartupEntries: false);
+                            StartupIsolationMode.ExplorerRunPolicies);
                 })
                 .ConfigureAwait(true);
         }
@@ -2052,15 +2046,16 @@ public sealed class ChildSessionService : IDisposable
 
     /// <summary>
     /// 无论用户是否允许启动项，都不再使用 RDP 的 StartProgram/WorkDir。
-    /// <c>ConnectToChildSession</c> 会忽略这两个设置；真正可验证的外壳接管是
-    /// 当前用户 Winlogon Shell（启动项隔离时）或默认 Explorer。
+    /// <c>ConnectToChildSession</c> 会忽略这两个设置；登录外壳始终是系统默认的
+    /// %WINDIR%\explorer.exe。启动项隔离改由 Explorer Run/RunOnce 策略完成，
+    /// 连接后再按子会话号、创建时间与最终镜像路径确认 Explorer 确实在运行。
     /// </summary>
     private static void ConfigureRdpShell(MainWindow window)
     {
         window.RdpHost.ClearShellGate();
     }
 
-    private void ConnectCore(string operationMessage, bool startupAppsEnabled)
+    private void ConnectCore(string operationMessage)
     {
         // WTS 查询失败时绝不能当作「没有已有会话」继续新建，否则会重复登录、
         // 重复拉起程序，并破坏启动项隔离的会话边界。
@@ -2501,6 +2496,236 @@ public sealed class ChildSessionService : IDisposable
         return (false, error);
     }
 
+    /// <summary>
+    /// 登录事件之后确认真正的可见桌面已经启动。只接受本次子会话中路径严格等于
+    /// <c>%WINDIR%\explorer.exe</c> 的进程，并在返回成功前再次复核会话身份和
+    /// 进程创建时间，避免 PID 复用或旧会话事件造成误判。
+    /// </summary>
+    private static async Task<(bool Confirmed, string Error)> WaitForExplorerAsync()
+    {
+        const int attempts = 41;
+        var genericError = "未能在分身中确认可见的 Explorer 桌面。";
+        if (!SessionAgentService.TryCaptureChildSessionIdentity(out var identity, out var identityError))
+        {
+            return (false, genericError + identityError);
+        }
+
+        if (!TryGetExpectedExplorerPath(out var expectedExplorerPath))
+        {
+            return (false, genericError + "无法确定 Windows Explorer 的标准路径。");
+        }
+
+        var candidate = default(ProcessNativeMethods.ProcessIdentitySnapshot);
+        var lastError = string.Empty;
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            if (candidate.IsComplete)
+            {
+                if (TryConfirmExplorerCandidate(identity, expectedExplorerPath, candidate, out var confirmError))
+                {
+                    return (true, string.Empty);
+                }
+
+                lastError = confirmError;
+                candidate = default;
+            }
+
+            if (TryFindExplorerInSession(identity, expectedExplorerPath, out var found, out var findError))
+            {
+                candidate = found;
+                lastError = string.Empty;
+            }
+            else
+            {
+                lastError = findError;
+            }
+
+            if (attempt + 1 < attempts)
+            {
+                await Task.Delay(250).ConfigureAwait(true);
+            }
+        }
+
+        // 第 41 次探测可能刚找到候选，但循环随即结束。返回失败前再做一次
+        // 完整的会话与进程身份复核，避免把最后一次成功探测误报为失败。
+        if (candidate.IsComplete)
+        {
+            if (TryConfirmExplorerCandidate(
+                    identity,
+                    expectedExplorerPath,
+                    candidate,
+                    out var finalError))
+            {
+                return (true, string.Empty);
+            }
+
+            lastError = finalError;
+        }
+
+        return (false, string.IsNullOrWhiteSpace(lastError)
+            ? genericError
+            : genericError + lastError);
+    }
+
+    private static bool TryFindExplorerInSession(
+        SessionAgentService.ChildSessionIdentity identity,
+        string expectedExplorerPath,
+        out ProcessNativeMethods.ProcessIdentitySnapshot snapshot,
+        out string error)
+    {
+        snapshot = default;
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName("explorer");
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+                                              or Win32Exception or NotSupportedException)
+        {
+            error = "枚举 Explorer 进程失败：" + exception.Message;
+            return false;
+        }
+
+        try
+        {
+            foreach (var process in processes)
+            {
+                int processId;
+                try
+                {
+                    processId = process.Id;
+                }
+                catch (InvalidOperationException)
+                {
+                    continue;
+                }
+
+                if (!ProcessNativeMethods.TryGetProcessIdentity(
+                        processId,
+                        out var current,
+                        out _)
+                    || !IsExactExplorerCandidate(
+                        current.SessionId,
+                        current.ImagePath,
+                        identity.SessionId,
+                        expectedExplorerPath))
+                {
+                    continue;
+                }
+
+                snapshot = current;
+                error = string.Empty;
+                return true;
+            }
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
+
+        error = "没有找到属于本次子会话的标准 Explorer 进程。";
+        return false;
+    }
+
+    private static bool TryConfirmExplorerCandidate(
+        SessionAgentService.ChildSessionIdentity identity,
+        string expectedExplorerPath,
+        ProcessNativeMethods.ProcessIdentitySnapshot candidate,
+        out string error)
+    {
+        if (!SessionAgentService.TryConfirmChildSessionIdentity(identity, out error))
+        {
+            return false;
+        }
+
+        if (!ProcessNativeMethods.TryGetProcessIdentity(
+                candidate.ProcessId,
+                out var current,
+                out var processError))
+        {
+            error = "无法重新读取 Explorer 进程身份，Win32 错误 " + processError + "。";
+            return false;
+        }
+
+        if (current.SessionId != candidate.SessionId
+            || current.CreationTimeUtc != candidate.CreationTimeUtc
+            || !IsExactExplorerCandidate(
+                current.SessionId,
+                current.ImagePath,
+                identity.SessionId,
+                expectedExplorerPath))
+        {
+            error = "Explorer 进程身份在确认期间发生变化。";
+            return false;
+        }
+
+        // 进程身份读取本身可能与子会话注销/重新登录交错。成功返回前最后再确认
+        // 会话仍属于同一登录，避免旧 Explorer 在 PID 查询期间被新会话复用。
+        if (!SessionAgentService.TryConfirmChildSessionIdentity(identity, out error))
+        {
+            return false;
+        }
+
+        error = string.Empty;
+        return true;
+    }
+
+    /// <summary>
+    /// 严格判定“本次子会话中标准路径的 Explorer”。会话号必须完全一致，
+    /// 路径必须已经归一化并等于预期全路径；任何缺失都返回 false。
+    /// </summary>
+    internal static bool IsExactExplorerCandidate(
+        uint processSessionId,
+        string processImagePath,
+        uint expectedSessionId,
+        string expectedExplorerPath)
+    {
+        if (processSessionId == 0
+            || expectedSessionId == 0
+            || processSessionId != expectedSessionId
+            || string.IsNullOrWhiteSpace(processImagePath)
+            || string.IsNullOrWhiteSpace(expectedExplorerPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!Path.IsPathFullyQualified(processImagePath)
+                || !Path.IsPathFullyQualified(expectedExplorerPath))
+            {
+                return false;
+            }
+
+            return string.Equals(
+                Path.GetFullPath(processImagePath),
+                Path.GetFullPath(expectedExplorerPath),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException
+                                              or NotSupportedException
+                                              or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetExpectedExplorerPath(out string expectedExplorerPath)
+    {
+        expectedExplorerPath = string.Empty;
+        var windowsDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        if (string.IsNullOrWhiteSpace(windowsDirectory))
+        {
+            return false;
+        }
+
+        var candidate = Path.Combine(windowsDirectory, "explorer.exe");
+        return ProcessNativeMethods.TryNormalizeImagePath(candidate, out expectedExplorerPath);
+    }
+
     // RDP 报告连接成功后稍作等待，让新分身会话的桌面初始化完成。
     // 使用 OnLoginComplete 等待实际登录完成，避免依赖固定时长的延时。
     private async void OnRdpLoginCompleted(object? sender, EventArgs e)
@@ -2511,7 +2736,7 @@ public sealed class ChildSessionService : IDisposable
             return;
         }
 
-        // 会话登录事件属于事件到达时的这一代连接。下面的外壳门卫验证可能等待
+        // 会话登录事件属于事件到达时的这一代连接。下面的可见桌面验证可能等待
         // 十秒；这期间用户完全可能注销并重新启动，因此代际必须在这里冻结，
         // 不能在 await 之后读取最新值，否则旧事件会把新会话误判为失败并注销。
         var loginGeneration = Volatile.Read(ref _startGeneration);
@@ -2547,7 +2772,7 @@ public sealed class ChildSessionService : IDisposable
 
         // 输入窗口每次连接都会新建，观看模式需要重新施加到新窗口上。
         // 这里必须读回原生窗口状态，不能只相信设置值；失败立即注销，不能带着
-        // 可接收本机输入的 RDP 窗口继续运行。此步骤必须早于门卫验证的等待。
+        // 可接收本机输入的 RDP 窗口继续运行。此步骤必须早于桌面验证的等待。
         var inputResult = rdpHost.SetInputBlocked(watchMode);
         if (watchMode && inputResult != RdpInputWindowApplyResult.Applied)
         {
@@ -2576,6 +2801,23 @@ public sealed class ChildSessionService : IDisposable
             }
 
             AppLog.Info("已确认分身由 DesktopTwin 隐藏外壳门卫接管。");
+        }
+        else
+        {
+            // 默认路径必须是用户可见的 Windows 桌面。只看到 RDP 登录动画或黑屏
+            // 不能算成功：必须证明本次子会话确实运行了标准的 explorer.exe。
+            var explorer = await WaitForExplorerAsync();
+            if (!explorer.Confirmed)
+            {
+                var sessionId = ChildSessionNativeMethods.TryGetChildSessionId();
+                _ = AbortForIsolationFailureAsync(
+                    sessionId,
+                    "可见桌面验证失败，已注销分身：" + explorer.Error,
+                    loginGeneration);
+                return;
+            }
+
+            AppLog.Info("已确认本次分身运行了标准 Explorer 可见桌面。");
         }
 
         if (!IsCurrentLoginGeneration(

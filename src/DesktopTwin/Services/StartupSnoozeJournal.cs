@@ -1040,6 +1040,43 @@ public sealed class StartupSnoozeTaskEntry
 }
 
 /// <summary>
+/// 一条本次启动隔离期间写入的 Explorer Run/RunOnce 策略。
+///
+/// 可见桌面必须让资源管理器正常启动；这四条策略只让 Explorer 跳过
+/// Run/RunOnce，不会替换登录外壳，也不会逐项修改第三方启动值。
+/// 原值必须精确记录，恢复时只能删除或还原本程序确认写入的 DWORD 1。
+/// </summary>
+public sealed class StartupSnoozeExplorerRunPolicyEntry
+{
+    /// <summary>配置单元，只允许 <c>CurrentUser</c> 或 <c>LocalMachine</c>。</summary>
+    public string Hive { get; set; } = "CurrentUser";
+
+    /// <summary>策略值名称，只允许四个固定的 Run/RunOnce 开关。</summary>
+    public string ValueName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 写入前策略键是否存在。恢复时只删除本程序写入的值，不删除本次新建的
+    /// 空策略键，以免改动策略键本身的既有语义。
+    /// </summary>
+    public bool OriginalKeyExists { get; set; }
+
+    /// <summary>写入前策略值是否存在。</summary>
+    public bool OriginalExists { get; set; }
+
+    /// <summary>写入前策略值；原值不存在时为 <see langword="null"/>。</summary>
+    public int? OriginalValue { get; set; }
+
+    /// <summary>是否已经准备写入；必须在写入策略前落盘。</summary>
+    public bool WriteAttempted { get; set; }
+
+    /// <summary>写入后是否已严格回读确认。</summary>
+    public bool WriteConfirmed { get; set; }
+
+    /// <summary>本程序写入并确认的值，固定为 1。</summary>
+    public int WrittenValue { get; set; } = 1;
+}
+
+/// <summary>
 /// 一条本次启动隔离期间接管的当前用户 Winlogon Shell 值。
 ///
 /// Winlogon 的 Shell 只在会话登录时读取；把它临时指向已验证的门卫程序，
@@ -1109,9 +1146,10 @@ public sealed class StartupSnoozeJournal
 {
     /// <summary>
     /// 日志格式版本。版本 2 增加计划任务写入前标记；版本 3 要求计划任务身份；
-    /// 版本 4 增加当前用户 Winlogon Shell 的精确接管记录。
+    /// 版本 4 增加当前用户 Winlogon Shell 的精确接管记录；版本 5 增加
+    /// Explorer Run/RunOnce 策略记录。旧版本日志仍必须能够恢复。
     /// </summary>
-    public int Version { get; set; } = 4;
+    public int Version { get; set; } = 5;
 
     /// <summary>创建时间。</summary>
     public DateTimeOffset CreatedAt { get; set; }
@@ -1130,6 +1168,12 @@ public sealed class StartupSnoozeJournal
 
     /// <summary>UWP 启动任务。</summary>
     public List<StartupSnoozeUwpEntry> Uwp { get; set; } = new();
+
+    /// <summary>
+    /// 本次隔离写入的 Explorer Run/RunOnce 策略。版本 5 起使用；空列表表示
+    /// 旧的全注册表或替代外壳模式，不能与可见桌面策略混用。
+    /// </summary>
+    public List<StartupSnoozeExplorerRunPolicyEntry> ExplorerRunPolicies { get; set; } = new();
 
     /// <summary>
     /// 本次隔离接管的当前用户 Winlogon Shell。版本 4 起使用；旧日志为

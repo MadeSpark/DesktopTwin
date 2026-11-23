@@ -739,7 +739,7 @@ public sealed class StartupSnoozeServiceTests
         Assert.Equal("Registry64", back.Registry[0].ApprovedView);
         Assert.Equal(journal.Registry[0].OriginalBase64, back.Registry[0].OriginalBase64);
         Assert.True(back.Registry[0].Applied);
-        Assert.Equal(4, back.Version);
+        Assert.Equal(5, back.Version);
         Assert.Single(back.Tasks);
         Assert.Equal(journal.Tasks[0].Identity, back.Tasks[0].Identity);
         Assert.True(back.Tasks[0].WriteAttempted);
@@ -1614,7 +1614,15 @@ public sealed class StartupSnoozeServiceTests
         previous.Tasks[0].Identity = null;
         StartupSnoozeService.ValidateJournal(previous);
 
-        AssertInvalidJournal(journal => journal.Version = 5);
+        foreach (var version in new[] { 3, 4, 5 })
+        {
+            var current = CreateValidJournal();
+            current.Version = version;
+            StartupSnoozeService.ValidateJournal(current);
+        }
+
+        AssertInvalidJournal(journal => journal.Version = 0);
+        AssertInvalidJournal(journal => journal.Version = 6);
         AssertInvalidJournal(journal => journal.Tasks[0].Identity = null);
     }
 
@@ -3053,5 +3061,460 @@ public sealed class StartupSnoozeServiceTests
                 System.IO.Directory.Delete(directory, recursive: true);
             }
         }
+    }
+
+    [Fact]
+    public void Explorer策略目标固定为四个且不得重复()
+    {
+        var targets = ExplorerRunPolicyTargets.All;
+
+        Assert.Equal(4, targets.Count);
+        Assert.Equal(
+            @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
+            ExplorerRunPolicyTargets.KeyPath);
+        Assert.Equal(
+            ("CurrentUser", "DisableCurrentUserRun"),
+            (targets[0].Hive, targets[0].ValueName));
+        Assert.Equal(
+            ("CurrentUser", "DisableCurrentUserRunOnce"),
+            (targets[1].Hive, targets[1].ValueName));
+        Assert.Equal(
+            ("LocalMachine", "DisableLocalMachineRun"),
+            (targets[2].Hive, targets[2].ValueName));
+        Assert.Equal(
+            ("LocalMachine", "DisableLocalMachineRunOnce"),
+            (targets[3].Hive, targets[3].ValueName));
+        Assert.Equal(targets.Count, targets.Distinct().Count());
+        Assert.Throws<InvalidOperationException>(() =>
+            ExplorerRunPolicyTargets.Resolve(
+                "CurrentUser",
+                "DisableLocalMachineRun"));
+    }
+
+    [Fact]
+    public void Explorer策略模式写入四个精确开关并在恢复时还原原值()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-policy-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            System.IO.Directory.CreateDirectory(directory);
+            var store = new FakeExplorerRunPolicyStore();
+            var existing = ExplorerRunPolicyTargets.All[0];
+            store.Set(existing, true, true, RegistryValueKind.DWord, 0);
+            var service = CreatePolicyTestService(directory, store);
+
+            var result = service.EnsureSnoozed(StartupIsolationMode.ExplorerRunPolicies);
+
+            Assert.True(result.Success, result.Message);
+            Assert.Equal(ExplorerRunPolicyTargets.All.Count, store.WriteCount);
+            foreach (var target in ExplorerRunPolicyTargets.All)
+            {
+                var written = store.Read(target);
+                Assert.True(written.ValueExists);
+                Assert.Equal(RegistryValueKind.DWord, written.Kind);
+                Assert.Equal(1, written.Value);
+            }
+
+            var journal = ReadTestJournal(service);
+            Assert.Equal(5, journal.Version);
+            Assert.True(journal.Completed);
+            Assert.Equal(ExplorerRunPolicyTargets.All.Count, journal.ExplorerRunPolicies.Count);
+            Assert.All(journal.ExplorerRunPolicies, policy =>
+            {
+                Assert.True(policy.WriteAttempted);
+                Assert.True(policy.WriteConfirmed);
+                Assert.Equal(1, policy.WrittenValue);
+            });
+            Assert.Null(journal.Shell);
+            Assert.Empty(journal.Registry);
+            Assert.Empty(journal.Tasks);
+            Assert.Empty(journal.Uwp);
+
+            var restored = service.Restore();
+
+            Assert.True(restored.Success, restored.Message);
+            var original = store.Read(existing);
+            Assert.True(original.ValueExists);
+            Assert.Equal(RegistryValueKind.DWord, original.Kind);
+            Assert.Equal(0, original.Value);
+            foreach (var target in ExplorerRunPolicyTargets.All.Where(item => item != existing))
+            {
+                Assert.False(store.Read(target).ValueExists);
+            }
+
+            Assert.False(service.HasPendingJournal);
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory))
+            {
+                System.IO.Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void Explorer策略已是启用值时保持原值且不会误删()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-policy-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            System.IO.Directory.CreateDirectory(directory);
+            var store = new FakeExplorerRunPolicyStore();
+            foreach (var target in ExplorerRunPolicyTargets.All)
+            {
+                store.Set(target, true, true, RegistryValueKind.DWord, 1);
+            }
+
+            var service = CreatePolicyTestService(directory, store);
+            var result = service.EnsureSnoozed(StartupIsolationMode.ExplorerRunPolicies);
+            Assert.True(result.Success, result.Message);
+
+            var journal = ReadTestJournal(service);
+            Assert.All(journal.ExplorerRunPolicies, policy =>
+            {
+                Assert.True(policy.OriginalExists);
+                Assert.Equal(1, policy.OriginalValue);
+            });
+
+            var restored = service.Restore();
+
+            Assert.True(restored.Success, restored.Message);
+            Assert.Equal(0, store.DeleteCount);
+            Assert.All(
+                ExplorerRunPolicyTargets.All,
+                target =>
+                {
+                    var snapshot = store.Read(target);
+                    Assert.True(snapshot.ValueExists);
+                    Assert.Equal(1, snapshot.Value);
+                });
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory))
+            {
+                System.IO.Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void Explorer策略遇到非_DWORD_时失败关闭且不写任何值()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-policy-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            System.IO.Directory.CreateDirectory(directory);
+            var store = new FakeExplorerRunPolicyStore();
+            store.Set(
+                ExplorerRunPolicyTargets.All[2],
+                true,
+                true,
+                RegistryValueKind.String,
+                null);
+
+            var service = CreatePolicyTestService(directory, store);
+            var result = service.EnsureSnoozed(StartupIsolationMode.ExplorerRunPolicies);
+
+            Assert.False(result.Success);
+            Assert.Contains("不是 REG_DWORD", result.Message);
+            Assert.Equal(0, store.WriteCount);
+            Assert.False(service.HasPendingJournal);
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory))
+            {
+                System.IO.Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void Explorer策略写入中途失败时回滚已写值()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-policy-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            System.IO.Directory.CreateDirectory(directory);
+            var store = new FakeExplorerRunPolicyStore
+            {
+                FailWriteOnCall = 2
+            };
+            var service = CreatePolicyTestService(directory, store);
+
+            var result = service.EnsureSnoozed(StartupIsolationMode.ExplorerRunPolicies);
+
+            Assert.False(result.Success);
+            Assert.Contains("已回滚", result.Message);
+            Assert.Equal(2, store.WriteCount);
+            Assert.All(
+                ExplorerRunPolicyTargets.All,
+                target => Assert.False(store.Read(target).ValueExists));
+            Assert.False(service.HasPendingJournal);
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory))
+            {
+                System.IO.Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void Explorer策略被外部修改时恢复保留当前值()
+    {
+        var directory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopTwin-policy-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            System.IO.Directory.CreateDirectory(directory);
+            var store = new FakeExplorerRunPolicyStore();
+            var service = CreatePolicyTestService(directory, store);
+            var applied = service.EnsureSnoozed(StartupIsolationMode.ExplorerRunPolicies);
+            Assert.True(applied.Success, applied.Message);
+
+            var externallyChanged = ExplorerRunPolicyTargets.All[1];
+            store.Set(externallyChanged, true, true, RegistryValueKind.DWord, 0);
+
+            var restored = service.Restore();
+
+            Assert.True(restored.Success, restored.Message);
+            Assert.Contains(restored.Warnings, warning => warning.Contains("外部修改", StringComparison.Ordinal));
+            var current = store.Read(externallyChanged);
+            Assert.True(current.ValueExists);
+            Assert.Equal(0, current.Value);
+            Assert.False(service.HasPendingJournal);
+        }
+        finally
+        {
+            if (System.IO.Directory.Exists(directory))
+            {
+                System.IO.Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void Explorer策略日志要求四个完整且自洽的原值记录()
+    {
+        var valid = CreateValidJournal();
+        valid.ExplorerRunPolicies.AddRange(CreateValidPolicyEntries());
+        StartupSnoozeService.ValidateJournal(valid);
+        StartupSnoozeService.ValidateExplorerRunPolicies(valid.ExplorerRunPolicies);
+
+        AssertInvalidPolicyJournal(journal =>
+        {
+            journal.ExplorerRunPolicies.Add(CreateValidPolicyEntry(ExplorerRunPolicyTargets.All[0]));
+        });
+        AssertInvalidPolicyJournal(journal =>
+        {
+            journal.ExplorerRunPolicies.Add(CreateValidPolicyEntry(
+                new ExplorerRunPolicyTarget("CurrentUser", "UnknownPolicy")));
+        });
+        AssertInvalidPolicyJournal(journal =>
+        {
+            journal.ExplorerRunPolicies[0].OriginalKeyExists = false;
+            journal.ExplorerRunPolicies[0].OriginalExists = true;
+            journal.ExplorerRunPolicies[0].OriginalValue = 0;
+        });
+        AssertInvalidPolicyJournal(journal =>
+        {
+            journal.ExplorerRunPolicies[0].OriginalExists = false;
+            journal.ExplorerRunPolicies[0].OriginalValue = 0;
+        });
+        AssertInvalidPolicyJournal(journal =>
+        {
+            journal.ExplorerRunPolicies[0].WriteAttempted = false;
+            journal.ExplorerRunPolicies[0].WriteConfirmed = true;
+        });
+        AssertInvalidPolicyJournal(journal =>
+        {
+            journal.ExplorerRunPolicies[0].WriteConfirmed = false;
+        });
+        AssertInvalidPolicyJournal(journal =>
+        {
+            journal.ExplorerRunPolicies[0].WrittenValue = 0;
+        });
+
+        var incomplete = CreateValidJournal();
+        incomplete.ExplorerRunPolicies.AddRange(CreateValidPolicyEntries().Take(3));
+        Assert.Throws<InvalidDataException>(
+            () => StartupSnoozeService.ValidateJournal(incomplete));
+    }
+
+    private static InvalidDataException AssertInvalidPolicyJournal(
+        Action<StartupSnoozeJournal> mutate)
+    {
+        var journal = CreateValidJournal();
+        journal.ExplorerRunPolicies.AddRange(CreateValidPolicyEntries());
+        mutate(journal);
+        return Assert.Throws<InvalidDataException>(
+            () => StartupSnoozeService.ValidateJournal(journal));
+    }
+
+    [Fact]
+    public void Explorer策略日志不能与替代_Shell_或旧版本混用()
+    {
+        var mixed = CreateValidJournal();
+        mixed.ExplorerRunPolicies.AddRange(CreateValidPolicyEntries());
+        mixed.Shell = new StartupSnoozeShellEntry();
+        Assert.Throws<InvalidDataException>(
+            () => StartupSnoozeService.ValidateJournal(mixed));
+
+        foreach (var version in new[] { 1, 2, 3, 4 })
+        {
+            var old = CreateValidJournal();
+            old.Version = version;
+            if (version < 3)
+            {
+                old.Tasks[0].Identity = null;
+            }
+
+            old.ExplorerRunPolicies.AddRange(CreateValidPolicyEntries());
+            Assert.Throws<InvalidDataException>(
+                () => StartupSnoozeService.ValidateJournal(old));
+        }
+    }
+
+    private static List<StartupSnoozeExplorerRunPolicyEntry> CreateValidPolicyEntries() =>
+        ExplorerRunPolicyTargets.All.Select(CreateValidPolicyEntry).ToList();
+
+    private static StartupSnoozeExplorerRunPolicyEntry CreateValidPolicyEntry(
+        ExplorerRunPolicyTarget target) =>
+        new()
+        {
+            Hive = target.Hive,
+            ValueName = target.ValueName,
+            OriginalKeyExists = true,
+            OriginalExists = false,
+            OriginalValue = null,
+            WriteAttempted = true,
+            WriteConfirmed = true,
+            WrittenValue = 1
+        };
+
+    private static StartupSnoozeService CreatePolicyTestService(
+        string directory,
+        FakeExplorerRunPolicyStore policyStore) =>
+        new(
+            directory,
+            () => StartupSnoozeService.ChildSessionPresence.Absent,
+            TimeSpan.Zero,
+            _ => new List<string>(),
+            () => new StartupSnoozeSnapshot(
+                new List<StartupSnoozeRegistryEntry>(),
+                new List<StartupSnoozeTaskEntry>(),
+                new List<StartupSnoozeUwpEntry>()),
+            new FakeCurrentUserShellStore(),
+            policyStore);
+
+    private sealed class FakeExplorerRunPolicyStore : IExplorerRunPolicyStore
+    {
+        private readonly Dictionary<string, ExplorerRunPolicySnapshot> _snapshots =
+            new(StringComparer.Ordinal);
+
+        public IReadOnlyList<ExplorerRunPolicyTarget> Targets => ExplorerRunPolicyTargets.All;
+
+        public int WriteCount { get; private set; }
+
+        public int DeleteCount { get; private set; }
+
+        public int FailWriteOnCall { get; init; }
+
+        public ExplorerRunPolicySnapshot Read(ExplorerRunPolicyTarget target)
+        {
+            var canonical = ExplorerRunPolicyTargets.Resolve(target.Hive, target.ValueName);
+            return _snapshots.TryGetValue(Key(canonical), out var snapshot)
+                ? snapshot
+                : new ExplorerRunPolicySnapshot(
+                    KeyExists: false,
+                    ValueExists: false,
+                    Kind: RegistryValueKind.Unknown,
+                    Value: null);
+        }
+
+        public void WriteDisabledPolicy(ExplorerRunPolicyTarget target)
+        {
+            var canonical = ExplorerRunPolicyTargets.Resolve(target.Hive, target.ValueName);
+            WriteCount++;
+            if (WriteCount == FailWriteOnCall)
+            {
+                throw new UnauthorizedAccessException("模拟策略写入失败");
+            }
+
+            var current = Read(canonical);
+            _snapshots[Key(canonical)] = new ExplorerRunPolicySnapshot(
+                KeyExists: true,
+                ValueExists: true,
+                Kind: RegistryValueKind.DWord,
+                Value: 1);
+            Assert.True(current.KeyExists || !current.ValueExists);
+        }
+
+        public void RestorePolicyValue(ExplorerRunPolicyTarget target, int value)
+        {
+            var canonical = ExplorerRunPolicyTargets.Resolve(target.Hive, target.ValueName);
+            var current = Read(canonical);
+            if (!current.ValueExists
+                || current.Kind != RegistryValueKind.DWord
+                || current.Value != 1)
+            {
+                throw new InvalidOperationException("模拟恢复碰到外部修改");
+            }
+
+            _snapshots[Key(canonical)] = current with { Value = value };
+        }
+
+        public void DeleteDisabledPolicy(ExplorerRunPolicyTarget target)
+        {
+            var canonical = ExplorerRunPolicyTargets.Resolve(target.Hive, target.ValueName);
+            var current = Read(canonical);
+            if (current.ValueExists
+                && (current.Kind != RegistryValueKind.DWord || current.Value != 1))
+            {
+                throw new InvalidOperationException("模拟删除碰到外部修改");
+            }
+
+            if (current.ValueExists)
+            {
+                DeleteCount++;
+            }
+
+            _snapshots[Key(canonical)] = new ExplorerRunPolicySnapshot(
+                KeyExists: current.KeyExists,
+                ValueExists: false,
+                Kind: RegistryValueKind.Unknown,
+                Value: null);
+        }
+
+        public void Set(
+            ExplorerRunPolicyTarget target,
+            bool keyExists,
+            bool valueExists,
+            RegistryValueKind kind,
+            int? value)
+        {
+            var canonical = ExplorerRunPolicyTargets.Resolve(target.Hive, target.ValueName);
+            _snapshots[Key(canonical)] = new ExplorerRunPolicySnapshot(
+                keyExists,
+                valueExists,
+                kind,
+                value);
+        }
+
+        private static string Key(ExplorerRunPolicyTarget target) =>
+            target.Hive + @"\" + target.ValueName;
     }
 }

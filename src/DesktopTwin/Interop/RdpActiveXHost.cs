@@ -95,10 +95,11 @@ internal sealed class RdpActiveXHost : AxHost
     }
 
     /// <summary>
-    /// 指定替代资源管理器的隐藏外壳门卫。路径必须已经由
-    /// <see cref="SessionAgentService.TryEnsureShellGateInstalled"/> 释放并验证。
-    /// 这里再次校验固定文件名、同目录关系、普通文件和绝对路径，避免任意程序
-    /// 被误写进 RDP 的 StartProgram。
+    /// 指定替代资源管理器的隐藏外壳门卫。该入口仅保留给旧日志兼容与隔离测试；
+    /// 正常可见桌面路径必须调用 <see cref="ClearShellGate"/>，不得安装或启用门卫。
+    /// 路径必须已经由 <see cref="SessionAgentService.TryEnsureShellGateInstalled"/>
+    /// 释放并验证。这里再次校验固定文件名、同目录关系、普通文件和绝对路径，
+    /// 避免任意程序被误写进 RDP 的 StartProgram。
     /// </summary>
     internal void SetShellGate(string programPath, string workingDirectory)
     {
@@ -148,8 +149,9 @@ internal sealed class RdpActiveXHost : AxHost
     }
 
     /// <summary>
-    /// 用户显式允许在分身中运行启动项时恢复 Explorer。下一次连接会清空
-    /// StartProgram/WorkDir 并读回确认，不能只依赖控件上次会话的残留值。
+    /// 正常可见桌面路径显式恢复标准 Explorer。每次连接都必须清空
+    /// StartProgram/WorkDir 并读回确认，不能只依赖控件上次会话的残留值；
+    /// 旧替代 Shell 模式仅保留给兼容测试和旧日志恢复。
     /// </summary>
     internal void ClearShellGate()
     {
@@ -233,10 +235,10 @@ internal sealed class RdpActiveXHost : AxHost
                 _audioMuted ? DisableRemoteAudio : RedirectAudioToClient));
         RunComStep(Locale.Get("Rdp.Step.ShellGate"), () =>
         {
-            // 替代默认 shell：隐藏门卫不会启动 Explorer，因此 Run、RunOnce、
-            // Startup 文件夹、UWP shell 启动项与 shell 计划任务都不会被加载。
-            // StartProgram 语义是“程序名”，门卫路径不含空格且已做受保护安装。
-            // 用户显式允许启动项时清空这两个属性，让 Explorer 成为默认 shell。
+            // 正常路径在连接前已清空 StartProgram/WorkDir，让标准 Explorer 成为
+            // 可见桌面外壳。仅旧替代 Shell 兼容模式才写入隐藏门卫；该模式不启动
+            // Explorer，因此会跳过 Run、RunOnce、Startup 文件夹及 shell 启动项。
+            // 两种模式都必须在写入后读回，且空值不得被控件上次连接的残留值覆盖。
             SetComProperty(securedSettings, "StartProgram", shellGateProgram);
             SetComProperty(securedSettings, "WorkDir", shellGateDirectory);
             var actualProgram = GetComProperty(securedSettings, "StartProgram");

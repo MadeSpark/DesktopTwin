@@ -30,6 +30,21 @@ internal static class ProcessNativeMethods
     private const string SeDebugPrivilege = "SeDebugPrivilege";
 
     /// <summary>
+    /// 进程生命周期内不可变的安全身份字段。镜像路径已经归一化。
+    /// </summary>
+    internal readonly record struct ProcessIdentitySnapshot(
+        int ProcessId,
+        uint SessionId,
+        long CreationTimeUtc,
+        string ImagePath)
+    {
+        internal bool IsComplete => ProcessId > 0
+                                    && SessionId > 0
+                                    && CreationTimeUtc > 0
+                                    && !string.IsNullOrWhiteSpace(ImagePath);
+    }
+
+    /// <summary>
     /// 启用当前进程的 <c>SeDebugPrivilege</c>。失败不抛异常——拿不到就退回普通结束流程。
     /// </summary>
     /// <returns>成功启用返回 true。</returns>
@@ -227,6 +242,94 @@ internal static class ProcessNativeMethods
                 _ => ErrorInvalidData
             };
             return false;
+        }
+        finally
+        {
+            _ = CloseHandle(handle);
+        }
+    }
+
+    /// <summary>
+    /// 只读捕获进程身份快照：PID、会话号、创建时间和最终镜像路径。
+    /// 不能只凭 PID 认定桌面外壳仍在运行，PID 可能在两次轮询之间被复用。
+    /// </summary>
+    internal static bool TryGetProcessIdentity(
+        int processId,
+        out ProcessIdentitySnapshot snapshot,
+        out int errorCode)
+    {
+        snapshot = default;
+        errorCode = 0;
+        if (processId <= 0)
+        {
+            errorCode = ErrorInvalidData;
+            return false;
+        }
+
+        var handle = OpenProcess(
+            ProcessQueryInformation,
+            inheritHandle: false,
+            processId);
+        if (handle == IntPtr.Zero)
+        {
+            errorCode = Marshal.GetLastPInvokeError();
+            return false;
+        }
+
+        try
+        {
+            if (!GetProcessTimes(handle, out var creation, out _, out _, out _))
+            {
+                errorCode = Marshal.GetLastPInvokeError();
+                return false;
+            }
+
+            var imagePath = QueryImagePath(handle);
+            if (imagePath is null
+                || !TryNormalizeImagePath(imagePath, out var normalizedImagePath))
+            {
+                errorCode = imagePath is null
+                    ? Marshal.GetLastPInvokeError()
+                    : ErrorInvalidData;
+                return false;
+            }
+
+            // ProcessIdToSessionId 只能按 PID 查询；若进程恰好退出并复用 PID，
+            // 查询结果可能属于另一个对象。紧跟查询前后都要求固定句柄仍处于活动
+            // 状态，一旦原进程已退出就失败关闭，不能把会话号拼到旧句柄身份上。
+            if (!GetExitCodeProcess(handle, out var beforeSessionExitCode)
+                || beforeSessionExitCode != StillActive)
+            {
+                errorCode = beforeSessionExitCode != StillActive
+                    ? ErrorInvalidData
+                    : Marshal.GetLastPInvokeError();
+                return false;
+            }
+
+            if (!ProcessIdToSessionId((uint)processId, out var sessionId)
+                || sessionId == 0)
+            {
+                errorCode = sessionId == 0
+                    ? ErrorInvalidData
+                    : Marshal.GetLastPInvokeError();
+                return false;
+            }
+
+            if (!GetExitCodeProcess(handle, out var afterSessionExitCode)
+                || afterSessionExitCode != StillActive)
+            {
+                errorCode = afterSessionExitCode != StillActive
+                    ? ErrorInvalidData
+                    : Marshal.GetLastPInvokeError();
+                return false;
+            }
+
+            snapshot = new ProcessIdentitySnapshot(
+                processId,
+                sessionId,
+                ToFileTimeTicks(creation),
+                normalizedImagePath);
+            return true;
         }
         finally
         {

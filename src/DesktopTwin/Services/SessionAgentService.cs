@@ -1282,7 +1282,7 @@ internal sealed class SessionAgentService : IDisposable
     /// 捕获本次周期唯一可信的子会话身份。会话不存在、WTS 查询失败或读不到登录时间
     /// 都返回 false；拿不到完整身份时必须失败关闭，不能退化成「只按会话号启动」。
     /// </summary>
-    private static bool TryCaptureChildSessionIdentity(
+    internal static bool TryCaptureChildSessionIdentity(
         out ChildSessionIdentity identity,
         out string error)
     {
@@ -1356,7 +1356,7 @@ internal sealed class SessionAgentService : IDisposable
     /// 重新确认当前子会话仍是捕获时的那一个。任何查询失败、会话消失、会话号变化
     /// 或登录时间不可读/变化都返回 false，由调用方失败关闭。
     /// </summary>
-    private static bool TryConfirmChildSessionIdentity(
+    internal static bool TryConfirmChildSessionIdentity(
         ChildSessionIdentity expected,
         out string error)
     {

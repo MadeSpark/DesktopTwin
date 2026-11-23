@@ -64,6 +64,17 @@ public sealed record StartupSnoozeResult(
 }
 
 /// <summary>
+/// 启动项隔离策略。旧模式保留用于读取和恢复旧日志；正常连接使用
+/// <see cref="ExplorerRunPolicies"/>，让可见 Explorer 启动但跳过 Run/RunOnce。
+/// </summary>
+internal enum StartupIsolationMode
+{
+    FullRegistry,
+    AlternateShell,
+    ExplorerRunPolicies
+}
+
+/// <summary>
 /// 在分身连接期间临时关掉本机的开机自启动项，断开后再按字节原样恢复。
 ///
 /// 为什么需要它：子会话用同一个账户登录，Windows 会在子会话里把用户和公共启动项
@@ -146,9 +157,10 @@ public sealed class StartupSnoozeService
     private readonly string? _legacyJournalPath;
     private readonly Func<ChildSessionPresence> _childSessionPresenceProvider;
     private readonly TimeSpan _presenceConfirmationDelay;
-    private readonly Func<bool, List<string>> _refusalReasonsProvider;
+    private readonly Func<StartupIsolationMode, List<string>> _refusalReasonsProvider;
     private readonly Func<StartupSnoozeSnapshot>? _startupSnapshotProvider;
     private readonly ICurrentUserShellStore _shellStore;
+    private readonly IExplorerRunPolicyStore _policyStore;
     private bool _appliedInThisInstance;
 
     /// <summary>
@@ -173,7 +185,9 @@ public sealed class StartupSnoozeService
         TimeSpan? presenceConfirmationDelay = null,
         Func<bool, List<string>>? refusalReasonsProvider = null,
         Func<StartupSnoozeSnapshot>? startupSnapshotProvider = null,
-        ICurrentUserShellStore? shellStore = null)
+        ICurrentUserShellStore? shellStore = null,
+        IExplorerRunPolicyStore? policyStore = null,
+        Func<StartupIsolationMode, List<string>>? isolationRefusalReasonsProvider = null)
     {
         Directory = directory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -184,9 +198,13 @@ public sealed class StartupSnoozeService
                 ? QueryNativeChildSessionPresence
                 : static () => ChildSessionPresence.Absent);
         _presenceConfirmationDelay = presenceConfirmationDelay ?? DefaultPresenceConfirmationDelay;
-        _refusalReasonsProvider = refusalReasonsProvider ?? GetRefusalReasons;
+        _refusalReasonsProvider = isolationRefusalReasonsProvider
+            ?? (refusalReasonsProvider is null
+                ? GetRefusalReasons
+                : mode => refusalReasonsProvider(mode == StartupIsolationMode.AlternateShell));
         _startupSnapshotProvider = startupSnapshotProvider;
         _shellStore = shellStore ?? new CurrentUserShellStore();
+        _policyStore = policyStore ?? new ExplorerRunPolicyStore();
         _journalValueName = _useMachineJournal ? BuildJournalValueName() : null;
         _legacyJournalPath = _useMachineJournal
             ? Path.Combine(
@@ -342,14 +360,19 @@ public sealed class StartupSnoozeService
     /// 否则会改到一个无法核对来源的旧会话下面。接管旧会话必须走专用方法。
     /// </summary>
     public StartupSnoozeResult EnsureSnoozed() => EnsureSnoozed(
-        isolateRegistryStartupEntries: true);
+        StartupIsolationMode.FullRegistry);
 
     /// <summary>
-    /// 关停启动源。使用 RDP 替代 shell 时可跳过注册表启动项：
-    /// 隐藏门卫不会创建 Explorer，因此 Run/RunOnce/Startup 文件夹及其
-    /// Shell 扩展启动项不会被加载；计划任务和 UWP 仍按日志隔离。
+    /// 兼容旧调用的关停入口。<c>false</c> 表示旧的替代 Shell 模式，仅供
+    /// 兼容测试与旧日志使用；正常可见桌面必须选择 Explorer Run/RunOnce
+    /// 策略模式，让标准 Explorer 启动，同时只跳过 Run/RunOnce。
     /// </summary>
-    internal StartupSnoozeResult EnsureSnoozed(bool isolateRegistryStartupEntries)
+    internal StartupSnoozeResult EnsureSnoozed(bool isolateRegistryStartupEntries) =>
+        EnsureSnoozed(isolateRegistryStartupEntries
+            ? StartupIsolationMode.FullRegistry
+            : StartupIsolationMode.AlternateShell);
+
+    internal StartupSnoozeResult EnsureSnoozed(StartupIsolationMode mode)
     {
         lock (_gate)
         {
@@ -358,7 +381,7 @@ public sealed class StartupSnoozeService
             return WithRestoreMutex(() => EnsureSnoozedCore(
                 adoptExistingJournal: false,
                 requireAbsentSession: true,
-                isolateRegistryStartupEntries));
+                mode));
         }
     }
 
@@ -367,10 +390,16 @@ public sealed class StartupSnoozeService
     /// 的关停日志；没有日志、日志未完成或状态不一致时都必须失败关闭，绝不能在这里恢复。
     /// </summary>
     internal StartupSnoozeResult EnsureSnoozedForExistingChildSession() =>
-        EnsureSnoozedForExistingChildSession(isolateRegistryStartupEntries: true);
+        EnsureSnoozedForExistingChildSession(StartupIsolationMode.FullRegistry);
 
     internal StartupSnoozeResult EnsureSnoozedForExistingChildSession(
-        bool isolateRegistryStartupEntries)
+        bool isolateRegistryStartupEntries) =>
+        EnsureSnoozedForExistingChildSession(isolateRegistryStartupEntries
+            ? StartupIsolationMode.FullRegistry
+            : StartupIsolationMode.AlternateShell);
+
+    internal StartupSnoozeResult EnsureSnoozedForExistingChildSession(
+        StartupIsolationMode mode)
     {
         lock (_gate)
         {
@@ -394,7 +423,7 @@ public sealed class StartupSnoozeService
                 return EnsureSnoozedCore(
                     adoptExistingJournal: true,
                     requireAbsentSession: false,
-                    isolateRegistryStartupEntries);
+                    mode);
             });
         }
     }
@@ -402,8 +431,11 @@ public sealed class StartupSnoozeService
     private StartupSnoozeResult EnsureSnoozedCore(
         bool adoptExistingJournal,
         bool requireAbsentSession,
-        bool isolateRegistryStartupEntries)
+        StartupIsolationMode mode)
     {
+        var isolateRegistryStartupEntries = mode == StartupIsolationMode.FullRegistry;
+        var explorerPolicies = mode == StartupIsolationMode.ExplorerRunPolicies;
+        var alternateShell = mode == StartupIsolationMode.AlternateShell;
         if (requireAbsentSession)
         {
             var presenceBlock = GetNewSessionIsolationBlockResult();
@@ -466,6 +498,32 @@ public sealed class StartupSnoozeService
             }
             else
             {
+                if (GetJournalIsolationMode(existing) != mode)
+                {
+                    if (adoptExistingJournal)
+                    {
+                        AppLog.Warn("已有分身会话，但关停日志的隔离模式与本次连接不一致；保留日志并拒绝接管。");
+                        return StartupSnoozeResult.Fail(
+                            "检测到已有分身会话，但启动项隔离模式与上次运行不一致。"
+                            + "为避免在会话仍运行时改动启动项，已保留关停日志并拒绝连接；"
+                            + "请先注销该分身，再重新启动 DesktopTwin。");
+                    }
+
+                    AppLog.Warn("关停日志的隔离模式与本次连接不一致，先恢复旧模式原值。");
+                    var modeRecovery = RestoreCore();
+                    if (!modeRecovery.Success)
+                    {
+                        return StartupSnoozeResult.Fail(
+                            "启动项隔离模式已变化，且恢复旧模式失败：" + modeRecovery.Message,
+                            modeRecovery.Warnings);
+                    }
+
+                    return EnsureSnoozedCore(
+                        adoptExistingJournal: false,
+                        requireAbsentSession: requireAbsentSession,
+                        mode);
+                }
+
                 if (!_appliedInThisInstance && !adoptExistingJournal)
                 {
                     return StartupSnoozeResult.Fail(
@@ -545,7 +603,7 @@ public sealed class StartupSnoozeService
             }
         }
 
-        var refusals = _refusalReasonsProvider(!isolateRegistryStartupEntries);
+        var refusals = _refusalReasonsProvider(mode);
         if (refusals.Count > 0)
         {
             AppLog.Warn("存在未覆盖的启动源，已拒绝关停：" + string.Join("；", refusals));
@@ -575,15 +633,21 @@ public sealed class StartupSnoozeService
                             journal.DeferredExecutables,
                             exceptions,
                             blockedStartupItems)
-                        : [];
+                        : explorerPolicies
+                            ? CollectRegistryEntries(
+                                warnings,
+                                journal.DeferredExecutables,
+                                exceptions,
+                                blockedStartupItems,
+                                includeRunValues: false)
+                            : [];
                     journal.Tasks = CollectScheduledTasks();
                     journal.Uwp = CollectUwpTasks();
                     if (!isolateRegistryStartupEntries)
                     {
-                        // 替代外壳不会执行 Explorer，Run/RunOnce/启动文件夹不会在
-                        // 子会话里正常触发；但部分厂商服务会在登录后直接拉起同一
-                        // 程序的辅助进程，绕过外壳启动链。这里只读枚举启动项，
-                        // 把可解析的 EXE 作为常驻守卫目标，绝不读取或改写审批值。
+                        // Explorer 策略和替代外壳都不会执行 Run/RunOnce 启动链；
+                        // 但厂商服务仍可能在登录后直接拉起同一程序的辅助进程。
+                        // 这里只读枚举启动项作为常驻守卫目标，不改第三方启动值。
                         AppendGuardExecutables(
                             journal.DeferredExecutables,
                             CollectRegistryGuardExecutables(warnings));
@@ -594,7 +658,14 @@ public sealed class StartupSnoozeService
                     var snapshot = _startupSnapshotProvider();
                     journal.Registry = isolateRegistryStartupEntries
                         ? snapshot.Registry
-                        : [];
+                        : explorerPolicies
+                            ? snapshot.Registry
+                                .Where(entry => string.Equals(
+                                    entry.Kind,
+                                    "StartupFolderItem",
+                                    StringComparison.Ordinal))
+                                .ToList()
+                            : [];
                     journal.Tasks = snapshot.Tasks;
                     journal.Uwp = snapshot.Uwp;
                     if (!isolateRegistryStartupEntries)
@@ -616,9 +687,27 @@ public sealed class StartupSnoozeService
                 return StartupSnoozeResult.Fail("读取启动项失败，未做任何修改：" + exception.Message);
             }
 
+            if (explorerPolicies)
+            {
+                try
+                {
+                    journal.ExplorerRunPolicies = CaptureExplorerRunPolicies();
+                }
+                catch (Exception exception) when (exception is SecurityException
+                                                      or UnauthorizedAccessException
+                                                      or IOException or InvalidOperationException
+                                                      or ArgumentException or NotSupportedException)
+                {
+                    AppLog.Warn("读取 Explorer Run/RunOnce 策略失败，未做任何修改。", exception);
+                    return StartupSnoozeResult.Fail(
+                        "无法安全接管 Explorer 启动项策略，未做任何修改：" + exception.Message);
+                }
+            }
+
             // 替代 shell 模式必须先把当前用户 Shell 的原值写入日志，再改注册表。
-            // 这里只接管当前用户 Winlogon，机器级 HKLM Winlogon 永不触碰。
-            if (!isolateRegistryStartupEntries)
+            // 这里只接管当前用户 Winlogon，机器级 HKLM Winlogon 永不触碰；可见
+            // Explorer 模式绝不修改 Shell，否则会再次得到黑屏桌面。
+            if (alternateShell)
             {
                 try
                 {
@@ -681,6 +770,7 @@ public sealed class StartupSnoozeService
             if (journal.Registry.Count == 0
                 && journal.Tasks.Count == 0
                 && journal.Uwp.Count == 0
+                && journal.ExplorerRunPolicies.Count == 0
                 && journal.Shell is null)
             {
                 if (blockedStartupItems.Count > 0)
@@ -748,9 +838,17 @@ public sealed class StartupSnoozeService
 
                 ApplyScheduledTasks(journal, warnings, blockedStartupItems);
                 ApplyUwpTasks(journal, warnings, blockedStartupItems);
+                if (explorerPolicies)
+                {
+                    ApplyExplorerRunPolicies(journal);
+                }
+
                 // Shell 必须最后写入：前面的任务/UWP 开关失败时，登录外壳尚未
                 // 被改掉，回滚范围更小；成功时它负责阻止子会话启动 Explorer。
-                ApplyShellOverride(journal);
+                if (alternateShell)
+                {
+                    ApplyShellOverride(journal);
+                }
             }
             catch (Exception exception) when (exception is SecurityException or UnauthorizedAccessException
                                                   or IOException or InvalidOperationException)
@@ -833,9 +931,10 @@ public sealed class StartupSnoozeService
             var summary = string.Format(
                 CultureInfo.CurrentCulture,
                 journal.Shell is null
-                    ? "已关停启动项：注册表 {0} 项、计划任务 {1} 项、UWP {2} 项。"
-                    : "已关停启动项：注册表 {0} 项、计划任务 {1} 项、UWP {2} 项；已接管当前用户登录外壳。",
+                    ? "已隔离启动项：注册表 {0} 项、Explorer Run/RunOnce 策略 {1} 项、计划任务 {2} 项、UWP {3} 项。"
+                    : "已隔离启动项：注册表 {0} 项、Explorer Run/RunOnce 策略 {1} 项、计划任务 {2} 项、UWP {3} 项；已接管当前用户登录外壳。",
                 journal.Registry.Count(entry => entry.Applied),
+                journal.ExplorerRunPolicies.Count(entry => entry.WriteConfirmed),
                 journal.Tasks.Count(entry => entry.ConfirmedDisabled),
                 journal.Uwp.Count(entry => entry.WrittenState == 0));
             AppLog.Info(summary + (warnings.Count == 0 ? string.Empty : "；未能关停：" + string.Join("；", warnings)));
@@ -989,6 +1088,29 @@ public sealed class StartupSnoozeService
                     || state != 0)
                 {
                     return false;
+                }
+            }
+
+            if (journal.ExplorerRunPolicies.Count > 0)
+            {
+                ValidateExplorerRunPolicies(journal.ExplorerRunPolicies);
+                foreach (var policy in journal.ExplorerRunPolicies)
+                {
+                    if (!policy.WriteAttempted || !policy.WriteConfirmed)
+                    {
+                        return false;
+                    }
+
+                    var target = ExplorerRunPolicyTargets.Resolve(
+                        policy.Hive,
+                        policy.ValueName);
+                    var current = _policyStore.Read(target);
+                    if (!current.ValueExists
+                        || current.Kind != RegistryValueKind.DWord
+                        || current.Value != policy.WrittenValue)
+                    {
+                        return false;
+                    }
                 }
             }
 
@@ -1248,6 +1370,35 @@ public sealed class StartupSnoozeService
             }
         }
 
+        // Explorer 策略先于 Shell 恢复：任务/UWP 已恢复后，再撤掉 Run/RunOnce
+        // 开关。可见桌面模式没有 Shell 记录，因此这里只操作四个精确 DWORD。
+        foreach (var policy in journal.ExplorerRunPolicies.ToArray())
+        {
+            try
+            {
+                if (RestoreExplorerRunPolicy(policy))
+                {
+                    journal.ExplorerRunPolicies.Remove(policy);
+                    restored++;
+                }
+                else
+                {
+                    journal.ExplorerRunPolicies.Remove(policy);
+                    preserved++;
+                    warnings.Add(
+                        "Explorer 策略在恢复前已被外部修改，已保留当前值："
+                        + policy.Hive + @"\" + policy.ValueName);
+                }
+            }
+            catch (Exception exception) when (exception is SecurityException
+                                                  or UnauthorizedAccessException
+                                                  or IOException or InvalidOperationException
+                                                  or ArgumentException or NotSupportedException)
+            {
+                problems.Add("Explorer Run 策略：" + exception.Message);
+            }
+        }
+
         // Shell 最后恢复：先恢复 Run/任务/UWP，再让 Explorer 回到登录外壳，
         // 尽量缩短子会话仍存在时启动项重新可用的窗口。
         if (journal.Shell is not null)
@@ -1420,10 +1571,13 @@ public sealed class StartupSnoozeService
         List<string> warnings,
         List<string> deferredExecutables,
         HashSet<string> exceptions,
-        List<string> blockedStartupItems)
+        List<string> blockedStartupItems,
+        bool includeRunValues = true)
     {
         var entries = new List<StartupSnoozeRegistryEntry>();
 
+        if (includeRunValues)
+        {
         foreach (var target in RunTargets())
         {
             using var baseKey = RegistryKey.OpenBaseKey(target.Hive, target.RunView);
@@ -1558,6 +1712,7 @@ public sealed class StartupSnoozeService
                         : null
                 });
             }
+        }
         }
 
         entries.AddRange(CollectStartupFolderEntries(
@@ -3132,6 +3287,210 @@ public sealed class StartupSnoozeService
         }
     }
 
+    // ===== Explorer Run/RunOnce 策略 =====
+
+    private List<StartupSnoozeExplorerRunPolicyEntry> CaptureExplorerRunPolicies()
+    {
+        var entries = new List<StartupSnoozeExplorerRunPolicyEntry>();
+        foreach (var target in _policyStore.Targets)
+        {
+            var canonical = ExplorerRunPolicyTargets.Resolve(target.Hive, target.ValueName);
+            var snapshot = _policyStore.Read(canonical);
+            if (snapshot.ValueExists
+                && (snapshot.Kind != RegistryValueKind.DWord || snapshot.Value is null))
+            {
+                throw new InvalidOperationException(
+                    "Explorer 策略值已存在但不是 REG_DWORD，拒绝覆盖：" + canonical.DisplayPath);
+            }
+
+            entries.Add(new StartupSnoozeExplorerRunPolicyEntry
+            {
+                Hive = canonical.Hive,
+                ValueName = canonical.ValueName,
+                OriginalKeyExists = snapshot.KeyExists,
+                OriginalExists = snapshot.ValueExists,
+                OriginalValue = snapshot.Value,
+                WrittenValue = 1
+            });
+        }
+
+        ValidateExplorerRunPolicies(entries);
+        return entries;
+    }
+
+    /// <summary>
+    /// 四个值全部采集并校验后才允许进入写入阶段。日志先记录“准备写入”，
+    /// 再写 DWORD 1 并严格回读；任何一步失败都会走统一回滚。
+    /// </summary>
+    private void ApplyExplorerRunPolicies(StartupSnoozeJournal journal)
+    {
+        foreach (var entry in journal.ExplorerRunPolicies)
+        {
+            var target = ExplorerRunPolicyTargets.Resolve(entry.Hive, entry.ValueName);
+            EnsureOriginalExplorerRunPolicyBeforeWrite(entry, target, "写入前");
+
+            entry.WriteAttempted = true;
+            entry.WriteConfirmed = false;
+            SaveJournal(journal);
+
+            EnsureOriginalExplorerRunPolicyBeforeWrite(entry, target, "日志落盘后");
+            _policyStore.WriteDisabledPolicy(target);
+            var written = _policyStore.Read(target);
+            if (!written.ValueExists
+                || written.Kind != RegistryValueKind.DWord
+                || written.Value != entry.WrittenValue)
+            {
+                throw new InvalidOperationException(
+                    "写入 Explorer 策略后回读不一致：" + target.DisplayPath);
+            }
+
+            entry.WriteConfirmed = true;
+            SaveJournal(journal);
+        }
+    }
+
+    private void EnsureOriginalExplorerRunPolicyBeforeWrite(
+        StartupSnoozeExplorerRunPolicyEntry entry,
+        ExplorerRunPolicyTarget target,
+        string stage)
+    {
+        var current = _policyStore.Read(target);
+        if (!ExplorerRunPolicyMatchesOriginal(entry, current))
+        {
+            throw new StartupStateChangedException(
+                stage + " Explorer 策略已被外部修改：" + target.DisplayPath);
+        }
+    }
+
+    private bool RestoreExplorerRunPolicy(StartupSnoozeExplorerRunPolicyEntry entry)
+    {
+        var target = ExplorerRunPolicyTargets.Resolve(entry.Hive, entry.ValueName);
+        var current = _policyStore.Read(target);
+        if (ExplorerRunPolicyMatchesOriginal(entry, current))
+        {
+            return true;
+        }
+
+        if (!entry.WriteAttempted && !entry.WriteConfirmed)
+        {
+            throw new InvalidOperationException(
+                "Explorer 策略没有本程序的写入记录，拒绝恢复或覆盖当前值："
+                + target.DisplayPath);
+        }
+
+        if (!ExplorerRunPolicyMatchesWritten(entry, current))
+        {
+            // 保留第三方写入的值，不能为了“清理”而覆盖用户或管理员的策略。
+            return false;
+        }
+
+        if (entry.OriginalExists)
+        {
+            if (entry.OriginalValue is null)
+            {
+                throw new InvalidDataException(
+                    "关停日志中的 Explorer 策略原值无效：" + target.DisplayPath);
+            }
+
+            _policyStore.RestorePolicyValue(target, entry.OriginalValue.Value);
+            var restored = _policyStore.Read(target);
+            if (!ExplorerRunPolicyMatchesOriginal(entry, restored))
+            {
+                throw new InvalidOperationException(
+                    "恢复 Explorer 策略后回读不一致：" + target.DisplayPath);
+            }
+        }
+        else
+        {
+            _policyStore.DeleteDisabledPolicy(target);
+            var restored = _policyStore.Read(target);
+            if (restored.ValueExists)
+            {
+                throw new InvalidOperationException(
+                    "删除 Explorer 策略后回读仍存在：" + target.DisplayPath);
+            }
+        }
+
+        return true;
+    }
+
+    private static bool ExplorerRunPolicyMatchesOriginal(
+        StartupSnoozeExplorerRunPolicyEntry entry,
+        ExplorerRunPolicySnapshot snapshot) =>
+        entry.OriginalExists == snapshot.ValueExists
+        && (!entry.OriginalExists
+            || (snapshot.Kind == RegistryValueKind.DWord
+                && snapshot.Value == entry.OriginalValue));
+
+    private static bool ExplorerRunPolicyMatchesWritten(
+        StartupSnoozeExplorerRunPolicyEntry entry,
+        ExplorerRunPolicySnapshot snapshot) =>
+        snapshot.ValueExists
+        && snapshot.Kind == RegistryValueKind.DWord
+        && snapshot.Value == entry.WrittenValue;
+
+    internal static void ValidateExplorerRunPolicies(
+        IReadOnlyCollection<StartupSnoozeExplorerRunPolicyEntry> policies)
+    {
+        if (policies.Count != 0 && policies.Count != ExplorerRunPolicyTargets.All.Count)
+        {
+            throw new InvalidDataException("Explorer 策略日志必须记录完整的四个开关。");
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in policies)
+        {
+            var target = ExplorerRunPolicyTargets.Resolve(entry.Hive, entry.ValueName);
+            if (!seen.Add(target.Hive + @"\" + target.ValueName))
+            {
+                throw new InvalidDataException("Explorer 策略日志包含重复开关。");
+            }
+
+            if (entry.WrittenValue != 1)
+            {
+                throw new InvalidDataException("Explorer 策略日志的写入值必须为 DWORD 1。");
+            }
+
+            if (entry.WriteConfirmed && !entry.WriteAttempted)
+            {
+                throw new InvalidDataException("Explorer 策略日志缺少写入前记录。");
+            }
+
+            if (entry.OriginalExists != entry.OriginalValue.HasValue)
+            {
+                throw new InvalidDataException("Explorer 策略日志的原值存在标记与内容不一致。");
+            }
+
+            if (entry.OriginalExists && !entry.OriginalKeyExists)
+            {
+                throw new InvalidDataException("Explorer 策略日志的原值与键存在标记不一致。");
+            }
+        }
+
+        if (seen.Count != policies.Count)
+        {
+            throw new InvalidDataException("Explorer 策略日志包含未知开关。");
+        }
+    }
+
+    private static StartupIsolationMode GetJournalIsolationMode(
+        StartupSnoozeJournal journal)
+    {
+        if (journal.ExplorerRunPolicies.Count > 0 && journal.Shell is not null)
+        {
+            throw new InvalidDataException("关停日志不能同时使用 Explorer 策略和替代 Shell 模式。");
+        }
+
+        if (journal.ExplorerRunPolicies.Count > 0)
+        {
+            return StartupIsolationMode.ExplorerRunPolicies;
+        }
+
+        return journal.Shell is not null
+            ? StartupIsolationMode.AlternateShell
+            : StartupIsolationMode.FullRegistry;
+    }
+
     // ===== 当前用户 Winlogon Shell =====
 
     /// <summary>
@@ -3373,28 +3732,30 @@ public sealed class StartupSnoozeService
 
     // ===== 拒绝条件 =====
 
-    private List<string> GetRefusalReasons(bool ignoreExplorerRunSources)
+    private List<string> GetRefusalReasons(StartupIsolationMode mode)
     {
         var reasons = new List<string>();
+        var ignoreExplorerRunSources = mode == StartupIsolationMode.AlternateShell;
 
-        // 替代 shell 连接不会启动 Explorer：RunOnce、RunOnceEx 与
-        // Policies\Explorer\Run 都依赖 shell 初始化。它们仍保留在 Session 1，
-        // 本轮只检查 Winlogon/Userinit 这类 shell 之前就会执行的外部启动源。
+        // 可见 Explorer 模式下，四个 Run/RunOnce 策略只覆盖标准值；策略
+        // Run、RunOnceEx 与 RunOnce\Setup 等其它外壳启动源没有等价开关，
+        // 必须像全注册表模式一样在连接前拒绝。只有替代 Shell 不启动 Explorer，
+        // 才不检查这些来源。
         if (!ignoreExplorerRunSources)
         {
             var runOnceTargets = new (RegistryHive Hive, RegistryView View, string Path)[]
-        {
-            // Registry32 本身已经重定向到 WOW6432Node；再手写 WOW6432Node 会变成
-            // WOW6432Node\WOW6432Node，看起来查过了，实际漏掉真正的 32 位 RunOnce。
-            (RegistryHive.CurrentUser, RegistryView.Registry64, RunKeyPath + "Once"),
-            (RegistryHive.CurrentUser, RegistryView.Registry32, RunKeyPath + "Once"),
-            (RegistryHive.CurrentUser, RegistryView.Registry64, RunKeyPath + "OnceEx"),
-            (RegistryHive.CurrentUser, RegistryView.Registry32, RunKeyPath + "OnceEx"),
-            (RegistryHive.LocalMachine, RegistryView.Registry64, RunKeyPath + "Once"),
-            (RegistryHive.LocalMachine, RegistryView.Registry32, RunKeyPath + "Once"),
-            (RegistryHive.LocalMachine, RegistryView.Registry64, RunKeyPath + "OnceEx"),
-            (RegistryHive.LocalMachine, RegistryView.Registry32, RunKeyPath + "OnceEx")
-        };
+            {
+                // Registry32 本身已经重定向到 WOW6432Node；再手写 WOW6432Node 会变成
+                // WOW6432Node\WOW6432Node，看起来查过了，实际漏掉真正的 32 位 RunOnce。
+                (RegistryHive.CurrentUser, RegistryView.Registry64, RunKeyPath + "Once"),
+                (RegistryHive.CurrentUser, RegistryView.Registry32, RunKeyPath + "Once"),
+                (RegistryHive.CurrentUser, RegistryView.Registry64, RunKeyPath + "OnceEx"),
+                (RegistryHive.CurrentUser, RegistryView.Registry32, RunKeyPath + "OnceEx"),
+                (RegistryHive.LocalMachine, RegistryView.Registry64, RunKeyPath + "Once"),
+                (RegistryHive.LocalMachine, RegistryView.Registry32, RunKeyPath + "Once"),
+                (RegistryHive.LocalMachine, RegistryView.Registry64, RunKeyPath + "OnceEx"),
+                (RegistryHive.LocalMachine, RegistryView.Registry32, RunKeyPath + "OnceEx")
+            };
 
         var allowedRoots = new[]
         {
@@ -3504,7 +3865,7 @@ public sealed class StartupSnoozeService
                 }
                 else if (!IsStandardShellValue(shell)
                          && !(hive == RegistryHive.CurrentUser
-                              && ignoreExplorerRunSources
+                              && mode == StartupIsolationMode.AlternateShell
                               && string.Equals(
                                   shell.Trim(),
                                   GetManagedShellPath(),
@@ -4015,16 +4376,28 @@ public sealed class StartupSnoozeService
     {
         // 版本 1 没有计划任务写入标记；版本 2 没有任务身份。两者仍可读取，
         // 但计划任务恢复会因缺少身份而失败关闭；版本 3 起身份是必需字段；
-        // 版本 4 增加当前用户 Winlogon Shell 的精确接管记录。
-        if (journal.Version is < 1 or > 4)
+        // 版本 4 增加当前用户 Winlogon Shell 的精确接管记录；版本 5 增加
+        // Explorer Run/RunOnce 策略，同时仍能恢复版本 1-4。
+        if (journal.Version is < 1 or > 5)
         {
             throw new InvalidDataException("不支持的启动项关停日志版本：" + journal.Version);
         }
 
         if (journal.Registry is null || journal.Tasks is null || journal.Uwp is null
+            || journal.ExplorerRunPolicies is null
             || journal.Warnings is null || journal.DeferredExecutables is null)
         {
             throw new InvalidDataException("启动项关停日志缺少必要的列表。");
+        }
+
+        if (journal.Version < 5 && journal.ExplorerRunPolicies.Count > 0)
+        {
+            throw new InvalidDataException("旧版启动项关停日志不能包含 Explorer 策略记录。");
+        }
+
+        if (journal.ExplorerRunPolicies.Count > 0 && journal.Shell is not null)
+        {
+            throw new InvalidDataException("启动项关停日志不能同时包含 Explorer 策略和替代 Shell。");
         }
 
         if ((!string.IsNullOrEmpty(journal.Machine)
@@ -4054,6 +4427,21 @@ public sealed class StartupSnoozeService
         foreach (var uwp in journal.Uwp)
         {
             ValidateUwpEntry(uwp);
+        }
+
+        if (journal.ExplorerRunPolicies.Count > 0)
+        {
+            ValidateExplorerRunPolicies(journal.ExplorerRunPolicies);
+            if (journal.Completed
+                && journal.ExplorerRunPolicies.Any(policy => !policy.WriteConfirmed))
+            {
+                throw new InvalidDataException("已完成的 Explorer 策略日志缺少写入确认。");
+            }
+
+            if (journal.Version < 5)
+            {
+                throw new InvalidDataException("旧版启动项关停日志不能包含 Explorer 策略记录。");
+            }
         }
 
         if (journal.Shell is not null)
