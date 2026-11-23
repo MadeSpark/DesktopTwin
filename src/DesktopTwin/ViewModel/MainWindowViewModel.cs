@@ -319,8 +319,10 @@ public partial class MainWindowViewModel : ObservableObject
     /// <summary>
     /// 观看/控制切换按钮的提示：说明当前模式，并告知点击后的去向。
     /// </summary>
-    public string WatchModeButtonToolTip => McpEnabled && IsWatchModeEnabled
-        ? Locale.Get("Main.WatchMode.Button.Watch.McpLocked.ToolTip")
+    public string WatchModeButtonToolTip => McpEnabled
+        ? IsWatchModeEnabled
+            ? Locale.Get("Main.WatchMode.Button.Watch.McpEnabled.ToolTip")
+            : Locale.Get("Main.WatchMode.Button.Control.McpEnabled.ToolTip")
         : IsWatchModeEnabled
             ? Locale.Get("Main.WatchMode.Button.Watch.ToolTip")
             : Locale.Get("Main.WatchMode.Button.Control.ToolTip");
@@ -1743,8 +1745,9 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>
-    /// MCP 在观看模式下发送输入，避免 RDP 控件把远程指针映射到主桌面光标。
-    /// 只要 MCP 开启就必须保持该模式；失败时由 MCP 启动流程关闭服务。
+    /// MCP 启动时先切到观看模式，避免启动瞬间本机键鼠与 MCP 抢输入；
+    /// 启动完成后允许在观看/控制模式之间运行时切换，MCP 服务不重启。
+    /// 失败时由 MCP 启动流程关闭服务。
     /// </summary>
     private void EnsureMcpWatchMode()
     {
@@ -1978,17 +1981,6 @@ public partial class MainWindowViewModel : ObservableObject
     private void ToggleWatchMode()
     {
         var enabled = !IsWatchModeEnabled;
-        if (!enabled && McpEnabled)
-        {
-            IsWatchModeEnabled = true;
-            ShowNotification(
-                Locale.Get("Notify.McpWatchLocked.Title"),
-                Locale.Get("Notify.McpWatchLocked.Message"),
-                InfoBarSeverity.Informational,
-                TimeSpan.FromSeconds(7));
-            return;
-        }
-
         if (!Execute(() => _childSessionService.SetWatchModeEnabled(enabled)))
         {
             IsWatchModeEnabled = _childSessionService.WatchModeEnabled;
@@ -1997,10 +1989,16 @@ public partial class MainWindowViewModel : ObservableObject
 
         IsWatchModeEnabled = _childSessionService.WatchModeEnabled;
         ShowNotification(
-            enabled ? Locale.Get("Notify.WatchMode.On") : Locale.Get("Notify.WatchMode.Off"),
+            enabled
+                ? Locale.Get("Notify.WatchMode.On")
+                : McpEnabled
+                    ? Locale.Get("Notify.WatchMode.Off.WithMcp.Title")
+                    : Locale.Get("Notify.WatchMode.Off"),
             enabled
                 ? Locale.Get("Notify.WatchMode.On.Message")
-                : Locale.Get("Notify.WatchMode.Off.Message"),
+                : McpEnabled
+                    ? Locale.Get("Notify.WatchMode.Off.WithMcp.Message")
+                    : Locale.Get("Notify.WatchMode.Off.Message"),
             enabled ? InfoBarSeverity.Informational : InfoBarSeverity.Success);
     }
 

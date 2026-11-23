@@ -76,6 +76,31 @@ internal sealed class StartupGuardService : IDisposable
         "rdpclip.exe"
     ];
 
+    // 安全软件不是普通单实例启动程序：它们的自保护通常会拒绝终止，
+    // 而一次拒绝就会触发子会话失败关闭。这里只放行进程终止，
+    // 启动项快照、禁用与恢复流程仍然照常处理这些条目。
+    private static readonly string[] ProtectedSecurityExecutableFileNames =
+    [
+        "hipstray.exe",
+        "hipsmain.exe",
+        "hipsdaemon.exe",
+        "sysdiag.exe",
+        "usysdiag.exe",
+        "securityhealthsystray.exe",
+        "sechealthui.exe",
+        "securityhealthservice.exe",
+        "msmpeng.exe",
+        "nissrv.exe"
+    ];
+
+    private static readonly string[] ProtectedSecurityDirectoryFragments =
+    [
+        @"\huorong\sysdiag\",
+        @"\windows defender\",
+        @"\windows\system32\",
+        @"\windows\systemapps\microsoft.windows.sechealthui_"
+    ];
+
     private readonly HashSet<string> _fallbackPaths;
     private readonly HashSet<string> _managedPaths;
     private readonly uint _mainSessionId;
@@ -85,6 +110,8 @@ internal sealed class StartupGuardService : IDisposable
     private readonly Task _monitorTask;
     private readonly Dictionary<int, DateTime> _failedProcesses = new();
     private readonly HashSet<string> _reportedFailurePaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _reportedProtectedSecurityPaths =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, DateTime> _baselineProcesses = new();
     private readonly object _loginStateLock = new();
     private readonly DateTime _guardStartedUtc;
@@ -208,6 +235,34 @@ internal sealed class StartupGuardService : IDisposable
     }
 
     /// <summary>
+    /// 判断是否为已知安全软件进程。安全软件的自保护会让终止操作失败，
+    /// 失败后按隔离失败关闭会注销整个子会话；这类进程必须只记录、不终止。
+    /// </summary>
+    internal static bool IsProtectedSecurityExecutable(string? executablePath)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath))
+        {
+            return false;
+        }
+
+        var fileName = Path.GetFileName(executablePath);
+        if (!ProtectedSecurityExecutableFileNames.Contains(
+                fileName,
+                StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // 只按产品目录放行，不能因为任意目录里出现同名文件就跳过终止；
+        // 否则攻击者可以把恶意程序命名为 HipsTray.exe 绕过启动项守卫。
+        var normalized = executablePath.Replace(
+            Path.AltDirectorySeparatorChar,
+            Path.DirectorySeparatorChar);
+        return ProtectedSecurityDirectoryFragments.Any(
+            fragment => normalized.Contains(fragment, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
     /// 归一化启动程序路径。接受当前还不存在、但启动项指向的 .exe，
     /// 以便拦截登录后才被下载或解压出来的延迟程序；跳过 Windows 系统目录和
     /// 通用启动器，避免把子会话的桌面外壳或系统服务误当成用户启动项。
@@ -281,6 +336,11 @@ internal sealed class StartupGuardService : IDisposable
         if (targetSessionId == mainSessionId
             || processSessionId != targetSessionId
             || processSessionId == mainSessionId)
+        {
+            return false;
+        }
+
+        if (IsProtectedSecurityExecutable(executablePath))
         {
             return false;
         }
@@ -496,6 +556,7 @@ internal sealed class StartupGuardService : IDisposable
             || parentProcessId <= 0
             || maximumDepth <= 0
             || string.IsNullOrWhiteSpace(executablePath)
+            || IsProtectedSecurityExecutable(executablePath)
             || !ProcessNativeMethods.TryNormalizeImagePath(executablePath, out var normalizedCandidate)
             || !exactPaths.Contains(normalizedCandidate))
         {
@@ -913,6 +974,18 @@ internal sealed class StartupGuardService : IDisposable
                         AppLog.Warn(
                             "启动项守卫无法读取子会话进程的完整路径，已拒绝按进程名终止；"
                             + "该进程可能仍需人工核查：" + process.ProcessName);
+                    }
+
+                    if (IsProtectedSecurityExecutable(executablePath))
+                    {
+                        if (_reportedProtectedSecurityPaths.Add(executablePath!))
+                        {
+                            AppLog.Info(
+                                "启动项守卫跳过安全软件进程，不终止也不因此注销子会话："
+                                + $"{executablePath} (PID {process.Id})");
+                        }
+
+                        continue;
                     }
 
                     var directFallbackMatch = !existedBeforeGuard

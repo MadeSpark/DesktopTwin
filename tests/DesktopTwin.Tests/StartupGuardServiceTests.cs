@@ -182,6 +182,70 @@ public sealed class StartupGuardServiceTests
         Assert.Equal(0L, ReadPrivate<long>(service, "_loginCompletedTimestamp"));
     }
 
+    [Theory]
+    [InlineData(@"C:\Program Files\Huorong\Sysdiag\bin\HipsTray.exe")]
+    [InlineData(@"C:\Program Files (x86)\Huorong\Sysdiag\bin\HipsMain.exe")]
+    [InlineData(@"C:\Program Files\Windows Defender\SecurityHealthSystray.exe")]
+    [InlineData(@"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.0.0-0\MsMpEng.exe")]
+    [InlineData(@"C:\Windows\System32\SecurityHealthSystray.exe")]
+    [InlineData(@"C:\Windows\SystemApps\Microsoft.Windows.SecHealthUI_cw5n1h2txyewy\SecHealthUI.exe")]
+    public void 安全软件进程会被识别为不可终止(string executablePath)
+    {
+        Assert.True(StartupGuardService.IsProtectedSecurityExecutable(executablePath));
+    }
+
+    [Fact]
+    public void 普通目录中的同名文件不会获得安全软件豁免()
+    {
+        Assert.False(StartupGuardService.IsProtectedSecurityExecutable(
+            @"C:\Users\Public\HipsTray.exe"));
+    }
+
+    [Fact]
+    public void 安全软件路径即使出现在启动项精确集合中也不会被终止()
+    {
+        const string executablePath =
+            @"C:\Program Files\Huorong\Sysdiag\bin\HipsTray.exe";
+        var exactPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            executablePath
+        };
+
+        Assert.False(StartupGuardService.ShouldTerminate(
+            processSessionId: 7,
+            targetSessionId: 7,
+            mainSessionId: 1,
+            executablePath,
+            exactPaths));
+        Assert.False(StartupGuardService.ShouldTerminateManagedServiceSpawn(
+            processSessionId: 7,
+            targetSessionId: 7,
+            mainSessionId: 1,
+            executablePath,
+            parentProcessId: 42,
+            processStartedAt: LogonTime,
+            exactPaths,
+            _ => null));
+    }
+
+    [Fact]
+    public void 普通启动程序仍按精确路径进入终止判定()
+    {
+        const string executablePath = @"D:\Apps\startup.exe";
+        var exactPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            executablePath
+        };
+
+        Assert.False(StartupGuardService.IsProtectedSecurityExecutable(executablePath));
+        Assert.True(StartupGuardService.ShouldTerminate(
+            processSessionId: 7,
+            targetSessionId: 7,
+            mainSessionId: 1,
+            executablePath,
+            exactPaths));
+    }
+
     private static T ReadPrivate<T>(object instance, string fieldName)
     {
         var field = typeof(StartupGuardService).GetField(
