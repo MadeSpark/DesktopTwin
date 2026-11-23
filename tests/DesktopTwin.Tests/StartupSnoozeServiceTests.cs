@@ -2837,7 +2837,7 @@ public sealed class StartupSnoozeServiceTests
     [Fact]
     public void 恢复日志的计划任务名必须是根路径且不能带通配符()
     {
-        // 不以反斜杠开头时 schtasks /TN 会按当前任务文件夹解析，可能关掉不相干的任务；
+        // 任务路径不是从根文件夹开始时可能命中不相干的任务；
         // 通配符和换行会让一个条目命中多个任务，恢复时无法保证只碰日志里的那个。
         foreach (var invalid in new[]
                  {

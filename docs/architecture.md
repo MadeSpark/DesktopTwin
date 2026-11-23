@@ -101,17 +101,30 @@ LogoffAndHideAsync
 
 ## 状态与线程
 
-- `ChildSessionService` 的所有状态刷新都在 UI 线程（`DispatcherTimer` 每 500ms 一次），
-  因此界面读取状态时不需要额外同步。
+- `ChildSessionService` 的 `DispatcherTimer` 仍每 500ms 触发一次，但 WTS、注册表和服务
+  查询会先在线程池完成；RDP ActiveX 的 `ConnectedState` 和状态发布留在 UI 线程。
+  这样轮询频率和检查范围不变，系统调用不会压住界面输入。
 - RDP ActiveX 的事件回调（`OnLoginComplete` / `OnDisconnected` / `OnLogonError`）来自 COM，
   已在 `RdpActiveXHost` 内部转换到宿主控件线程再抛事件。
-- 启动进程的 COM 操作放在 `Task.Run` 里，用 `SemaphoreSlim` 串行化，避免并发注册同名任务。
+- 启动阶段的分身进程拉起、启动项隔离/恢复中的计划任务 COM 操作，以及首次 SessionAgent
+  同步放在 `Task.Run` 里；共享操作分别用 `SemaphoreSlim` / `_agentStartSync` 串行化，
+  避免并发注册同名任务。并非所有入口都已异步化：用户在设置界面切换相关开关时，
+  SessionAgent 同步仍可能沿同步命令路径执行。
+- 状态轮询触发的 SessionAgent 心跳/进程探针和子会话结束后的登录自启项补同步通过
+  单飞标记排队到线程池，500ms 状态事件只负责判断是否需要排队，避免探针或安装任务堆叠。
+  后台化范围是启动与连接准备路径；设置界面触发的同步命令仍可能占用 UI 线程，
+  性能结论只适用于已经测量的路径。
 
-## RDP 设置切换为什么要重连
+## RDP 设置切换：音频重连，观看模式不重连
 
-`KeyboardHookMode`（系统组合键发到哪一侧）和 `AudioRedirectionMode`（是否重定向音频）
-只能在**连接建立时**设置。因此切换这两个开关时，程序会主动断开并重连一次，
-并把「待生效的改动」记在 `_pendingRdpSettingChanges` 里，重连成功后回调通知界面。
+`AudioRedirectionMode`（是否重定向音频）在连接建立时设置，所以修改音频开关仍会主动
+断线重连一次，并把待生效改动记在 `_pendingRdpSettingChanges` 里。
+
+观看/控制模式不再走重连路径。程序继续使用同一个 RDP 连接、子会话和登录状态，只对
+当前 `Input Capture Window` 应用输入阻断，并切换 `KeyboardHookMode`（系统组合键发到哪一侧）。
+Microsoft 的文档把 `KeyboardHookMode` 描述为连接时属性，但实际连接建立后写入即可生效；
+项目已用真实连接验证按键路由会随模式改变。若即时写入或输入窗口阻断失败，切换会
+失败关闭并保持可验证的安全状态，不会悄悄改走重连。
 
 ## 输入屏蔽（观看模式）
 
@@ -119,7 +132,8 @@ RDP ActiveX 内部有一个标题为 `Input Capture Window` 的子窗口，所�
 `ChildSessionNativeMethods.SetRdpInputWindowEnabled` 通过 `EnumChildWindows` 找到它并 `EnableWindow(false)`，
 即可实现「只显示画面、不接收输入」，画面渲染不受影响。
 
-这个窗口每次连接都会重建，因此观看模式必须在每次 `OnLoginComplete` 后重新施加（见 `ChildSessionService`）。
+同一个连接内切换模式会复用这个窗口句柄；重新连接后句柄可能变化，因此观看模式必须在
+每次 `OnLoginComplete` 后重新施加（见 `ChildSessionService`）。
 
 ## 想加「游戏鼠标模式」需要动哪里
 

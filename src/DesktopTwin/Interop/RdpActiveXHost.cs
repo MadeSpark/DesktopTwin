@@ -12,7 +12,18 @@ using DesktopTwin.Localization;
 
 namespace DesktopTwin.Interop;
 
-internal sealed class RdpActiveXHost : AxHost
+/// <summary>
+/// 观看模式只需要对现有 RDP 连接施加输入阻断，不暴露建连、登录或重连能力。
+/// 生产实现是 <see cref="RdpActiveXHost"/>；测试可替换这个最窄接口。
+/// </summary>
+internal interface IRdpInputWindowController
+{
+    int ConnectedState { get; }
+
+    RdpInputWindowApplyResult SetInputBlocked(bool blocked);
+}
+
+internal sealed class RdpActiveXHost : AxHost, IRdpInputWindowController
 {
     // Windows 10+ 自带的非脚本化 RDP ActiveX 控件（MsRdpClient10）。
     private const string RdpClientClsid = "A0C63C30-F08D-4AB4-907C-34905D770C7D";
@@ -688,6 +699,8 @@ internal sealed class RdpActiveXHost : AxHost
     /// <summary>
     /// 立即把当前期望的 KeyboardHookMode 写入 RDP 控件并读回。
     /// 失败返回 false；调用方必须把它当成隔离未建立，而不是只记录设置值。
+    /// 这里的读回只证明控件接受并缓存了配置值，不证明本机全局键盘钩子已经
+    /// 实际安装或卸载；现场热切换仍需独立实测。
     /// </summary>
     private bool TryApplyKeyboardHookMode(bool inputBlocked)
     {
@@ -712,7 +725,9 @@ internal sealed class RdpActiveXHost : AxHost
                 return false;
             }
 
-            AppLog.Info($"KeyboardHookMode 已即时写入 {hookMode}，读回 {actual}。");
+            AppLog.Info(
+                $"KeyboardHookMode 配置已即时写入 {hookMode}，COM 读回 {actual}；"
+                + "该读回不代表全局键盘钩子的现场状态。");
             return true;
         }
         catch (Exception exception)
@@ -733,7 +748,9 @@ internal sealed class RdpActiveXHost : AxHost
     /// 实际流程由 <see cref="ApplyInputBlocked"/> 完成；这里只绑定生产依赖，
     /// 并通过可注入 helper 保证测试覆盖真实的 SetInputBlocked 调用链。
     /// </summary>
-    internal RdpInputWindowApplyResult SetInputBlocked(bool blocked)
+    int IRdpInputWindowController.ConnectedState => ConnectedState;
+
+    public RdpInputWindowApplyResult SetInputBlocked(bool blocked)
     {
         var result = ApplyInputBlocked(
             blocked,

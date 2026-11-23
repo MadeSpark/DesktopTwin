@@ -8,6 +8,8 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <!-- 测试 DLL 只允许 build(obj) 与调用(bin) 两份；不要生成 ref/refint 副本。 -->
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
   </PropertyGroup>
 
   <ItemGroup>

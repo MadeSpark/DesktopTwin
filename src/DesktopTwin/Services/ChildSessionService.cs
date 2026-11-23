@@ -19,6 +19,18 @@ using DesktopTwin.Localization;
 namespace DesktopTwin.Services;
 
 /// <summary>
+/// SetWatchModeEnabled 面对的当前 RDP 连接。生产环境包装同一个
+/// <see cref="MainWindow"/> 与 <see cref="RdpActiveXHost"/>；测试只替换这个视图，
+/// 不伪造服务私有状态，也不启动 COM/WPF。
+/// </summary>
+internal interface IWatchModeRdpConnection
+{
+    bool IsConnected { get; }
+
+    RdpInputWindowApplyResult SetInputBlocked(bool blocked);
+}
+
+/// <summary>
 /// 桌面分身的编排层：负责会话生命周期、RDP 连接状态、失败重试与界面状态文本。
 ///
 /// 分层说明：本类直接持有 <see cref="MainWindow"/> 的引用。这是一个单窗口应用，
@@ -1201,17 +1213,48 @@ public sealed class ChildSessionService : IDisposable
 
     /// <summary>
     /// 切换观看模式：开启后本机键鼠不会进入分身。
+    ///
+    /// 观看/控制模式只作用于当前 RDP 连接，绝不通过重连来切换。KeyboardHookMode
+    /// 在连接期间能否真正热切换仍取决于 RDP 客户端实现，不能把 COM 属性读回当成
+    /// 全局键盘钩子已安装/卸载的现场证据。
     /// </summary>
     public void SetWatchModeEnabled(bool enabled)
     {
         ThrowIfDisposed();
 
-        var host = _desktopWindow?.RdpHost;
-        var connected = host?.ConnectedState == 1;
+        var window = _desktopWindow;
+        var connection = window is null
+            ? null
+            : new RdpHostWatchModeConnection(window.RdpHost);
+        ApplyWatchModeTransition(
+            enabled,
+            connection,
+            _settings.Current.Session,
+            _settings.SaveSoon,
+            RefreshState);
+    }
+
+    /// <summary>
+    /// 观看模式切换的纯编排核心。它只对现有连接调用 SetInputBlocked；接口不暴露
+    /// 建连、登录或重连能力，因此回归测试不会靠一个从未被生产代码调用的重连桩
+    /// 来证明「没有重连」。
+    /// </summary>
+    internal static void ApplyWatchModeTransition(
+        bool enabled,
+        IWatchModeRdpConnection? connection,
+        SessionSettings sessionSettings,
+        Action saveSettings,
+        Action<string> refreshState)
+    {
+        ArgumentNullException.ThrowIfNull(sessionSettings);
+        ArgumentNullException.ThrowIfNull(saveSettings);
+        ArgumentNullException.ThrowIfNull(refreshState);
+
         var result = RdpInputWindowApplyResult.Applied;
-        if (host is not null)
+        var connected = connection?.IsConnected == true;
+        if (connection is not null)
         {
-            result = host.SetInputBlocked(enabled);
+            result = connection.SetInputBlocked(enabled);
         }
         else if (enabled)
         {
@@ -1226,26 +1269,29 @@ public sealed class ChildSessionService : IDisposable
             throw new InvalidOperationException(Locale.Get("Mcp.WatchMode.Failed"));
         }
 
-        _settings.Current.Session.WatchMode = enabled;
-        _settings.SaveSoon();
-
-        // KeyboardHookMode 在连接建立时生效。若控制模式曾允许 RDP 安装本机
-        // 键盘钩子，那么切入观看模式必须重连一次才能真正卸载它；切回控制模式
-        // 同样重连，恢复用户选择的系统组合键行为。
-        if (connected && SendSystemShortcutsToRemote && _desktopWindow is not null)
-        {
-            ReconnectForRdpSettingChange(
-                _desktopWindow,
-                RdpSettingChange.WatchMode,
-                Locale.Get(enabled ? "Svc.Status.WatchModeOn" : "Svc.Status.WatchModeOff"));
-            return;
-        }
+        sessionSettings.WatchMode = enabled;
+        saveSettings();
 
         // 切回控制模式时 SetInputBlocked 会把焦点还给输入窗口：观看模式期间
         // 被系统移走的焦点不会自动回来，画面看着像还在观看模式。
-        RefreshState(enabled
-            ? Locale.Get("Svc.Status.WatchModeOn")
-            : Locale.Get("Svc.Status.WatchModeOff"));
+        refreshState(Locale.Get(enabled
+            ? "Svc.Status.WatchModeOn"
+            : "Svc.Status.WatchModeOff"));
+    }
+
+    internal sealed class RdpHostWatchModeConnection : IWatchModeRdpConnection
+    {
+        private readonly IRdpInputWindowController _host;
+
+        internal RdpHostWatchModeConnection(IRdpInputWindowController host)
+        {
+            _host = host;
+        }
+
+        public bool IsConnected => _host.ConnectedState == 1;
+
+        public RdpInputWindowApplyResult SetInputBlocked(bool blocked) =>
+            _host.SetInputBlocked(blocked);
     }
 
     /// <summary>
@@ -1441,7 +1487,7 @@ public sealed class ChildSessionService : IDisposable
         StartupSnoozeResult result;
         try
         {
-            // 枚举计划任务要跑 schtasks、写注册表可能要等杀软放行，全都不能占着 UI 线程。
+            // 计划任务 COM 查询、注册表写入和杀软放行等待都不能占着 UI 线程。
             // 新连接和崩溃后接管旧会话必须走不同路径：只有拿到严格 WTS 结果后，
             // 才允许复用旧日志，不能把查询失败当成“没有会话”。
             result = await Task.Run(() =>
@@ -1658,7 +1704,7 @@ public sealed class ChildSessionService : IDisposable
                 else
                 {
                     // 恢复失败通常意味着会话仍在、WTS 查询失败或杀软/权限暂时未放行；
-                    // 给系统接口留出冷却时间，避免状态轮询每 500ms 都触发一轮 schtasks。
+                    // 给系统接口留出冷却时间，避免状态轮询每 500ms 都触发一轮计划任务查询与恢复尝试。
                     Interlocked.Exchange(
                         ref _startupIsolationRestoreNotBeforeTick,
                         Environment.TickCount64 + 30_000);
@@ -1747,25 +1793,8 @@ public sealed class ChildSessionService : IDisposable
 
         try
         {
-            var enabled = ChildSessionNativeMethods.IsChildSessionsEnabled();
-            ChildSessionId = ChildSessionNativeMethods.TryGetChildSessionId();
-            ConnectedState = _desktopWindow?.RdpHost.ConnectedState ?? 0;
-
-            var connectionText = ConnectedState switch
-            {
-                0 => Locale.Get("Svc.Conn.None"),
-                1 => Locale.Get("Svc.Conn.Connected"),
-                2 => Locale.Get("Svc.Conn.Connecting"),
-                _ => Locale.Format("Svc.Conn.Unknown", ConnectedState)
-            };
-            var sessionText = ChildSessionId?.ToString() ?? Locale.Get("Check.None");
-            var mainText = _lastOperationMessage ?? connectionText;
-            var enabledText = enabled ? Locale.Get("Svc.Status.On") : Locale.Get("Svc.Status.Off");
-
-            // 服务正常时不占用状态栏；只有「没启动」或「被禁用」才追加一段，
-            // 让用户在点启动之前就能看出是环境问题、而不是连接问题。
-            StatusText = Locale.Format("Svc.Status.Bar", mainText, connectionText, sessionText, enabledText)
-                         + DescribeTermServiceForStatus();
+            var connectedState = _desktopWindow?.RdpHost.ConnectedState ?? 0;
+            ApplyStatusSnapshot(QueryStatusSnapshot(), connectedState);
         }
         catch (Exception exception) when (IsExpectedChildSessionException(exception))
         {
@@ -1774,6 +1803,98 @@ public sealed class ChildSessionService : IDisposable
 
         StateChanged?.Invoke(this, EventArgs.Empty);
     }
+
+    /// <summary>
+    /// 状态轮询的 WTS、注册表和服务查询都在线程池执行；RDP ActiveX 的
+    /// ConnectedState 仍由 UI 线程读取。这样 500ms 轮询不会把数毫秒到上百毫秒的
+    /// 系统调用压到输入线程上，也不降低轮询频率或跳过状态检查。
+    /// </summary>
+    private async Task RefreshStateFromTimerAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        StatusSnapshot snapshot;
+        var connectedState = 0;
+        try
+        {
+            connectedState = _desktopWindow?.RdpHost.ConnectedState ?? 0;
+            snapshot = await Task.Run(QueryStatusSnapshot);
+        }
+        catch (Exception exception) when (IsExpectedChildSessionException(exception))
+        {
+            if (!_disposed)
+            {
+                StatusText = exception.GetBaseException().Message;
+            }
+
+            return;
+        }
+
+        if (_disposed)
+        {
+            return;
+        }
+
+        ApplyStatusSnapshot(snapshot, connectedState);
+    }
+
+    private void RaiseStateChangedSafely()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        try
+        {
+            StateChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception exception)
+        {
+            // 状态订正已经完成；一个订阅者失败不能阻断自动登录监听或下一轮轮询。
+            AppLog.Error("状态变更订阅者抛出异常。", exception);
+        }
+    }
+
+    private static StatusSnapshot QueryStatusSnapshot()
+    {
+        return new StatusSnapshot(
+            ChildSessionNativeMethods.IsChildSessionsEnabled(),
+            ChildSessionNativeMethods.TryGetChildSessionId(),
+            DescribeTermServiceForStatus());
+    }
+
+    private void ApplyStatusSnapshot(StatusSnapshot snapshot, int connectedState)
+    {
+        ChildSessionId = snapshot.ChildSessionId;
+        ConnectedState = connectedState;
+
+        var connectionText = connectedState switch
+        {
+            0 => Locale.Get("Svc.Conn.None"),
+            1 => Locale.Get("Svc.Conn.Connected"),
+            2 => Locale.Get("Svc.Conn.Connecting"),
+            _ => Locale.Format("Svc.Conn.Unknown", connectedState)
+        };
+        var sessionText = ChildSessionId?.ToString() ?? Locale.Get("Check.None");
+        var mainText = _lastOperationMessage ?? connectionText;
+        var enabledText = snapshot.ChildSessionsEnabled
+            ? Locale.Get("Svc.Status.On")
+            : Locale.Get("Svc.Status.Off");
+
+        // 服务正常时不占用状态栏；只有「没启动」或「被禁用」才追加一段，
+        // 让用户在点启动之前就能看出是环境问题、而不是连接问题。
+        StatusText = Locale.Format("Svc.Status.Bar", mainText, connectionText, sessionText, enabledText)
+                     + snapshot.TermServiceText;
+    }
+
+    private readonly record struct StatusSnapshot(
+        bool ChildSessionsEnabled,
+        uint? ChildSessionId,
+        string TermServiceText);
 
     /// <summary>
     /// 状态栏里描述远程桌面服务的那一段：正常返回空串，异常时返回「 | TermService：未启动/已禁用」。
@@ -2163,7 +2284,7 @@ public sealed class ChildSessionService : IDisposable
                || _pendingRdpSettingChanges != RdpSettingChange.None;
     }
 
-    private void OnStatusTimerTick(object? sender, EventArgs e)
+    private async void OnStatusTimerTick(object? sender, EventArgs e)
     {
         if (_statusTickInProgress || _disposed)
         {
@@ -2174,7 +2295,14 @@ public sealed class ChildSessionService : IDisposable
         try
         {
             RestoreStartupIsolationIfOrphaned();
-            RefreshState();
+            await RefreshStateFromTimerAsync();
+
+            if (_disposed)
+            {
+                return;
+            }
+
+            RaiseStateChangedSafely();
 
             // 连接中且开了自动登录：开始盯着可能出现的凭据弹窗。
             // 放在状态轮询里而不是每个连接入口各写一遍，重连、重试、设置变更全覆盖。
@@ -2195,7 +2323,17 @@ public sealed class ChildSessionService : IDisposable
         }
         catch (Exception exception) when (IsExpectedChildSessionException(exception))
         {
-            RefreshState(exception.GetBaseException().Message);
+            if (!_disposed)
+            {
+                StatusText = exception.GetBaseException().Message;
+                RaiseStateChangedSafely();
+            }
+        }
+        catch (Exception exception)
+        {
+            // async void 没有外层 Dispatcher 异常边界；状态订阅者或 COM 意外失败
+            // 不能把整个进程带走。轮询下一轮仍会照常重试。
+            AppLog.Error("状态轮询发生未预期异常。", exception);
         }
         finally
         {
@@ -3271,7 +3409,6 @@ public sealed class ChildSessionService : IDisposable
         None = 0,
         SystemShortcuts = 1,
         Audio = 2,
-        Resolution = 4,
-        WatchMode = 8
+        Resolution = 4
     }
 }

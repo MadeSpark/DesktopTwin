@@ -968,6 +968,176 @@ public sealed class SessionAgentServiceTests
         Assert.Contains("继承", exception.Message);
     }
 
+    [Fact]
+    public async Task 线程池安装会由Dispatcher启动轮询并在释放时停止()
+    {
+        var dispatcherThread = StartDispatcherThread();
+        var root = CreateTempDirectory();
+        try
+        {
+            var service = new SessionAgentService(
+                dispatcherThread.Dispatcher,
+                dataDirectory: root,
+                agentDirectory: root,
+                protectAgentDirectory: false,
+                manageLegacyDefaultInstallation: false,
+                startupRegistration: new FakeStartupRegistration());
+
+            var installed = await Task.Run(() =>
+            {
+                var result = service.EnsureInstalled(
+                    "Ctrl+Alt+U",
+                    controlPipe: null,
+                    out var error,
+                    updateStartupEntry: false);
+                return (result, error);
+            });
+
+            Assert.True(installed.result, installed.error);
+            var timerField = typeof(SessionAgentService).GetField(
+                "_pollTimer",
+                System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(timerField);
+            Assert.NotNull(await dispatcherThread.Dispatcher.InvokeAsync(
+                () => timerField.GetValue(service),
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle));
+
+            Assert.True(await Task.Run(
+                () => service.Uninstall(
+                    removeStartupEntry: true,
+                    removeShellGate: false)));
+            Assert.Null(await dispatcherThread.Dispatcher.InvokeAsync(
+                () => timerField.GetValue(service),
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle));
+
+            Assert.True(await Task.Run(() =>
+                service.EnsureInstalled(
+                    "Ctrl+Alt+U",
+                    controlPipe: null,
+                    out var error,
+                    updateStartupEntry: false)));
+            Assert.NotNull(await dispatcherThread.Dispatcher.InvokeAsync(
+                () => timerField.GetValue(service),
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle));
+
+            await Task.Run(service.Dispose);
+            Assert.Null(await dispatcherThread.Dispatcher.InvokeAsync(
+                () => timerField.GetValue(service),
+                System.Windows.Threading.DispatcherPriority.ApplicationIdle));
+        }
+        finally
+        {
+            dispatcherThread.Shutdown();
+            DeleteTempDirectory(root);
+        }
+
+        dispatcherThread.ThrowIfFailed();
+    }
+
+    [Fact]
+    public void Dispatcher已关闭时释放服务不会抛出()
+    {
+        var dispatcherThread = StartDispatcherThread();
+        var root = CreateTempDirectory();
+        try
+        {
+            var service = new SessionAgentService(
+                dispatcherThread.Dispatcher,
+                dataDirectory: root,
+                agentDirectory: root,
+                protectAgentDirectory: false,
+                manageLegacyDefaultInstallation: false,
+                startupRegistration: new FakeStartupRegistration());
+
+            dispatcherThread.Shutdown();
+            service.Dispose();
+        }
+        finally
+        {
+            dispatcherThread.Shutdown();
+            DeleteTempDirectory(root);
+        }
+
+        dispatcherThread.ThrowIfFailed();
+    }
+
+    private static DispatcherThreadFixture StartDispatcherThread()
+    {
+        Dispatcher? dispatcher = null;
+        Exception? failure = null;
+        using var ready = new ManualResetEventSlim();
+        using var stopped = new ManualResetEventSlim();
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                dispatcher = Dispatcher.CurrentDispatcher;
+                ready.Set();
+                Dispatcher.Run();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+                ready.Set();
+            }
+            finally
+            {
+                stopped.Set();
+            }
+        })
+        {
+            IsBackground = true
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(ready.Wait(TimeSpan.FromSeconds(10)), "Dispatcher 线程未能启动。");
+        Assert.NotNull(dispatcher);
+        return new DispatcherThreadFixture(dispatcher!, thread, stopped, () => failure);
+    }
+
+    private sealed class DispatcherThreadFixture
+    {
+        private readonly Thread _thread;
+        private readonly ManualResetEventSlim _stopped;
+        private readonly Func<Exception?> _failure;
+        private bool _shutdownRequested;
+
+        internal DispatcherThreadFixture(
+            Dispatcher dispatcher,
+            Thread thread,
+            ManualResetEventSlim stopped,
+            Func<Exception?> failure)
+        {
+            Dispatcher = dispatcher;
+            _thread = thread;
+            _stopped = stopped;
+            _failure = failure;
+        }
+
+        internal Dispatcher Dispatcher { get; }
+
+        internal void Shutdown()
+        {
+            if (!_shutdownRequested)
+            {
+                _shutdownRequested = true;
+                Dispatcher.InvokeShutdown();
+            }
+
+            Assert.True(_thread.Join(TimeSpan.FromSeconds(10)), "Dispatcher 线程未能退出。");
+        }
+
+        internal void ThrowIfFailed()
+        {
+            var exception = _failure();
+            if (exception is not null)
+            {
+                throw new InvalidOperationException("Dispatcher 线程失败。", exception);
+            }
+        }
+    }
+
     private static UninstallFixture CreateUninstallFixture(
         SessionAgentService.AgentStopResult? stopResult = null)
     {

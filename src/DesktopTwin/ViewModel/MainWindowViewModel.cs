@@ -35,9 +35,12 @@ public partial class MainWindowViewModel : ObservableObject
     private readonly UuViewSwitchService _uuViewSwitchService;
     private readonly SessionAgentService _sessionAgent;
     private readonly McpEnablementCoordinator _mcpEnablementCoordinator;
+    private readonly object _sessionAgentSyncGate = new();
     private long _lastAgentStartTicks;
     private long _lastSessionAgentStartupReconcileTicks;
-    private bool _sessionAgentStartupNeedsReconcile;
+    private volatile bool _sessionAgentStartupNeedsReconcile;
+    private int _sessionAgentHealthProbeInProgress;
+    private int _sessionAgentStartupReconcileInProgress;
     private GlobalHotkeyService? _globalHotkey;
     private McpLoopbackServer? _mcpServer;
     private Window? _hotkeyWindow;
@@ -606,7 +609,8 @@ public partial class MainWindowViewModel : ObservableObject
         // 恢复成功后，隔离日志中的 StartupApproved 原状态已回写。此时必须重新
         // 同步一次代理：升级前遗留的 AppData Run 值需要迁移到 ProgramData，
         // 否则旧的可写代理仍可能在下次登录时执行。同步失败则中止连接。
-        if (!SyncSessionAgent(startInChildSession: false))
+        // 文件替换、ACL 和计划任务注册都可能被安全软件扫描数秒，必须离开 UI 线程。
+        if (!await Task.Run(() => SyncSessionAgent(startInChildSession: false)))
         {
             AppLog.Warn("连接前同步分身代理失败，已阻止启动。");
             ShowNotification(
@@ -990,7 +994,9 @@ public partial class MainWindowViewModel : ObservableObject
     {
         _hotkeyWindow = window;
         var mcpApplied = ApplyMcpService(notifyUser: false, notifySuccess: false);
-        var agentReady = ApplyUuHotkey(notifySuccess: false);
+        // 注册热键必须留在 UI 线程；分身端安装会替换文件、写 ACL 和计划任务，
+        // 统一延后到用户点击启动后的后台连接准备阶段。
+        var agentReady = ApplyUuHotkey(notifySuccess: false, syncSessionAgent: false);
         if (mcpApplied && McpEnabled && !agentReady)
         {
             RollbackMcpEnablement(
@@ -1497,7 +1503,10 @@ public partial class MainWindowViewModel : ObservableObject
     /// 注册或注销 UU 切换热键。
     /// </summary>
     /// <param name="notifySuccess">注册成功时是否提示用户。</param>
-    private bool ApplyUuHotkey(bool notifySuccess)
+    /// <param name="syncSessionAgent">
+    /// 是否立即安装并同步分身端。窗口初始化只注册主窗口热键，重安装延后到后台启动准备阶段。
+    /// </param>
+    private bool ApplyUuHotkey(bool notifySuccess, bool syncSessionAgent = true)
     {
         _globalHotkey ??= new GlobalHotkeyService();
         _globalHotkey.Pressed -= OnUuHotkeyPressed;
@@ -1506,7 +1515,7 @@ public partial class MainWindowViewModel : ObservableObject
 
         if (!UuViewSwitchEnabled)
         {
-            return SyncSessionAgent();
+            return !syncSessionAgent || SyncSessionAgent();
         }
 
         if (_hotkeyWindow is null)
@@ -1518,7 +1527,7 @@ public partial class MainWindowViewModel : ObservableObject
         if (_globalHotkey.TryRegister(_hotkeyWindow, combination, out var error))
         {
             // 分身端：Console 侧热键在焦点进分身画面后会失效，必须由分身会话里的代理接住。
-            var agentReady = SyncSessionAgent();
+            var agentReady = !syncSessionAgent || SyncSessionAgent();
             if (notifySuccess)
             {
                 ShowNotification(
@@ -1538,7 +1547,7 @@ public partial class MainWindowViewModel : ObservableObject
         UuViewSwitchEnabled = false;
         _settings.Current.Automation.UuViewSwitchEnabled = false;
         _settings.SaveSoon();
-        var fallbackAgentReady = SyncSessionAgent();
+        var fallbackAgentReady = !syncSessionAgent || SyncSessionAgent();
         ShowNotification(
             Locale.Get("Hotkey.Registered.Failed.Title"),
             error,
@@ -1553,6 +1562,16 @@ public partial class MainWindowViewModel : ObservableObject
     /// <returns>分身端是否已按所需设置安装并可用。</returns>
     private bool SyncSessionAgent(bool startInChildSession = true)
     {
+        // UI 命令、后台启动预检和延迟补同步都可能同时进入这里。必须在读配置之前
+        // 串行化整段安装，否则较旧的一次调用可能在较新调用之后才完成文件替换。
+        lock (_sessionAgentSyncGate)
+        {
+            return SyncSessionAgentCore(startInChildSession);
+        }
+    }
+
+    private bool SyncSessionAgentCore(bool startInChildSession)
+    {
         if (_hotkeyWindow is null)
         {
             return false;
@@ -1560,10 +1579,14 @@ public partial class MainWindowViewModel : ObservableObject
 
         try
         {
-            var hotkey = UuViewSwitchEnabled
+            // 后台调用不读取 ObservableProperty 的 UI 字段，而是在安装锁内读取
+            // 设置对象的当前开关；同一把锁保证较旧调用不会覆盖较新的安装结果。
+            var hotkey = _settings.Current.Automation.UuViewSwitchEnabled
                 ? _settings.Current.Automation.UuViewSwitchHotkey
                 : null;
-            var controlPipe = McpEnabled ? _settings.Current.Mcp.PipeName : null;
+            var controlPipe = _settings.Current.Mcp.Enabled
+                ? _settings.Current.Mcp.PipeName
+                : null;
 
             // 子会话开着或关停日志尚未恢复时，HKCU Run 可能正被隔离。
             // 这时只更新内存参数；若 Run 仍精确指向旧版 AppData 代理，可安全
@@ -1610,7 +1633,7 @@ public partial class MainWindowViewModel : ObservableObject
             // 自启项只在下次登录时生效；当前分身已经在运行时立刻补拉一份。
             if (startInChildSession)
             {
-                _ = _sessionAgent.TryStartInChildSession();
+                QueueSessionAgentStart();
             }
 
             return true;
@@ -2214,32 +2237,60 @@ public partial class MainWindowViewModel : ObservableObject
     /// </summary>
     private void ReconcileDeferredSessionAgentStartup()
     {
-        if (_hotkeyWindow is null)
+        if (_hotkeyWindow is null
+            || Interlocked.CompareExchange(
+                ref _sessionAgentStartupReconcileInProgress,
+                1,
+                0) != 0)
         {
             return;
         }
 
-        var deferStartupMutation = _childSessionService.ShouldDeferSessionAgentStartupMutation();
         var now = Environment.TickCount64;
         if (!ShouldAttemptDeferredSessionAgentStartupReconcile(
                 _sessionAgentStartupNeedsReconcile,
-                deferStartupMutation,
+                deferStartupMutation: false,
                 now,
-                _lastSessionAgentStartupReconcileTicks,
+                Interlocked.Read(ref _lastSessionAgentStartupReconcileTicks),
                 SessionAgentStartupReconcileIntervalMs))
         {
+            Volatile.Write(ref _sessionAgentStartupReconcileInProgress, 0);
             return;
         }
 
-        _lastSessionAgentStartupReconcileTicks = now;
-        if (SyncSessionAgent(startInChildSession: false))
+        Interlocked.Exchange(ref _lastSessionAgentStartupReconcileTicks, now);
+        _ = Task.Run(() =>
         {
-            AppLog.Info("分身会话已结束，已补做登录自启项同步。");
-        }
-        else
-        {
-            AppLog.Warn("分身会话已结束，但补做登录自启项同步失败；稍后重试。");
-        }
+            try
+            {
+                // WTS 查询、文件替换、ACL 和登录任务注册都可能被安全软件扫描数秒。
+                // 状态轮询只负责排队；这些工作不能占着 UI 线程。
+                var deferStartupMutation =
+                    _childSessionService.ShouldDeferSessionAgentStartupMutation();
+                if (deferStartupMutation || !_sessionAgentStartupNeedsReconcile)
+                {
+                    return;
+                }
+
+                if (SyncSessionAgent(startInChildSession: false))
+                {
+                    AppLog.Info("分身会话已结束，已补做登录自启项同步。");
+                }
+                else
+                {
+                    AppLog.Warn("分身会话已结束，但补做登录自启项同步失败；稍后重试。");
+                }
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException
+                                                  and not StackOverflowException)
+            {
+                AppLog.Warn("后台补做登录自启项同步失败；稍后重试。", exception);
+            }
+            finally
+            {
+                Volatile.Write(ref _sessionAgentStartupReconcileInProgress, 0);
+            }
+        });
     }
 
     /// <summary>
@@ -2275,36 +2326,83 @@ public partial class MainWindowViewModel : ObservableObject
     private void EnsureSessionAgentRunning()
     {
         if ((!UuViewSwitchEnabled && !McpEnabled)
-            || _childSessionService.ConnectedState != 1)
+            || _childSessionService.ConnectedState != 1
+            || Interlocked.CompareExchange(ref _sessionAgentHealthProbeInProgress, 1, 0) != 0)
         {
             return;
         }
 
-        if (!_sessionAgent.NeedsRestart && _sessionAgent.IsAgentOnline())
+        // WTS 身份查询、进程枚举和心跳文件读取都放到后台。状态事件来自 500ms
+        // 轮询，之前这些同步探针会周期性占住 UI 线程，正好打在新会话的首帧输入上。
+        _ = Task.Run(() =>
         {
-            return;
-        }
+            try
+            {
+                if (!_sessionAgent.NeedsRestart && _sessionAgent.IsAgentOnline())
+                {
+                    return;
+                }
 
-        // 状态事件来自 500ms 轮询，不加节流会反复下发启动任务。
-        var now = Environment.TickCount64;
-        if (now - _lastAgentStartTicks < 10_000)
+                // 状态事件来自 500ms 轮询，不加节流会反复下发启动任务。
+                var now = Environment.TickCount64;
+                if (now - Interlocked.Read(ref _lastAgentStartTicks) < 10_000)
+                {
+                    return;
+                }
+
+                Interlocked.Exchange(ref _lastAgentStartTicks, now);
+
+                // 进程还在就别再拉一个：新代理抢不到互斥体会立刻退出，除了多一条日志什么也做不到。
+                if (!_sessionAgent.NeedsRestart && _sessionAgent.HasLiveAgentProcess())
+                {
+                    AppLog.Info("分身端进程仍在（心跳停滞），跳过重启以免多开。");
+                    return;
+                }
+
+                AppLog.Info(_sessionAgent.NeedsRestart
+                    ? "分身端脚本已更新，拉起新代理替换旧的。"
+                    : "分身端未在运行，重新拉起。");
+                QueueSessionAgentStart();
+            }
+            catch (ObjectDisposedException)
+            {
+                // 窗口关闭、服务释放时探针自然结束。
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException
+                                                  and not StackOverflowException)
+            {
+                AppLog.Warn("后台检查分身端运行状态失败；下轮继续。", exception);
+            }
+            finally
+            {
+                Volatile.Write(ref _sessionAgentHealthProbeInProgress, 0);
+            }
+        });
+    }
+
+    /// <summary>
+    /// 代理拉起会枚举子会话、等待旧进程退出，必要时还要等任务计划程序完成；
+    /// 这些都不是 UI 工作。放到线程池后，连接状态回调仍会立即返回，键盘鼠标不再
+    /// 为一次进程替换停顿数秒。服务内部的安装锁会串行保护每次实际检查，避免并发安装冲突。
+    /// </summary>
+    private void QueueSessionAgentStart()
+    {
+        _ = Task.Run(() =>
         {
-            return;
-        }
-
-        _lastAgentStartTicks = now;
-
-        // 进程还在就别再拉一个：新代理抢不到互斥体会立刻退出，除了多一条日志什么也做不到。
-        if (!_sessionAgent.NeedsRestart && _sessionAgent.HasLiveAgentProcess())
-        {
-            AppLog.Info("分身端进程仍在（心跳停滞），跳过重启以免多开。");
-            return;
-        }
-
-        AppLog.Info(_sessionAgent.NeedsRestart
-            ? "分身端脚本已更新，拉起新代理替换旧的。"
-            : "分身端未在运行，重新拉起。");
-        _ = _sessionAgent.TryStartInChildSession();
+            try
+            {
+                _sessionAgent.TryStartInChildSession();
+            }
+            catch (ObjectDisposedException)
+            {
+                // 窗口正在关闭，代理生命周期已结束。
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException
+                                                  and not StackOverflowException)
+            {
+                AppLog.Warn("在后台拉起分身端失败。", exception);
+            }
+        });
     }
 
     private void OnChildSessionIsolationFailed(

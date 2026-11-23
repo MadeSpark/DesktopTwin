@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -85,7 +84,7 @@ internal enum StartupIsolationMode
 /// 登录后仍然在子会话里拉起了同一程序时，才由仅限子会话的短时守卫兜底。
 /// <list type="bullet">
 /// <item><c>Explorer\StartupApproved</c> 的二进制值（Run / Run32 / StartupFolder）</item>
-/// <item>计划任务的启用状态（<c>schtasks /Change</c>）</item>
+/// <item>计划任务的启用状态（Task Scheduler COM）</item>
 /// <item>UWP 启动任务的 <c>State</c> 值</item>
 /// </list>
 ///
@@ -159,8 +158,10 @@ public sealed class StartupSnoozeService
     private readonly TimeSpan _presenceConfirmationDelay;
     private readonly Func<StartupIsolationMode, List<string>> _refusalReasonsProvider;
     private readonly Func<StartupSnoozeSnapshot>? _startupSnapshotProvider;
+    private readonly Func<IScheduledTaskComClient> _scheduledTaskComClientFactory;
     private readonly ICurrentUserShellStore _shellStore;
     private readonly IExplorerRunPolicyStore _policyStore;
+    private IScheduledTaskComClient? _scheduledTaskComClient;
     private bool _appliedInThisInstance;
 
     /// <summary>
@@ -187,7 +188,8 @@ public sealed class StartupSnoozeService
         Func<StartupSnoozeSnapshot>? startupSnapshotProvider = null,
         ICurrentUserShellStore? shellStore = null,
         IExplorerRunPolicyStore? policyStore = null,
-        Func<StartupIsolationMode, List<string>>? isolationRefusalReasonsProvider = null)
+        Func<StartupIsolationMode, List<string>>? isolationRefusalReasonsProvider = null,
+        Func<IScheduledTaskComClient>? scheduledTaskComClientFactory = null)
     {
         Directory = directory ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -203,6 +205,8 @@ public sealed class StartupSnoozeService
                 ? GetRefusalReasons
                 : mode => refusalReasonsProvider(mode == StartupIsolationMode.AlternateShell));
         _startupSnapshotProvider = startupSnapshotProvider;
+        _scheduledTaskComClientFactory = scheduledTaskComClientFactory
+            ?? (static () => new ScheduledTaskComClient());
         _shellStore = shellStore ?? new CurrentUserShellStore();
         _policyStore = policyStore ?? new ExplorerRunPolicyStore();
         _journalValueName = _useMachineJournal ? BuildJournalValueName() : null;
@@ -378,10 +382,12 @@ public sealed class StartupSnoozeService
         {
             // 会话探测和启动项写入必须在同一把跨进程恢复互斥体内完成。
             // 在锁外先探测、再排队拿锁，会给新会话在空档中出现的窗口。
-            return WithRestoreMutex(() => EnsureSnoozedCore(
-                adoptExistingJournal: false,
-                requireAbsentSession: true,
-                mode));
+            return WithRestoreMutexAndScheduledTaskComClient(
+                () => EnsureSnoozedCore(
+                    adoptExistingJournal: false,
+                    requireAbsentSession: true,
+                    mode),
+                message => StartupSnoozeResult.Fail(message));
         }
     }
 
@@ -405,26 +411,28 @@ public sealed class StartupSnoozeService
         {
             // 接管同样必须在互斥体内重新核对「会话仍在」和「日志仍在」。
             // 否则排队拿锁期间会话可能已经退出，旧日志也可能已被恢复。
-            return WithRestoreMutex(() =>
-            {
-                if (QueryChildSessionPresence() != ChildSessionPresence.Present)
+            return WithRestoreMutexAndScheduledTaskComClient(
+                () =>
                 {
-                    return StartupSnoozeResult.Fail(
-                        "无法确认已有分身会话仍在运行，已拒绝接管启动项隔离。");
-                }
+                    if (QueryChildSessionPresence() != ChildSessionPresence.Present)
+                    {
+                        return StartupSnoozeResult.Fail(
+                            "无法确认已有分身会话仍在运行，已拒绝接管启动项隔离。");
+                    }
 
-                if (!IsSnoozed)
-                {
-                    return StartupSnoozeResult.Fail(
-                        "检测到已有分身会话，但没有可核对的启动项关停日志。"
-                        + "为避免在未知会话下修改启动项，已拒绝连接；请先注销已有分身再重试。");
-                }
+                    if (!IsSnoozed)
+                    {
+                        return StartupSnoozeResult.Fail(
+                            "检测到已有分身会话，但没有可核对的启动项关停日志。"
+                            + "为避免在未知会话下修改启动项，已拒绝连接；请先注销已有分身再重试。");
+                    }
 
-                return EnsureSnoozedCore(
-                    adoptExistingJournal: true,
-                    requireAbsentSession: false,
-                    mode);
-            });
+                    return EnsureSnoozedCore(
+                        adoptExistingJournal: true,
+                        requireAbsentSession: false,
+                        mode);
+                },
+                message => StartupSnoozeResult.Fail(message));
         }
     }
 
@@ -953,7 +961,9 @@ public sealed class StartupSnoozeService
     {
         lock (_gate)
         {
-            return WithRestoreMutex(RestoreCore);
+            return WithRestoreMutexAndScheduledTaskComClient(
+                RestoreCore,
+                message => StartupSnoozeResult.Fail(message));
         }
     }
 
@@ -965,7 +975,9 @@ public sealed class StartupSnoozeService
     {
         lock (_gate)
         {
-            return WithRestoreMutex(() => GetRestoreBlockResult() ?? RestoreCore());
+            return WithRestoreMutexAndScheduledTaskComClient(
+                () => GetRestoreBlockResult() ?? RestoreCore(),
+                message => StartupSnoozeResult.Fail(message));
         }
     }
 
@@ -1035,6 +1047,49 @@ public sealed class StartupSnoozeService
                     // 锁已经不归当前线程时不能让退出路径再次失败。
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// 启动项操作的一次互斥体作用域同时也是 COM 连接的作用域。连接只在
+    /// 当前调用线程上按需创建；无论操作成功、失败还是提前返回，都在同一线程
+    /// 的 finally 中释放。
+    /// </summary>
+    private T WithRestoreMutexAndScheduledTaskComClient<T>(
+        Func<T> action,
+        Func<string, T> failureFactory)
+    {
+        try
+        {
+            return WithRestoreMutex(action, failureFactory);
+        }
+        finally
+        {
+            ReleaseScheduledTaskComClient();
+        }
+    }
+
+    private IScheduledTaskComClient GetScheduledTaskComClient() =>
+        _scheduledTaskComClient ??= _scheduledTaskComClientFactory();
+
+    private void ReleaseScheduledTaskComClient()
+    {
+        var client = Interlocked.Exchange(ref _scheduledTaskComClient, null);
+        if (client is null)
+        {
+            return;
+        }
+
+        try
+        {
+            client.Dispose();
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException
+                                              and not StackOverflowException)
+        {
+            // 释放失败不能把已经确认的启动项结果改写成“未执行”；但必须留下
+            // 诊断，下一次操作会创建一个新的线程内连接。
+            AppLog.Warn("释放计划任务 COM 客户端失败。", exception);
         }
     }
 
@@ -1251,7 +1306,7 @@ public sealed class StartupSnoozeService
                 continue;
             }
 
-            // 已经是启用状态时不要为了“执行恢复”再跑一次 schtasks：
+            // 已经是启用状态时不要为了“执行恢复”再发起一次 COM 写入：
             // 某些受保护任务即使状态正确也可能拒绝修改，直接回读确认即可。
             if (currentState == TaskEnabledState.Enabled)
             {
@@ -1274,42 +1329,43 @@ public sealed class StartupSnoozeService
                 continue;
             }
 
-            var (exitCode, output) = RunSchtasks("/Change", "/TN", task.Relative, "/Enable");
-            if (exitCode != 0)
+            var writeResult = SetTaskEnabledViaCom(
+                task.Relative,
+                enabled: true,
+                expectedIdentity: task.Identity);
+
+            switch (writeResult.Status)
             {
-                // 用户在分身会话期间删除了任务时，任务已经不可能再启动，
-                // 不应因此永久保留日志并让每次启动都报恢复失败。
-                var presenceAfterFailure = GetScheduledTaskPresence(task.Relative);
-                if (presenceAfterFailure == ScheduledTaskPresence.Absent)
-                {
+                case ScheduledTaskComWriteStatus.Succeeded:
+                    // SetEnabled 只在同一连接中完成写入、身份校验和 Enabled 回读后
+                    // 才返回 Succeeded；随后再轮询每个任务只会把最多 1.5 秒的等待
+                    // 串行叠加到启动/恢复路径，不能提供额外证据。
                     task.WriteAttempted = false;
                     task.ConfirmedDisabled = false;
                     journal.Tasks.Remove(task);
                     restored++;
                     continue;
-                }
 
-                // 命令失败后仍可能已经生效；只有身份和开关都回读确认才清日志。
-                var afterFailureQuery = QueryTaskXml(task.Relative);
-                if (afterFailureQuery.IsAbsent)
-                {
+                case ScheduledTaskComWriteStatus.AlreadyInDesiredState:
+                    // 预读还是禁用，写入前却已经被外部启用；身份未变，保留
+                    // 已有的“外部改动可被识别”语义并清除日志。
+                    AppLog.Warn("计划任务在恢复写入前已被外部启用：" + task.Relative);
                     task.WriteAttempted = false;
                     task.ConfirmedDisabled = false;
                     journal.Tasks.Remove(task);
                     restored++;
                     continue;
-                }
 
-                if (afterFailureQuery.IsUnknown)
-                {
-                    problems.Add(
-                        task.Relative + "：命令失败且无法复核任务状态，保留恢复日志；" + output);
+                case ScheduledTaskComWriteStatus.NotFound:
+                    // 用户在分身会话期间删除了任务时，任务已经不可能再启动，
+                    // 不应因此永久保留日志并让每次启动都报恢复失败。
+                    task.WriteAttempted = false;
+                    task.ConfirmedDisabled = false;
+                    journal.Tasks.Remove(task);
+                    restored++;
                     continue;
-                }
 
-                var afterFailureXml = afterFailureQuery.Xml!;
-                if (!ScheduledTaskIdentityMatches(journal, task, afterFailureXml))
-                {
+                case ScheduledTaskComWriteStatus.IdentityChanged:
                     warnings.Add(task.Relative + "：任务定义已变化，保留当前状态");
                     AppLog.Warn("计划任务身份不匹配，拒绝继续恢复：" + task.Relative);
                     task.WriteAttempted = false;
@@ -1317,31 +1373,29 @@ public sealed class StartupSnoozeService
                     journal.Tasks.Remove(task);
                     preserved++;
                     continue;
-                }
 
-                if (ScheduledTaskXml.GetEnabledState(afterFailureXml) == TaskEnabledState.Enabled)
-                {
-                    task.WriteAttempted = false;
-                    task.ConfirmedDisabled = false;
-                    journal.Tasks.Remove(task);
-                    restored++;
+                case ScheduledTaskComWriteStatus.ReadBackFailed:
+                    problems.Add(
+                        task.Relative + "：启用后无法回读确认，保留恢复日志；"
+                        + writeResult.Message);
+                    AppLog.Warn(
+                        "计划任务恢复写入后回读失败，保留 WriteAttempted："
+                        + task.Relative,
+                        writeResult.Failure);
                     continue;
-                }
 
-                problems.Add(task.Relative + "：" + output);
-                continue;
+                case ScheduledTaskComWriteStatus.Failed:
+                default:
+                    // 写入失败时绝不能猜测它是否已经生效。保留 WriteAttempted，
+                    // 不清除 ConfirmedDisabled，并让本次恢复按问题失败关闭。
+                    problems.Add(
+                        task.Relative + "：启用写入失败，保留恢复日志；"
+                        + writeResult.Message);
+                    AppLog.Warn(
+                        "计划任务恢复写入失败，保留 WriteAttempted：" + task.Relative,
+                        writeResult.Failure);
+                    continue;
             }
-
-            if (!WaitForTaskEnabled(task.Relative, expected: true, expectedIdentity: task.Identity))
-            {
-                problems.Add(task.Relative + "：启用后回读未确认");
-                continue;
-            }
-
-            task.WriteAttempted = false;
-            task.ConfirmedDisabled = false;
-            journal.Tasks.Remove(task);
-            restored++;
         }
 
         for (var index = journal.Uwp.Count - 1; index >= 0; index--)
@@ -1490,7 +1544,7 @@ public sealed class StartupSnoozeService
                 return null;
             }
 
-            return WithRestoreMutex<StartupSnoozeResult?>(
+            return WithRestoreMutexAndScheduledTaskComClient<StartupSnoozeResult?>(
                 RecoverOnStartupCore,
                 message => StartupSnoozeResult.Fail(message));
         }
@@ -2186,7 +2240,7 @@ public sealed class StartupSnoozeService
         return ReadApprovalValue(key, valueName, out exists, out problem);
     }
 
-    private static List<StartupSnoozeTaskEntry> CollectScheduledTasks()
+    private List<StartupSnoozeTaskEntry> CollectScheduledTasks()
     {
         var entries = new List<StartupSnoozeTaskEntry>();
         using var baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
@@ -2548,30 +2602,77 @@ public sealed class StartupSnoozeService
     internal static ScheduledTaskXmlQueryResult ParseTaskXmlQueryOutput(string? output)
     {
         var trimmed = output?.Trim().TrimStart('\uFEFF');
-        // schtasks 的成功输出声称 XML 是 UTF-16，实际却按 OEM 代码页写字节。
-        // ScheduledTaskXml 会安全移除声明并用禁用 DTD 的严格解析器校验；
-        // 空输出、截断、错误命名空间或格式错误都按“读不到定义”处理。
+        // COM 返回的是 Unicode XML，但声明仍可能不可信。ScheduledTaskXml 会安全
+        // 移除声明并用禁用 DTD 的严格解析器校验；空输出、截断、错误命名空间
+        // 或格式错误都按“读不到定义”处理。
         return trimmed is not null && ScheduledTaskXml.GetIdentity(trimmed) is not null
             ? ScheduledTaskXmlQueryResult.Present(trimmed)
             : ScheduledTaskXmlQueryResult.Unknown;
     }
 
-    private static ScheduledTaskXmlQueryResult QueryTaskXml(string relative)
+    private ScheduledTaskXmlQueryResult QueryTaskXml(string relative)
     {
-        var (exitCode, output) = RunSchtasks("/Query", "/XML", "ONE", "/TN", relative);
-        if (exitCode != 0)
+        ScheduledTaskComReadResult read;
+        try
         {
-            var presence = GetScheduledTaskPresence(relative);
-            var definitionMissing = presence == ScheduledTaskPresence.Present
-                                    && IsTaskDefinitionFileConfirmedMissing(relative);
-            AppLog.Warn(
-                $"查询计划任务定义失败，TaskCache 状态={presence}，定义文件"
-                + (definitionMissing ? "确认缺失" : "状态未知")
-                + "：" + relative + "；" + output);
-            return InterpretFailedTaskXmlQuery(presence, definitionMissing);
+            read = GetScheduledTaskComClient().ReadXml(relative);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException
+                                              and not StackOverflowException)
+        {
+            read = ScheduledTaskComReadResult.Failed(exception);
         }
 
-        return ParseTaskXmlQueryOutput(output);
+        switch (read.Status)
+        {
+            case ScheduledTaskComReadStatus.Xml:
+                var parsed = ParseTaskXmlQueryOutput(read.Xml);
+                if (!parsed.IsPresent)
+                {
+                    AppLog.Warn("计划任务 COM 返回的 XML 未通过严格校验：" + relative);
+                }
+
+                return parsed;
+
+            case ScheduledTaskComReadStatus.NotFound:
+                // 只有 Task Scheduler 明确报告路径不存在时，才允许用 TaskCache
+                // 和受保护定义文件做“缓存残留”交叉确认。连接失败绝不进入这里。
+                var presence = GetScheduledTaskPresence(relative);
+                var definitionMissing = presence == ScheduledTaskPresence.Present
+                                        && IsTaskDefinitionFileConfirmedMissing(relative);
+                AppLog.Warn(
+                    $"计划任务 COM 明确报告任务不存在，TaskCache 状态={presence}，定义文件"
+                    + (definitionMissing ? "确认缺失" : "状态未知")
+                    + "：" + relative);
+                return InterpretFailedTaskXmlQuery(presence, definitionMissing);
+
+            case ScheduledTaskComReadStatus.Failed:
+            default:
+                AppLog.Warn(
+                    "计划任务 COM 查询失败，按未知状态失败关闭：" + relative
+                    + "；" + read.Failure?.Message,
+                    read.Failure);
+                return ScheduledTaskXmlQueryResult.Unknown;
+        }
+    }
+
+    private ScheduledTaskComWriteResult SetTaskEnabledViaCom(
+        string relative,
+        bool enabled,
+        string? expectedIdentity)
+    {
+        try
+        {
+            return GetScheduledTaskComClient().SetEnabled(
+                relative,
+                enabled,
+                expectedIdentity);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException
+                                              and not StackOverflowException)
+        {
+            return ScheduledTaskComWriteResult.Failed(exception);
+        }
     }
 
     private static List<StartupSnoozeUwpEntry> CollectUwpTasks()
@@ -2892,47 +2993,80 @@ public sealed class StartupSnoozeService
 
             task.WriteAttempted = true;
             SaveJournal(journal);
-            var (exitCode, output) = RunSchtasks("/Change", "/TN", task.Relative, "/Disable");
-            if (exitCode != 0)
+            var writeResult = SetTaskEnabledViaCom(
+                task.Relative,
+                enabled: false,
+                expectedIdentity: task.Identity);
+
+            switch (writeResult.Status)
             {
-                // schtasks 可能在改动生效后仍返回失败（超时、被安全软件拦截输出、
-                // 退出码异常）。直接清掉 WriteAttempted 会让回滚跳过这条任务，
-                // 启动项被永远留在禁用状态。这里必须重新查询：只有身份仍匹配
-                // 且 Settings/Enabled 明确为 false 时才保留所有权；查询 Unknown
-                // 绝不能当作“安全未启用”，只能清标记并让本轮失败关闭。
-                var postFailureQuery = QueryTaskXml(task.Relative);
-                if (postFailureQuery.IsPresent
-                    && ScheduledTaskXml.IsDisabled(postFailureQuery.Xml)
-                    && ScheduledTaskIdentityMatches(journal, task, postFailureQuery.Xml!))
-                {
-                    task.ConfirmedDisabled = false;
-                    task.WriteAttempted = true;
+                case ScheduledTaskComWriteStatus.Succeeded:
+                    // 写入、身份校验和 Disabled 回读已经由同一 COM 连接完成。
+                    // 再次轮询会在启动关键路径上按“任务数 × 最多 1.5 秒”串行阻塞，
+                    // 却不增加任何独立证据。
+                    task.ConfirmedDisabled = true;
                     SaveJournal(journal);
-                    warnings.Add(task.Relative + "：" + output + "（已复核为禁用，保留恢复日志）");
-                    AppLog.Warn(
-                        "禁用计划任务命令失败但状态已确认禁用：" + task.Relative + " -> " + output);
-                    blockedStartupItems.Add(task.Relative + "（" + output + "）");
                     continue;
-                }
 
-                task.WriteAttempted = false;
-                task.ConfirmedDisabled = false;
-                SaveJournal(journal);
-                warnings.Add(task.Relative + "：" + output);
-                AppLog.Warn("禁用计划任务失败：" + task.Relative + " -> " + output);
-                blockedStartupItems.Add(task.Relative + "（" + output + "）");
-                continue;
+                case ScheduledTaskComWriteStatus.AlreadyInDesiredState:
+                    // 预读时任务还是启用，写入前却被外部禁用。任务已无法在
+                    // 分身中启动，但这不是 DesktopTwin 的写入，必须同时清除
+                    // 写入/确认标记，否则恢复时会误启用外部改动。
+                    task.WriteAttempted = false;
+                    task.ConfirmedDisabled = false;
+                    warnings.Add(task.Relative + "：任务在关停写入前已被外部禁用");
+                    AppLog.Warn("计划任务在关停写入前已被外部禁用：" + task.Relative);
+                    SaveJournal(journal);
+                    continue;
+
+                case ScheduledTaskComWriteStatus.NotFound:
+                    // Task Scheduler 明确报告任务已不存在；它不可能再启动。
+                    task.WriteAttempted = false;
+                    task.ConfirmedDisabled = false;
+                    SaveJournal(journal);
+                    warnings.Add(task.Relative + "：任务在关停写入前已不存在");
+                    continue;
+
+                case ScheduledTaskComWriteStatus.IdentityChanged:
+                    task.WriteAttempted = false;
+                    task.ConfirmedDisabled = false;
+                    SaveJournal(journal);
+                    warnings.Add(task.Relative + "：任务定义在关停写入时发生变化，保持原状");
+                    AppLog.Warn(
+                        "计划任务定义在关停写入时发生变化，拒绝继续："
+                        + task.Relative + "；" + writeResult.Message);
+                    blockedStartupItems.Add(task.Relative + "（任务定义在关停写入时发生变化）");
+                    continue;
+
+                case ScheduledTaskComWriteStatus.ReadBackFailed:
+                    // 保留 WriteAttempted，绝不能把无法回读当成禁用成功。
+                    task.ConfirmedDisabled = false;
+                    SaveJournal(journal);
+                    warnings.Add(
+                        task.Relative + "：禁用后无法回读确认，保留恢复标记；"
+                        + writeResult.Message);
+                    AppLog.Warn(
+                        "计划任务禁用写入后回读失败，保留 WriteAttempted："
+                        + task.Relative,
+                        writeResult.Failure);
+                    blockedStartupItems.Add(task.Relative + "（禁用后无法回读确认）");
+                    continue;
+
+                case ScheduledTaskComWriteStatus.Failed:
+                default:
+                    // COM 失败可能发生在属性生效之前或之后；不得猜测成功，
+                    // 也不得清掉 WriteAttempted，否则恢复会漏掉可能被禁用的任务。
+                    task.ConfirmedDisabled = false;
+                    SaveJournal(journal);
+                    warnings.Add(
+                        task.Relative + "：禁用写入失败，保留恢复标记；"
+                        + writeResult.Message);
+                    AppLog.Warn(
+                        "禁用计划任务写入失败，保留 WriteAttempted：" + task.Relative,
+                        writeResult.Failure);
+                    blockedStartupItems.Add(task.Relative + "（禁用写入失败）");
+                    continue;
             }
-
-            if (!WaitForTaskEnabled(task.Relative, expected: false, expectedIdentity: task.Identity))
-            {
-                warnings.Add(task.Relative + "：禁用后回读未确认");
-                blockedStartupItems.Add(task.Relative + "（禁用后回读未确认）");
-                continue;
-            }
-
-            task.ConfirmedDisabled = true;
-            SaveJournal(journal);
         }
     }
 
@@ -4101,125 +4235,6 @@ public sealed class StartupSnoozeService
 
     // ===== 计划任务 =====
 
-    private static bool WaitForTaskEnabled(
-        string relative,
-        bool expected,
-        string? expectedIdentity)
-    {
-        for (var attempt = 0; attempt < 5; attempt++)
-        {
-            var query = QueryTaskXml(relative);
-            var state = query.IsPresent
-                ? ScheduledTaskXml.GetEnabledState(query.Xml)
-                : TaskEnabledState.Unknown;
-            if (query.IsPresent
-                && ((expected && state == TaskEnabledState.Enabled)
-                    || (!expected && state == TaskEnabledState.Disabled))
-                && ScheduledTaskXml.IsValidIdentity(expectedIdentity)
-                && string.Equals(
-                    ScheduledTaskXml.GetIdentity(query.Xml),
-                    expectedIdentity,
-                    StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            System.Threading.Thread.Sleep(300);
-        }
-
-        return false;
-    }
-
-    private static Encoding GetOemEncoding()
-    {
-        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-        try
-        {
-            return Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
-        }
-        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
-        {
-            AppLog.Warn("无法解析 schtasks 的 OEM 编码，暂按 UTF-8 读取。", exception);
-            return Encoding.UTF8;
-        }
-    }
-
-    private static (int ExitCode, string Output) RunSchtasks(params string[] arguments)
-    {
-        try
-        {
-            var oemEncoding = GetOemEncoding();
-            // 绝不能按 PATH 裸命令解析 schtasks：子会话或被篡改的环境可以把
-            // fake schtasks.exe 放进目录并劫持「关停/恢复」命令。System32 的
-            // 绝对路径是唯一可信位置；读环境变量只为定位系统目录，不作为命令名。
-            var systemRoot = Environment.GetEnvironmentVariable("SystemRoot");
-            if (string.IsNullOrWhiteSpace(systemRoot))
-            {
-                return (-1, "无法读取 SystemRoot 环境变量");
-            }
-
-            var schtasks = Path.Combine(systemRoot, "System32", "schtasks.exe");
-            if (!File.Exists(schtasks))
-            {
-                return (-1, "System32 中不存在 schtasks.exe");
-            }
-
-            var startInfo = new ProcessStartInfo(schtasks)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                StandardOutputEncoding = oemEncoding,
-                StandardErrorEncoding = oemEncoding
-            };
-
-            foreach (var argument in arguments)
-            {
-                startInfo.ArgumentList.Add(argument);
-            }
-
-            using var process = Process.Start(startInfo);
-            if (process is null)
-            {
-                return (-1, "无法启动 schtasks.exe");
-            }
-
-            // 必须同时异步读取两个管道，否则 schtasks 输出较多时会先写满缓冲区，
-            // 子进程阻塞在写、父进程阻塞在 ReadToEnd，30 秒超时永远没有机会生效。
-            var standardOutput = process.StandardOutput.ReadToEndAsync();
-            var standardError = process.StandardError.ReadToEndAsync();
-            if (!process.WaitForExit(30_000))
-            {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                    process.WaitForExit(5_000);
-                }
-                catch (Exception exception) when (exception is InvalidOperationException
-                                                        or System.ComponentModel.Win32Exception
-                                                        or NotSupportedException)
-                {
-                    AppLog.Warn("终止超时的 schtasks 进程失败。", exception);
-                }
-
-                return (-1, "schtasks 超时");
-            }
-
-            process.WaitForExit();
-            var output = standardOutput.GetAwaiter().GetResult().Trim();
-            var error = standardError.GetAwaiter().GetResult().Trim();
-            return (process.ExitCode, process.ExitCode == 0
-                ? output
-                : (output + " " + error).Trim());
-        }
-        catch (Exception exception) when (exception is System.ComponentModel.Win32Exception
-                                              or InvalidOperationException
-                                              or IOException)
-        {
-            return (-1, exception.Message);
-        }
-    }
 
     // ===== 日志 =====
 

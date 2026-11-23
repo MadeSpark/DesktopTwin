@@ -121,6 +121,17 @@ internal sealed class SessionAgentService : IDisposable
     /// 退出期间重入并下发第二次启动任务。
     /// </summary>
     private readonly object _agentStartSync = new();
+
+    /// <summary>
+    /// 串行化代理文件、启动项和参数配置的整段变更。启动预检现在在线程池执行，
+    /// 状态轮询仍可能在 UI 线程补拉代理；两者若同时替换文件，会出现「新文件已落地、
+    /// 旧进程仍被当成同参数复用」或反向的发布窗口。
+    ///
+    /// 锁顺序固定为「安装锁 → 启动锁」。所有涉及 UI Dispatcher 的轮询启停都放在
+    /// 安装锁之外，避免后台安装同步等待 UI、而 UI 又等待安装锁造成死锁。
+    /// </summary>
+    private readonly object _agentInstallSync = new();
+    private volatile bool _pollingDesired;
     private readonly Dispatcher _dispatcher;
     private DispatcherTimer? _pollTimer;
     private DateTime _lastRequestSeen = DateTime.MinValue;
@@ -138,7 +149,7 @@ internal sealed class SessionAgentService : IDisposable
     /// <summary>进程探测结果缓存（3 秒）。</summary>
     private long _lastAgentProbeTicks = -100_000;
     private bool _lastAgentProbeResult;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     /// <summary>
     /// 卸载阶段需要删除的持久自启项。生产实现直接操作任务计划程序和当前用户
@@ -595,6 +606,35 @@ internal sealed class SessionAgentService : IDisposable
         out string error,
         bool updateStartupEntry = true)
     {
+        bool installed;
+        bool pollingReady;
+        lock (_agentInstallSync)
+        {
+            installed = EnsureInstalledCore(
+                hotkey,
+                controlPipe,
+                out error,
+                updateStartupEntry,
+                out pollingReady);
+        }
+
+        // ReconcilePolling 会切回 UI 线程；必须在释放安装锁后调用。
+        if (pollingReady)
+        {
+            ReconcilePolling();
+        }
+
+        return installed;
+    }
+
+    private bool EnsureInstalledCore(
+        string? hotkey,
+        string? controlPipe,
+        out string error,
+        bool updateStartupEntry,
+        out bool pollingReady)
+    {
+        pollingReady = false;
         error = string.Empty;
         ThrowIfDisposed();
 
@@ -686,7 +726,8 @@ internal sealed class SessionAgentService : IDisposable
             return false;
         }
 
-        StartPolling();
+        _pollingDesired = true;
+        pollingReady = true;
 
         if (updateError is not null)
         {
@@ -711,7 +752,9 @@ internal sealed class SessionAgentService : IDisposable
         ThrowIfDisposed();
 
         // 整个「确认会话 -> 找旧代理 -> 等退出 -> 下发任务」流程必须串行。
-        // 否则轮询在等待旧进程退出时重入，会再下发一个抢不到互斥体的进程。
+        // 先拿安装锁，再拿启动锁，确保不会在代理文件/启动项正在替换时执行旧参数。
+        // 全局锁顺序固定为「安装锁 → 启动锁」。
+        lock (_agentInstallSync)
         lock (_agentStartSync)
         {
             // 整个周期只认这一次捕获的 sessionId + logonTime。会话号可能被系统
@@ -849,7 +892,13 @@ internal sealed class SessionAgentService : IDisposable
     /// 「新进程杀旧进程、旧进程还没退出、新进程抢不到互斥体又退出」的循环，
     /// 结果一个稳定的分身端都没有，热键彻底失灵。
     /// </summary>
-    public bool NeedsRestart { get; private set; }
+    public bool NeedsRestart
+    {
+        get => _needsRestart;
+        private set => _needsRestart = value;
+    }
+
+    private volatile bool _needsRestart;
 
     /// <summary>
     /// 分身端是否在线。
@@ -1563,7 +1612,19 @@ internal sealed class SessionAgentService : IDisposable
     /// </returns>
     public bool Uninstall(bool removeStartupEntry = true, bool removeShellGate = true)
     {
-        StopPolling();
+        bool uninstalled;
+        lock (_agentInstallSync)
+        {
+            _pollingDesired = false;
+            uninstalled = UninstallCore(removeStartupEntry, removeShellGate);
+        }
+
+        ReconcilePolling();
+        return uninstalled;
+    }
+
+    private bool UninstallCore(bool removeStartupEntry, bool removeShellGate)
+    {
         if (!removeStartupEntry)
         {
             var stopResult = _stopIsolatedAgent();
@@ -1637,12 +1698,32 @@ internal sealed class SessionAgentService : IDisposable
         }
 
         _disposed = true;
-        StopPolling();
+        _pollingDesired = false;
+        ReconcilePolling();
     }
 
-    private void StartPolling()
+    /// <summary>
+    /// 把「是否需要轮询」的最终状态发布到 UI Dispatcher。安装和卸载可能在线程池
+    /// 交错完成，不能直接按调用先后 Start/Stop；回调在 UI 线程重新读取最新意愿，
+    /// 以最后一次安装/卸载为准，避免卸载后又被较慢的安装回调重新拉起计时器。
+    /// </summary>
+    private void ReconcilePolling()
     {
-        if (_pollTimer is not null)
+        RunOnDispatcher(() =>
+        {
+            if (_disposed || !_pollingDesired)
+            {
+                StopPollingCore();
+                return;
+            }
+
+            StartPollingCore();
+        });
+    }
+
+    private void StartPollingCore()
+    {
+        if (_disposed || _pollTimer is not null)
         {
             return;
         }
@@ -1657,7 +1738,7 @@ internal sealed class SessionAgentService : IDisposable
         _pollTimer.Start();
     }
 
-    private void StopPolling()
+    private void StopPollingCore()
     {
         if (_pollTimer is null)
         {
@@ -1669,9 +1750,43 @@ internal sealed class SessionAgentService : IDisposable
         _pollTimer = null;
     }
 
+    /// <summary>
+    /// 启动阶段会把代理的文件/注册表/计划任务操作搬到线程池；DispatcherTimer
+    /// 仍只能在创建它的 UI Dispatcher 上启停。这里异步排队而不阻塞线程池：
+    /// UI 线程可能正等待同一段安装锁，同步 Invoke 会形成互相等待；异步回调执行时
+    /// 会重新读取最新的轮询意愿，因此连续安装/卸载仍以最后一次状态为准。
+    /// </summary>
+    private void RunOnDispatcher(Action action)
+    {
+        if (IsDispatcherShuttingDown())
+        {
+            return;
+        }
+
+        if (_dispatcher.CheckAccess())
+        {
+            action();
+            return;
+        }
+
+        try
+        {
+            _ = _dispatcher.BeginInvoke(DispatcherPriority.Normal, action);
+        }
+        catch (InvalidOperationException) when (IsDispatcherShuttingDown())
+        {
+            // 后台安装刚好跨过窗口关闭：没有 UI 可承载计时器，停止轮询即可。
+        }
+    }
+
+    private bool IsDispatcherShuttingDown() =>
+        _dispatcher.HasShutdownStarted || _dispatcher.HasShutdownFinished;
+
     private void OnPollTick(object? sender, EventArgs e)
     {
-        if (_disposed || !File.Exists(RequestPath))
+        // Dispatcher 停止轮询的操作是异步排队的；在它执行前可能还排着一次
+        // 已经触发的 Tick。卸载/释放后必须让它立即失效。
+        if (_disposed || !_pollingDesired || !File.Exists(RequestPath))
         {
             return;
         }

@@ -1032,7 +1032,7 @@ public sealed class StartupSnoozeTaskEntry
     /// <summary>原来的启用状态。</summary>
     public bool OriginalEnabled { get; set; }
 
-    /// <summary>是否已经准备调用 schtasks 禁用。用于区分「本次写入」和外部修改。</summary>
+    /// <summary>是否已经尝试通过计划任务 COM 禁用。用于区分「本次写入」和外部修改。</summary>
     public bool WriteAttempted { get; set; }
 
     /// <summary>禁用后回读确认的结果。</summary>

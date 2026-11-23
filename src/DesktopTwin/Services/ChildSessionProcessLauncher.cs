@@ -773,7 +773,7 @@ public static class ChildSessionProcessLauncher
     /// 2. HKLM 注册检查 fail-open。改 HKLM 已经需要管理员权限，这一层只做兜底；
     ///    读不到时放行并记日志，避免策略收紧的机器上功能整体不可用。
     /// </summary>
-    private static void EnsureTaskSchedulerIsTrusted()
+    internal static void EnsureTaskSchedulerIsTrusted()
     {
         EnsureNoUserClassOverride();
         EnsureMachineRegistrationIsSystemOwned();
